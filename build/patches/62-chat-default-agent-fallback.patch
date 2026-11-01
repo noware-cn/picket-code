@@ -1,0 +1,80 @@
+diff --git a/src/vs/workbench/contrib/chat/common/chatService/chatServiceImpl.ts b/src/vs/workbench/contrib/chat/common/chatService/chatServiceImpl.ts
+index c6ce114c..e7e9d015 100644
+--- a/src/vs/workbench/contrib/chat/common/chatService/chatServiceImpl.ts
++++ b/src/vs/workbench/contrib/chat/common/chatService/chatServiceImpl.ts
+@@ -1631,7 +1631,7 @@ export class ChatService extends Disposable implements IChatService {
+ 
+ 		const location = options?.location ?? model.initialLocation;
+ 		const attempt = options?.attempt ?? 0;
+-		const defaultAgent = this.chatAgentService.getDefaultAgent(location, options?.modeInfo?.kind);
++		const defaultAgent = this.chatAgentService.getDefaultAgent(location, options?.modeInfo?.kind) ?? this._resolveSilentAgent(options?.agentIdSilent);
+ 		if (!defaultAgent) {
+ 			this.logService.warn('sendRequest', `No default agent for location ${location}`);
+ 			return { kind: 'rejected', reason: 'No default agent available' };
+@@ -1659,6 +1659,20 @@ export class ChatService extends Disposable implements IChatService {
+ 		return result;
+ 	}
+ 
++	/**
++	 * Session-type sends name their agent explicitly through `agentIdSilent`.
++	 * When the build contributes no default chat agent at all (for example when
++	 * the extension that used to contribute it is not installed), honoring that
++	 * explicit id keeps those sends working. If any default agent exists, the
++	 * existing gate stays in force.
++	 */
++	private _resolveSilentAgent(agentIdSilent: string | undefined): IChatAgentData | undefined {
++		if (!agentIdSilent || this.chatAgentService.getAgents().some(agent => agent.isDefault)) {
++			return undefined;
++		}
++		return this.chatAgentService.getAgent(agentIdSilent);
++	}
++
+ 	/**
+ 	 * Converts an untitled contributed chat session into its real session on the
+ 	 * first send and returns the real model/resource so the caller can re-target
+@@ -2401,7 +2415,7 @@ export class ChatService extends Disposable implements IChatService {
+ 		};
+ 
+ 		const location = sendOptions.location ?? sendOptions.locationData?.type ?? model.initialLocation;
+-		const defaultAgent = this.chatAgentService.getDefaultAgent(location, sendOptions.modeInfo?.kind);
++		const defaultAgent = this.chatAgentService.getDefaultAgent(location, sendOptions.modeInfo?.kind) ?? this._resolveSilentAgent(sendOptions.agentIdSilent);
+ 		if (!defaultAgent) {
+ 			this.logService.warn('processNextPendingRequest', `No default agent for location ${location}`);
+ 			for (const deferred of deferreds) {
+diff --git a/src/vs/workbench/contrib/chat/test/common/chatService/chatService.test.ts b/src/vs/workbench/contrib/chat/test/common/chatService/chatService.test.ts
+index fa169e39..747c9c9b 100644
+--- a/src/vs/workbench/contrib/chat/test/common/chatService/chatService.test.ts
++++ b/src/vs/workbench/contrib/chat/test/common/chatService/chatService.test.ts
+@@ -527,6 +527,32 @@ suite('ChatService', () => {
+ 		}
+ 	}
+ 
++	test('uses the silent agent when no default agent is contributed at all', async () => {
++		const sessionType = 'agenthost-test-session';
++		// Isolated registry: the shared one always contributes a default agent.
++		const agents = testDisposables.add(instantiationService.createInstance(ChatAgentService));
++		instantiationService.stub(IChatAgentService, agents);
++		testDisposables.add(agents.registerAgent(sessionType, { ...getAgentData(sessionType), isDefault: false }));
++		const started = new DeferredPromise<void>();
++		let invocations = 0;
++		testDisposables.add(agents.registerAgentImplementation(sessionType, {
++			async invoke() { invocations++; started.complete(); return {}; },
++		}));
++		const service = createChatService();
++		const model = startSessionModel(service).object;
++		const result = await service.sendRequest(model.sessionResource, 'hello', { agentIdSilent: sessionType });
++		ChatSendResult.assertSent(result);
++		await started.p;
++		assert.strictEqual(invocations, 1);
++	});
++
++	test('rejects a send that has neither a default agent nor an agent id', async () => {
++		const service = createChatService();
++		const model = startSessionModel(service).object;
++		const result = await service.sendRequest(model.sessionResource, 'hello', { location: ChatAgentLocation.Terminal });
++		assert.strictEqual(result.kind, 'rejected');
++	});
++
+ 	for (const adopt of [false, true]) {
+ 		test(`correlates remote pending requests through ${adopt ? 'adoption between owners' : 'send and completion'}`, async () => {
+ 			const sessionType = 'remote-private-host-copilotcli';

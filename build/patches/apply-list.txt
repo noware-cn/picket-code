@@ -50,3 +50,4 @@
 58-agenthost-clean-product-config.patch
 59-voice-welcome-byok.patch
 61-build-source-adaptations.patch
+62-chat-default-agent-fallback.patch
