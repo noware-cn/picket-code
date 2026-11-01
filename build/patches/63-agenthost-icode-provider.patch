@@ -595,6 +595,357 @@ index 00000000..89074c9c
 +		kill,
 +	};
 +}
+diff --git a/src/vs/platform/agentHost/node/icode/icodeMapEvents.ts b/src/vs/platform/agentHost/node/icode/icodeMapEvents.ts
+new file mode 100644
+index 00000000..e9520162
+--- /dev/null
++++ b/src/vs/platform/agentHost/node/icode/icodeMapEvents.ts
+@@ -0,0 +1,345 @@
++/*---------------------------------------------------------------------------------------------
++ *  Copyright (c) Microsoft Corporation. All rights reserved.
++ *  Licensed under the MIT License. See License.txt in the project root for license information.
++ *--------------------------------------------------------------------------------------------*/
++
++import { URI } from '../../../../base/common/uri.js';
++import type { AgentSignal, IAgentToolPendingConfirmationSignal } from '../../common/agent.js';
++import { ActionType } from '../../common/state/sessionActions.js';
++import { ResponsePartKind, ToolCallConfirmationReason, ToolCallStatus, ToolResultContentType, type ToolCallPendingConfirmationState, type ToolResultContent } from '../../common/state/sessionState.js';
++
++/**
++ * A single `session/update` notification payload from iCode's ACP server.
++ *
++ * Only the fields this mapper reads are typed; ACP is an evolving protocol and
++ * both `sessionUpdate` and the tool-call `kind` are open string unions.
++ */
++export interface IcodeSessionUpdate {
++	readonly sessionUpdate: 'agent_message_chunk' | 'agent_thought_chunk' | 'tool_call' | 'tool_call_update' | 'plan' | 'usage_update' | 'session_info_update' | 'current_mode_update' | string;
++	readonly messageId?: string;
++	readonly content?: { readonly type: string; readonly text?: string } | readonly { readonly type: string; readonly text?: string }[];
++	readonly toolCallId?: string;
++	readonly title?: string;
++	readonly kind?: string;
++	readonly status?: string;
++	readonly rawInput?: unknown;
++	readonly rawOutput?: unknown;
++	readonly entries?: readonly unknown[];
++	readonly used?: number;
++	readonly size?: number;
++}
++
++/** The `session/request_permission` payload iCode sends before a gated tool runs. */
++export interface IcodePermissionRequest {
++	readonly sessionId: string;
++	readonly toolCall: { readonly toolCallId: string; readonly title?: string; readonly kind?: string; readonly status?: string; readonly rawInput?: unknown };
++	readonly options: readonly { readonly optionId: string; readonly name: string; readonly kind: string }[];
++}
++
++/**
++ * Per-turn mapping state.
++ *
++ * ACP streams deltas without part identifiers, so the mapper mints them once
++ * per logical stream and remembers them here: `partIds` maps a stream key
++ * (`messageId` for text, {@link THOUGHT_PART_KEY} for reasoning) to its part id.
++ */
++export interface IIcodeTurnState {
++	readonly turnId: string;
++	readonly partIds: Map<string, string>;
++	/** Tool call id to the display title used for the past-tense completion message. */
++	readonly toolTitles: Map<string, string>;
++	/** Tool call id to its serialized `rawInput`; ACP usually reports it only on `tool_call`. */
++	readonly toolInputs: Map<string, string>;
++	/** Tool calls that already emitted `ChatToolCallReady`. */
++	readonly readyToolCalls: Set<string>;
++	nextPartSequence: number;
++}
++
++const THOUGHT_PART_KEY = '__thought__';
++const ANONYMOUS_TEXT_PART_KEY = '__message__';
++const PART_ID_PREFIX = 'icode-part-';
++
++export function createIcodeTurnState(turnId: string): IIcodeTurnState {
++	return {
++		turnId,
++		partIds: new Map(),
++		toolTitles: new Map(),
++		toolInputs: new Map(),
++		readyToolCalls: new Set(),
++		nextPartSequence: 0,
++	};
++}
++
++/**
++ * Maps one ACP `session/update` notification to zero or more agent host
++ * signals. Pure: the only mutation is to the caller-owned `state`.
++ */
++export function mapAcpSessionUpdate(chat: URI, state: IIcodeTurnState, update: IcodeSessionUpdate): AgentSignal[] {
++	switch (update.sessionUpdate) {
++		case 'agent_message_chunk':
++			return mapTextChunk(chat, state, update);
++		case 'agent_thought_chunk':
++			return mapThoughtChunk(chat, state, update);
++		case 'tool_call':
++			return mapToolCallStart(chat, state, update);
++		case 'tool_call_update':
++			return mapToolCallUpdate(chat, state, update);
++		default:
++			// `plan`, `usage_update`, `session_info_update`, `current_mode_update`
++			// and anything iCode adds later carry no transcript content here.
++			return [];
++	}
++}
++
++/**
++ * Maps one ACP `session/request_permission` request to the pending
++ * confirmation signal the host turns into `ChatToolCallReady`.
++ */
++export function mapAcpPermissionRequest(chat: URI, state: IIcodeTurnState, request: IcodePermissionRequest): AgentSignal[] {
++	const { toolCall } = request;
++	const toolCallId = toolCall.toolCallId;
++	const displayName = toolCall.title ?? toolCallId;
++	const toolName = acpToolName(toolCall.kind);
++	const signals: AgentSignal[] = [];
++
++	if (!state.toolTitles.has(toolCallId)) {
++		state.toolTitles.set(toolCallId, displayName);
++		signals.push({
++			kind: 'action',
++			resource: chat,
++			action: { type: ActionType.ChatToolCallStart, turnId: state.turnId, toolCallId, toolName, displayName },
++		});
++	}
++
++	const pendingConfirmation: ToolCallPendingConfirmationState = {
++		status: ToolCallStatus.PendingConfirmation,
++		toolCallId,
++		toolName,
++		displayName,
++		invocationMessage: displayName,
++		confirmationTitle: displayName,
++		...(toolCall.rawInput !== undefined ? { toolInput: JSON.stringify(toolCall.rawInput) } : {}),
++	};
++	const permissionKind = acpPermissionKind(toolCall.kind);
++	const signal: IAgentToolPendingConfirmationSignal = {
++		kind: 'pending_confirmation',
++		chat,
++		state: pendingConfirmation,
++		...(permissionKind !== undefined ? { permissionKind } : {}),
++	};
++	signals.push(signal);
++
++	return signals;
++}
++
++function mapTextChunk(chat: URI, state: IIcodeTurnState, update: IcodeSessionUpdate): AgentSignal[] {
++	const text = extractText(update.content);
++	if (text === undefined) {
++		return [];
++	}
++
++	const key = update.messageId ?? ANONYMOUS_TEXT_PART_KEY;
++	let partId = state.partIds.get(key);
++	const signals: AgentSignal[] = [];
++	if (partId === undefined) {
++		partId = nextPartId(state);
++		state.partIds.set(key, partId);
++		signals.push({
++			kind: 'action',
++			resource: chat,
++			action: { type: ActionType.ChatResponsePart, turnId: state.turnId, part: { kind: ResponsePartKind.Markdown, id: partId, content: '' } },
++		});
++	}
++
++	signals.push({
++		kind: 'action',
++		resource: chat,
++		action: { type: ActionType.ChatDelta, turnId: state.turnId, partId, content: text },
++	});
++	return signals;
++}
++
++function mapThoughtChunk(chat: URI, state: IIcodeTurnState, update: IcodeSessionUpdate): AgentSignal[] {
++	const text = extractText(update.content);
++	if (text === undefined) {
++		return [];
++	}
++
++	// Reasoning must append through `ChatReasoning`: the reducer's `ChatDelta`
++	// branch only grows `ResponsePartKind.Markdown` parts and silently drops
++	// every other kind, so thinking would never render.
++	let partId = state.partIds.get(THOUGHT_PART_KEY);
++	const signals: AgentSignal[] = [];
++	if (partId === undefined) {
++		partId = nextPartId(state);
++		state.partIds.set(THOUGHT_PART_KEY, partId);
++		signals.push({
++			kind: 'action',
++			resource: chat,
++			action: { type: ActionType.ChatResponsePart, turnId: state.turnId, part: { kind: ResponsePartKind.Reasoning, id: partId, content: '' } },
++		});
++	}
++
++	signals.push({
++		kind: 'action',
++		resource: chat,
++		action: { type: ActionType.ChatReasoning, turnId: state.turnId, partId, content: text },
++	});
++	return signals;
++}
++
++function mapToolCallStart(chat: URI, state: IIcodeTurnState, update: IcodeSessionUpdate): AgentSignal[] {
++	const toolCallId = update.toolCallId;
++	if (toolCallId === undefined) {
++		return [];
++	}
++
++	const displayName = update.title ?? toolCallId;
++	state.toolTitles.set(toolCallId, displayName);
++	if (update.rawInput !== undefined) {
++		state.toolInputs.set(toolCallId, JSON.stringify(update.rawInput));
++	}
++
++	const signals: AgentSignal[] = [{
++		kind: 'action',
++		resource: chat,
++		action: {
++			type: ActionType.ChatToolCallStart,
++			turnId: state.turnId,
++			toolCallId,
++			toolName: acpToolName(update.kind),
++			displayName,
++		},
++	}];
++
++	// iCode may report the call as already running; the reducer then refuses the
++	// later completion unless a `running` transition happened first. A `pending`
++	// call goes to `pending_confirmation` through the permission request instead.
++	if (update.status === 'in_progress') {
++		const ready = createReadySignal(chat, state, toolCallId, displayName);
++		if (ready) {
++			signals.push(ready);
++		}
++	}
++	return signals;
++}
++
++function mapToolCallUpdate(chat: URI, state: IIcodeTurnState, update: IcodeSessionUpdate): AgentSignal[] {
++	const toolCallId = update.toolCallId;
++	if (toolCallId === undefined) {
++		return [];
++	}
++
++	const signals: AgentSignal[] = [];
++	const displayName = update.title ?? state.toolTitles.get(toolCallId) ?? toolCallId;
++	state.toolTitles.set(toolCallId, displayName);
++	if (update.rawInput !== undefined) {
++		state.toolInputs.set(toolCallId, JSON.stringify(update.rawInput));
++	}
++
++	const isFinished = update.status === 'completed' || update.status === 'failed';
++
++	// `ChatToolCallComplete` is dropped by the reducer unless the call is running,
++	// so a completion that arrives without a matching `in_progress` update has to
++	// be preceded by the ready signal.
++	if (update.status === 'in_progress' || isFinished) {
++		const ready = createReadySignal(chat, state, toolCallId, displayName);
++		if (ready) {
++			signals.push(ready);
++		}
++	}
++
++	if (isFinished) {
++		const content = extractResultContent(update);
++		signals.push({
++			kind: 'action',
++			resource: chat,
++			action: {
++				type: ActionType.ChatToolCallComplete,
++				turnId: state.turnId,
++				toolCallId,
++				result: {
++					success: update.status === 'completed',
++					pastTenseMessage: displayName,
++					...(content !== undefined ? { content } : {}),
++				},
++			},
++		});
++	}
++
++	return signals;
++}
++
++/** Emits `ChatToolCallReady` once per call, carrying the input seen at `tool_call`. */
++function createReadySignal(chat: URI, state: IIcodeTurnState, toolCallId: string, displayName: string): AgentSignal | undefined {
++	if (state.readyToolCalls.has(toolCallId)) {
++		return undefined;
++	}
++	state.readyToolCalls.add(toolCallId);
++
++	const toolInput = state.toolInputs.get(toolCallId);
++	return {
++		kind: 'action',
++		resource: chat,
++		action: {
++			type: ActionType.ChatToolCallReady,
++			turnId: state.turnId,
++			toolCallId,
++			invocationMessage: displayName,
++			confirmed: ToolCallConfirmationReason.NotNeeded,
++			...(toolInput !== undefined ? { toolInput } : {}),
++		},
++	};
++}
++
++/** Joins the `text` blocks of an ACP content payload, or `undefined` when it carries no text. */
++function extractText(content: IcodeSessionUpdate['content']): string | undefined {
++	const blocks = Array.isArray(content) ? content : content !== undefined ? [content] : [];
++	const text = blocks
++		.filter((block): block is { readonly type: string; readonly text: string } => block.type === 'text' && typeof block.text === 'string')
++		.map(block => block.text)
++		.join('');
++	return text.length > 0 ? text : undefined;
++}
++
++/**
++ * Builds the completion content: the `text` blocks iCode reported, else the raw
++ * output, else nothing at all.
++ */
++function extractResultContent(update: IcodeSessionUpdate): ToolResultContent[] | undefined {
++	const text = extractText(update.content);
++	if (text !== undefined) {
++		return [{ type: ToolResultContentType.Text, text }];
++	}
++	if (update.rawOutput === undefined) {
++		return undefined;
++	}
++	const raw = typeof update.rawOutput === 'string' ? update.rawOutput : JSON.stringify(update.rawOutput);
++	return raw.length > 0 ? [{ type: ToolResultContentType.Text, text: raw }] : undefined;
++}
++
++function nextPartId(state: IIcodeTurnState): string {
++	return `${PART_ID_PREFIX}${++state.nextPartSequence}`;
++}
++
++/** Maps an ACP tool-call `kind` to the internal tool name shown in the transcript. */
++function acpToolName(kind: string | undefined): string {
++	switch (kind) {
++		case 'execute': return 'shell';
++		case 'edit': return 'edit';
++		case 'read': return 'read';
++		case 'search': return 'search';
++		case 'fetch': return 'fetch';
++		default: return 'other';
++	}
++}
++
++/** Maps an ACP tool-call `kind` to the host's auto-approval permission kind. */
++function acpPermissionKind(kind: string | undefined): IAgentToolPendingConfirmationSignal['permissionKind'] {
++	switch (kind) {
++		case 'execute': return 'shell';
++		case 'edit': return 'write';
++		case 'read': return 'read';
++		default: return undefined;
++	}
++}
 diff --git a/src/vs/platform/agentHost/test/node/icode/icodeAcpClient.test.ts b/src/vs/platform/agentHost/test/node/icode/icodeAcpClient.test.ts
 new file mode 100644
 index 00000000..d34e4c39
@@ -1207,5 +1558,138 @@ index 00000000..448debe9
 +		assert.strictEqual(transport.exited, true);
 +		assert.ok(transport.error instanceof Error, 'the spawn error must be surfaced on the transport');
 +		assert.ok(logs.some(line => line.startsWith('[icode]')), `expected an [icode] log, got:\n${logs.join('\n')}`);
++	});
++});
+diff --git a/src/vs/platform/agentHost/test/node/icode/icodeMapEvents.test.ts b/src/vs/platform/agentHost/test/node/icode/icodeMapEvents.test.ts
+new file mode 100644
+index 00000000..a9af5454
+--- /dev/null
++++ b/src/vs/platform/agentHost/test/node/icode/icodeMapEvents.test.ts
+@@ -0,0 +1,127 @@
++/*---------------------------------------------------------------------------------------------
++ *  Copyright (c) Microsoft Corporation. All rights reserved.
++ *  Licensed under the MIT License. See License.txt in the project root for license information.
++ *--------------------------------------------------------------------------------------------*/
++
++import assert from 'assert';
++import { URI } from '../../../../../base/common/uri.js';
++import { ensureNoDisposablesAreLeakedInTestSuite } from '../../../../../base/test/common/utils.js';
++import { ActionType } from '../../../common/state/sessionActions.js';
++import { ResponsePartKind, ToolCallConfirmationReason, ToolCallStatus, ToolResultContentType } from '../../../common/state/sessionState.js';
++import { createIcodeTurnState, mapAcpPermissionRequest, mapAcpSessionUpdate } from '../../../node/icode/icodeMapEvents.js';
++
++const chat = URI.parse('ahp-chat://test/chat');
++
++suite('icodeMapEvents', () => {
++	ensureNoDisposablesAreLeakedInTestSuite();
++
++	test('streams a text chunk into one part', () => {
++		const state = createIcodeTurnState('turn-1');
++		assert.deepStrictEqual(
++			mapAcpSessionUpdate(chat, state, { sessionUpdate: 'agent_message_chunk', messageId: 'm1', content: { type: 'text', text: 'Hel' } }),
++			[
++				{ kind: 'action', resource: chat, action: { type: ActionType.ChatResponsePart, turnId: 'turn-1', part: { kind: ResponsePartKind.Markdown, id: 'icode-part-1', content: '' } } },
++				{ kind: 'action', resource: chat, action: { type: ActionType.ChatDelta, turnId: 'turn-1', partId: 'icode-part-1', content: 'Hel' } },
++			],
++		);
++		assert.deepStrictEqual(
++			mapAcpSessionUpdate(chat, state, { sessionUpdate: 'agent_message_chunk', messageId: 'm1', content: { type: 'text', text: 'lo' } }),
++			[{ kind: 'action', resource: chat, action: { type: ActionType.ChatDelta, turnId: 'turn-1', partId: 'icode-part-1', content: 'lo' } }],
++		);
++	});
++
++	test('streams a thought chunk as a reasoning part', () => {
++		const state = createIcodeTurnState('turn-1');
++		assert.deepStrictEqual(
++			mapAcpSessionUpdate(chat, state, { sessionUpdate: 'agent_thought_chunk', content: { type: 'text', text: 'think' } }),
++			[
++				{ kind: 'action', resource: chat, action: { type: ActionType.ChatResponsePart, turnId: 'turn-1', part: { kind: ResponsePartKind.Reasoning, id: 'icode-part-1', content: '' } } },
++				{ kind: 'action', resource: chat, action: { type: ActionType.ChatReasoning, turnId: 'turn-1', partId: 'icode-part-1', content: 'think' } },
++			],
++		);
++		assert.deepStrictEqual(
++			mapAcpSessionUpdate(chat, state, { sessionUpdate: 'agent_thought_chunk', content: { type: 'text', text: 'more' } }),
++			[{ kind: 'action', resource: chat, action: { type: ActionType.ChatReasoning, turnId: 'turn-1', partId: 'icode-part-1', content: 'more' } }],
++		);
++	});
++
++	test('maps a tool call start and completion', () => {
++		const state = createIcodeTurnState('turn-1');
++		assert.deepStrictEqual(
++			mapAcpSessionUpdate(chat, state, { sessionUpdate: 'tool_call', toolCallId: 't1', title: 'Run ls', kind: 'execute', status: 'in_progress', rawInput: { command: 'ls' } }),
++			[
++				{ kind: 'action', resource: chat, action: { type: ActionType.ChatToolCallStart, turnId: 'turn-1', toolCallId: 't1', toolName: 'shell', displayName: 'Run ls' } },
++				{
++					kind: 'action', resource: chat, action: {
++						type: ActionType.ChatToolCallReady, turnId: 'turn-1', toolCallId: 't1',
++						invocationMessage: 'Run ls', confirmed: ToolCallConfirmationReason.NotNeeded, toolInput: '{"command":"ls"}',
++					},
++				},
++			],
++		);
++		assert.deepStrictEqual(
++			mapAcpSessionUpdate(chat, state, { sessionUpdate: 'tool_call_update', toolCallId: 't1', status: 'completed', content: [{ type: 'text', text: 'ok' }], rawOutput: 'ok' }),
++			[{
++				kind: 'action', resource: chat, action: {
++					type: ActionType.ChatToolCallComplete, turnId: 'turn-1', toolCallId: 't1',
++					result: { success: true, pastTenseMessage: 'Run ls', content: [{ type: ToolResultContentType.Text, text: 'ok' }] },
++				},
++			}],
++		);
++	});
++
++	test('a completion without a running update is preceded by ready', () => {
++		// The reducer drops `chat/toolCallComplete` unless the call is running, so a
++		// completion that arrives straight after a `pending` start must first move it
++		// to running; otherwise the tool call stays streaming forever.
++		const state = createIcodeTurnState('turn-1');
++		mapAcpSessionUpdate(chat, state, { sessionUpdate: 'tool_call', toolCallId: 't2', title: 'Edit a.ts', kind: 'edit', status: 'pending', rawInput: { path: 'a.ts' } });
++		assert.deepStrictEqual(
++			mapAcpSessionUpdate(chat, state, { sessionUpdate: 'tool_call_update', toolCallId: 't2', status: 'failed', rawOutput: 'boom' }),
++			[
++				{
++					kind: 'action', resource: chat, action: {
++						type: ActionType.ChatToolCallReady, turnId: 'turn-1', toolCallId: 't2',
++						invocationMessage: 'Edit a.ts', confirmed: ToolCallConfirmationReason.NotNeeded, toolInput: '{"path":"a.ts"}',
++					},
++				},
++				{
++					kind: 'action', resource: chat, action: {
++						type: ActionType.ChatToolCallComplete, turnId: 'turn-1', toolCallId: 't2',
++						result: { success: false, pastTenseMessage: 'Edit a.ts', content: [{ type: ToolResultContentType.Text, text: 'boom' }] },
++					},
++				},
++			],
++		);
++	});
++
++	test('a permission request yields a pending confirmation on the existing tool call', () => {
++		const state = createIcodeTurnState('turn-1');
++		mapAcpSessionUpdate(chat, state, { sessionUpdate: 'tool_call', toolCallId: 't1', title: 'Run ls', kind: 'execute', status: 'pending', rawInput: { command: 'ls' } });
++		assert.deepStrictEqual(
++			mapAcpPermissionRequest(chat, state, {
++				sessionId: 's1',
++				toolCall: { toolCallId: 't1', title: 'Run ls', kind: 'execute', status: 'pending', rawInput: { command: 'ls' } },
++				options: [{ optionId: 'allow', name: 'Allow once', kind: 'allow_once' }, { optionId: 'reject', name: 'Reject once', kind: 'reject_once' }],
++			}),
++			[{
++				kind: 'pending_confirmation', chat,
++				state: {
++					status: ToolCallStatus.PendingConfirmation,
++					toolCallId: 't1', toolName: 'shell', displayName: 'Run ls',
++					invocationMessage: 'Run ls', toolInput: '{"command":"ls"}', confirmationTitle: 'Run ls',
++				},
++				permissionKind: 'shell',
++			}],
++		);
++	});
++
++	test('ignores plan, usage and unknown updates', () => {
++		const state = createIcodeTurnState('turn-1');
++		assert.deepStrictEqual(mapAcpSessionUpdate(chat, state, { sessionUpdate: 'plan', entries: [] }), []);
++		assert.deepStrictEqual(mapAcpSessionUpdate(chat, state, { sessionUpdate: 'usage_update', used: 10, size: 100 }), []);
++		assert.deepStrictEqual(mapAcpSessionUpdate(chat, state, { sessionUpdate: 'session_info_update' }), []);
++		assert.deepStrictEqual(mapAcpSessionUpdate(chat, state, { sessionUpdate: 'current_mode_update' }), []);
++		assert.deepStrictEqual(mapAcpSessionUpdate(chat, state, { sessionUpdate: 'branch_snapshot' }), []);
 +	});
 +});

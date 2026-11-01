@@ -446,6 +446,8 @@ export interface IIcodeTurnState {
 	readonly turnId: string;
 	readonly partIds: Map<string, string>;
 	readonly toolTitles: Map<string, string>;
+	/** ACP 一般只在 `tool_call` 上报 `rawInput`，这里存下来给后面的 Ready 用。 */
+	readonly toolInputs: Map<string, string>;
 	readonly readyToolCalls: Set<string>;
 	nextPartSequence: number;
 }
@@ -455,7 +457,7 @@ export function mapAcpSessionUpdate(chat: URI, state: IIcodeTurnState, update: I
 export function mapAcpPermissionRequest(chat: URI, state: IIcodeTurnState, request: IcodePermissionRequest): AgentSignal[];
 ```
 
-- [ ] **Step 1: 写失败测试**
+- [x] **Step 1: 写失败测试**
 
 ```ts
 import assert from 'assert';
@@ -504,7 +506,15 @@ suite('icodeMapEvents', () => {
 		const state = createIcodeTurnState('turn-1');
 		assert.deepStrictEqual(
 			mapAcpSessionUpdate(chat, state, { sessionUpdate: 'tool_call', toolCallId: 't1', title: 'Run ls', kind: 'execute', status: 'in_progress', rawInput: { command: 'ls' } }),
-			[{ kind: 'action', resource: chat, action: { type: ActionType.ChatToolCallStart, turnId: 'turn-1', toolCallId: 't1', toolName: 'shell', displayName: 'Run ls' } }],
+			[
+				{ kind: 'action', resource: chat, action: { type: ActionType.ChatToolCallStart, turnId: 'turn-1', toolCallId: 't1', toolName: 'shell', displayName: 'Run ls' } },
+				{
+					kind: 'action', resource: chat, action: {
+						type: ActionType.ChatToolCallReady, turnId: 'turn-1', toolCallId: 't1',
+						invocationMessage: 'Run ls', confirmed: ToolCallConfirmationReason.NotNeeded, toolInput: '{"command":"ls"}',
+					},
+				},
+			],
 		);
 		assert.deepStrictEqual(
 			mapAcpSessionUpdate(chat, state, { sessionUpdate: 'tool_call_update', toolCallId: 't1', status: 'completed', content: [{ type: 'text', text: 'ok' }], rawOutput: 'ok' }),
@@ -514,6 +524,30 @@ suite('icodeMapEvents', () => {
 					result: { success: true, pastTenseMessage: 'Run ls', content: [{ type: ToolResultContentType.Text, text: 'ok' }] },
 				},
 			}],
+		);
+	});
+
+	test('a completion without a running update is preceded by ready', () => {
+		// reducer 只对 running 的工具调用接受 `chat/toolCallComplete`，所以从 `pending`
+		// 直接到 `failed`/`completed` 时必须先补一条 Ready，否则工具调用永远停在 streaming。
+		const state = createIcodeTurnState('turn-1');
+		mapAcpSessionUpdate(chat, state, { sessionUpdate: 'tool_call', toolCallId: 't2', title: 'Edit a.ts', kind: 'edit', status: 'pending', rawInput: { path: 'a.ts' } });
+		assert.deepStrictEqual(
+			mapAcpSessionUpdate(chat, state, { sessionUpdate: 'tool_call_update', toolCallId: 't2', status: 'failed', rawOutput: 'boom' }),
+			[
+				{
+					kind: 'action', resource: chat, action: {
+						type: ActionType.ChatToolCallReady, turnId: 'turn-1', toolCallId: 't2',
+						invocationMessage: 'Edit a.ts', confirmed: ToolCallConfirmationReason.NotNeeded, toolInput: '{"path":"a.ts"}',
+					},
+				},
+				{
+					kind: 'action', resource: chat, action: {
+						type: ActionType.ChatToolCallComplete, turnId: 'turn-1', toolCallId: 't2',
+						result: { success: false, pastTenseMessage: 'Edit a.ts', content: [{ type: ToolResultContentType.Text, text: 'boom' }] },
+					},
+				},
+			],
 		);
 	});
 
@@ -549,27 +583,27 @@ suite('icodeMapEvents', () => {
 });
 ```
 
-- [ ] **Step 2: 运行测试确认失败**
+- [x] **Step 2: 运行测试确认失败**
 
 Run: `./node_modules/.bin/tsc -p src/tsconfig.json --noCheck --outDir out --rootDir src && npm run test-node -- --run src/vs/platform/agentHost/test/node/icode/icodeMapEvents.test.ts`
 Expected: FAIL，模块不存在。
 
-- [ ] **Step 3: 实现映射**
+- [x] **Step 3: 实现映射**
 
 固定规则（测试已把它们钉死，照做即可）：
 - 文本：`messageId` 为键；首次出现发 `ChatResponsePart`（`content: ''`）+ `ChatDelta`（本次文本），之后只发 `ChatDelta`。part id 为 `icode-part-${++state.nextPartSequence}`。
 - 思考：键固定为 `'__thought__'`，part kind 为 `ResponsePartKind.Reasoning`；首次同样发 `ChatResponsePart`，之后每次发 `ActionType.ChatReasoning`（字段名以 `sessionActions.ts` 的该 action 定义为准）。**不能复用 `ChatDelta`**——reducer 的 `ChatDelta` 分支只对 `ResponsePartKind.Markdown` 追加内容，其它 kind 会被原样丢弃，界面上就看不到思考。
 - 工具名：`execute → 'shell'`、`edit → 'edit'`、`read → 'read'`、`search → 'search'`、`fetch → 'fetch'`、其他 `'other'`。
-- `tool_call` 只发 `ChatToolCallStart`（`toolName`、`displayName: title ?? toolCallId`），记录标题，不发 Ready。
-- `tool_call_update`：`status === 'in_progress'` 且未 Ready 时发一次 `ChatToolCallReady`（`invocationMessage`、`toolInput`、`confirmed: ToolCallConfirmationReason.NotNeeded`）；`status === 'completed' | 'failed'` 时发 `ChatToolCallComplete`，`success` 取 `status === 'completed'`，`pastTenseMessage` 用记录的标题，`content` 优先取 `update.content` 中 `type === 'text'` 的 block 文本（数组则按序拼接），没有才回退 `rawOutput`（非字符串用 `JSON.stringify`），两者都没有就不带 `content`。
+- `tool_call` 只发 `ChatToolCallStart`（`toolName`、`displayName: title ?? toolCallId`），记下标题与 `JSON.stringify(rawInput)`；若该事件本身 `status === 'in_progress'`，紧接着补一条 `ChatToolCallReady`（`invocationMessage`、`toolInput` 取自状态里存的 rawInput、`confirmed: ToolCallConfirmationReason.NotNeeded`）——**reducer 只对 running 的工具调用接受后续 `ChatToolCallComplete`**（`reducer.ts:613-616`），漏了这条工具调用会永远停在 streaming。`status === 'pending'` 时不发 Ready，留给权限请求走 `pending_confirmation`。
+- `tool_call_update`：`status === 'in_progress'` 且未 Ready 时发一次 Ready；`status === 'completed' | 'failed'` 时若尚未 Ready 则**先补 Ready 再发 Complete**（同上，`pending → failed` 直接跳过的场景）；Complete 的 `success` 取 `status === 'completed'`，`pastTenseMessage` 用记录的标题，`content` 优先取 `update.content` 中 `type === 'text'` 的 block 文本（数组则按序拼接），没有才回退 `rawOutput`（非字符串用 `JSON.stringify`），两者都没有就不带 `content`。
 - 权限请求：若该 toolCallId 尚未发过 Start，先补一条 Start；然后发 `pending_confirmation`（`toolInput` 为 `JSON.stringify(rawInput)`，无 rawInput 则省略）；`permissionKind`：`execute → 'shell'`、`edit → 'write'`、`read → 'read'`，其他省略。
 - 其余 `sessionUpdate`（`plan`、`usage_update`、`session_info_update`、`current_mode_update` 以及未知值）一律返回 `[]`——iCode 在 `session/new` 之后会先发几条这类通知，不能当成错误。
 
-- [ ] **Step 4: 运行测试确认通过**
+- [x] **Step 4: 运行测试确认通过**
 
-Expected: PASS（5 passing）。
+Expected: PASS（7 passing）。
 
-- [ ] **Step 5: 导出补丁并提交**
+- [x] **Step 5: 导出补丁并提交**
 
 ```bash
 cd /home/dsun/workspace/picket-code/vscode
