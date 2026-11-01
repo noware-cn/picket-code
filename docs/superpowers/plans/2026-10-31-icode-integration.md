@@ -212,15 +212,16 @@ grep -n "interface IChatUsage\|ChatUsage\|ChatReasoning" src/vs/platform/agentHo
 grep -n "export function isAgentEnabled"   src/vs/platform/agentHost/common/agentService.ts
 ```
 
-- [ ] **Step 1: 写失败测试**
+- [x] **Step 1: 写失败测试**
 
 ```ts
 import assert from 'assert';
 import { PassThrough } from 'stream';
-import { timeout } from '../../../../base/common/async.js';
-import { Event } from '../../../../base/common/event.js';
-import { ensureNoDisposablesAreLeakedInTestSuite } from '../../../../base/test/common/utils.js';
-import { IcodeAcpClient, IIcodeAcpTransport } from '../../node/icode/icodeAcpClient.js';
+import { timeout } from '../../../../../base/common/async.js';
+import { Event } from '../../../../../base/common/event.js';
+import { DisposableStore } from '../../../../../base/common/lifecycle.js';
+import { ensureNoDisposablesAreLeakedInTestSuite } from '../../../../../base/test/common/utils.js';
+import { IcodeAcpClient, IIcodeAcpTransport } from '../../../node/icode/icodeAcpClient.js';
 
 function createTransport() {
 	const toServer = new PassThrough();
@@ -249,11 +250,12 @@ suite('IcodeAcpClient', () => {
 	});
 
 	test('dispatches notifications and server-to-client requests', async () => {
+		const disposables = new DisposableStore();
 		const { transport, toServer, fromServer } = createTransport();
 		const client = new IcodeAcpClient(transport, () => { });
 		const updates: unknown[] = [];
-		client.onNotification('session/update', params => updates.push(params));
-		client.onRequest('session/request_permission', (_params, id) => ({ id, outcome: { outcome: 'selected', optionId: 'allow' } }));
+		disposables.add(client.onNotification('session/update', params => updates.push(params)));
+		disposables.add(client.onRequest('session/request_permission', (_params, id) => ({ id, outcome: { outcome: 'selected', optionId: 'allow' } })));
 
 		fromServer.write(JSON.stringify({ jsonrpc: '2.0', method: 'session/update', params: { sessionId: 's1' } }) + '\n');
 		fromServer.write(JSON.stringify({ jsonrpc: '2.0', id: 7, method: 'session/request_permission', params: { sessionId: 's1' } }) + '\n');
@@ -263,6 +265,7 @@ suite('IcodeAcpClient', () => {
 		assert.deepStrictEqual(await nextMessage(toServer), {
 			jsonrpc: '2.0', id: 7, result: { id: 7, outcome: { outcome: 'selected', optionId: 'allow' } },
 		});
+		disposables.dispose();
 		client.dispose();
 	});
 
@@ -287,7 +290,7 @@ suite('IcodeAcpClient', () => {
 });
 ```
 
-- [ ] **Step 2: 运行测试确认失败**
+- [x] **Step 2: 运行测试确认失败**
 
 ```bash
 cd /home/dsun/workspace/picket-code/vscode
@@ -296,7 +299,7 @@ cd /home/dsun/workspace/picket-code/vscode
 
 Expected: FAIL，`Cannot find module .../icode/icodeAcpClient.js`。
 
-- [ ] **Step 3: 实现客户端**
+- [x] **Step 3: 实现客户端**
 
 要点（实现细节由签名与测试确定）：
 - `_nextId = 1`；`request` 记录 `{ resolve, reject }`，写出 `{ jsonrpc: '2.0', id, method, params }`；`params === undefined` 时不带该键。
@@ -306,12 +309,12 @@ Expected: FAIL，`Cannot find module .../icode/icodeAcpClient.js`。
 - `stdout` 的 `end`/`error` 与 `transport.onExit` 都走同一个 `_shutdown`：拒绝所有 pending，触发 `onExit`，且只触发一次。
 - `dispose()`：标记 disposed，拒绝 pending，`transport.kill()`。
 
-- [ ] **Step 4: 运行测试确认通过**
+- [x] **Step 4: 运行测试确认通过**
 
 Run: `./node_modules/.bin/tsc -p src/tsconfig.json --noCheck --outDir out --rootDir src && npm run test-node -- --run src/vs/platform/agentHost/test/node/icode/icodeAcpClient.test.ts`
 Expected: PASS（4 passing）。
 
-- [ ] **Step 5: 导出补丁并提交**
+- [x] **Step 5: 导出补丁并提交**
 
 ```bash
 cd /home/dsun/workspace/picket-code/vscode

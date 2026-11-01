@@ -1,0 +1,345 @@
+diff --git a/src/vs/platform/agentHost/node/icode/icodeAcpClient.ts b/src/vs/platform/agentHost/node/icode/icodeAcpClient.ts
+new file mode 100644
+index 00000000..53a64511
+--- /dev/null
++++ b/src/vs/platform/agentHost/node/icode/icodeAcpClient.ts
+@@ -0,0 +1,255 @@
++/*---------------------------------------------------------------------------------------------
++ *  Copyright (c) Microsoft Corporation. All rights reserved.
++ *  Licensed under the MIT License. See License.txt in the project root for license information.
++ *--------------------------------------------------------------------------------------------*/
++
++import { Emitter, Event } from '../../../../base/common/event.js';
++import { DisposableStore, IDisposable, toDisposable } from '../../../../base/common/lifecycle.js';
++
++export type IcodeJsonValue = null | boolean | number | string | IcodeJsonValue[] | { [key: string]: IcodeJsonValue };
++
++export interface IIcodeAcpTransport {
++	readonly stdin: NodeJS.WritableStream;
++	readonly stdout: NodeJS.ReadableStream;
++	readonly onExit: Event<number | null>;
++	kill(): void;
++}
++
++export interface IIcodeAcpClient extends IDisposable {
++	readonly onExit: Event<number | null>;
++	request<R = unknown>(method: string, params?: IcodeJsonValue): Promise<R>;
++	notify(method: string, params?: IcodeJsonValue): void;
++	onNotification(method: string, handler: (params: any) => void): IDisposable;
++	onRequest<R = unknown>(method: string, handler: (params: any, id: number | string) => R | Promise<R>): IDisposable;
++	respond(id: number | string, result: IcodeJsonValue): void;
++}
++
++interface IRpcMessage {
++	jsonrpc: '2.0';
++	id?: number | string;
++	method?: string;
++	params?: IcodeJsonValue;
++	result?: IcodeJsonValue;
++	error?: { code: number; message: string; data?: IcodeJsonValue };
++}
++
++interface IPendingRequest {
++	readonly resolve: (value: any) => void;
++	readonly reject: (reason: Error) => void;
++}
++
++/**
++ * JSON-RPC 2.0 client for the iCode ACP subprocess, speaking newline-delimited
++ * JSON over the transport's stdio pipes.
++ */
++export class IcodeAcpClient implements IIcodeAcpClient {
++
++	private readonly _onExit = new Emitter<number | null>();
++	readonly onExit = this._onExit.event;
++
++	private readonly _store = new DisposableStore();
++	private readonly _pendingRequests = new Map<number | string, IPendingRequest>();
++	private readonly _notificationHandlers = new Map<string, Set<(params: any) => void>>();
++	private readonly _requestHandlers = new Map<string, (params: any, id: number | string) => unknown>();
++
++	private _nextId = 1;
++	private _readBuffer = '';
++	private _disposed = false;
++	private _exitFired = false;
++
++	constructor(
++		private readonly _transport: IIcodeAcpTransport,
++		private readonly _log: (message: string) => void,
++	) {
++		const stdout = this._transport.stdout;
++		const onData = (chunk: Buffer | string) => this._onData(chunk.toString());
++		const onEnd = () => this._shutdown();
++		const onError = (err: Error) => {
++			this._log(`[IcodeAcpClient] stdout error: ${err.message}`);
++			this._shutdown();
++		};
++		stdout.on('data', onData);
++		stdout.on('end', onEnd);
++		stdout.on('error', onError);
++		this._store.add(toDisposable(() => {
++			stdout.removeListener('data', onData);
++			stdout.removeListener('end', onEnd);
++			stdout.removeListener('error', onError);
++		}));
++		this._store.add(this._transport.onExit(code => this._shutdown(code)));
++	}
++
++	request<R = unknown>(method: string, params?: IcodeJsonValue): Promise<R> {
++		if (this._disposed) {
++			return Promise.reject(new Error(`[IcodeAcpClient] request '${method}' after dispose`));
++		}
++
++		const id = this._nextId++;
++		const promise = new Promise<R>((resolve, reject) => {
++			this._pendingRequests.set(id, { resolve, reject });
++		});
++		this._write({ jsonrpc: '2.0', id, method, ...(params === undefined ? {} : { params }) });
++		return promise;
++	}
++
++	notify(method: string, params?: IcodeJsonValue): void {
++		this._write({ jsonrpc: '2.0', method, ...(params === undefined ? {} : { params }) });
++	}
++
++	onNotification(method: string, handler: (params: any) => void): IDisposable {
++		let handlers = this._notificationHandlers.get(method);
++		if (!handlers) {
++			handlers = new Set();
++			this._notificationHandlers.set(method, handlers);
++		}
++		handlers.add(handler);
++		return toDisposable(() => handlers.delete(handler));
++	}
++
++	onRequest<R = unknown>(method: string, handler: (params: any, id: number | string) => R | Promise<R>): IDisposable {
++		this._requestHandlers.set(method, handler);
++		return toDisposable(() => {
++			if (this._requestHandlers.get(method) === handler) {
++				this._requestHandlers.delete(method);
++			}
++		});
++	}
++
++	respond(id: number | string, result: IcodeJsonValue): void {
++		this._write({ jsonrpc: '2.0', id, result });
++	}
++
++	dispose(): void {
++		if (this._disposed) {
++			return;
++		}
++
++		this._disposed = true;
++		this._rejectPendingRequests(new Error('[IcodeAcpClient] client disposed'));
++		this._store.dispose();
++		this._onExit.dispose();
++		this._transport.kill();
++	}
++
++	private _respondError(id: number | string, code: number, message: string): void {
++		this._write({ jsonrpc: '2.0', id, error: { code, message } });
++	}
++
++	private _write(message: IRpcMessage): void {
++		if (this._disposed) {
++			return;
++		}
++		this._transport.stdin.write(`${JSON.stringify(message)}\n`);
++	}
++
++	private _onData(chunk: string): void {
++		if (this._disposed) {
++			return;
++		}
++
++		this._readBuffer += chunk;
++		let index: number;
++		while ((index = this._readBuffer.indexOf('\n')) >= 0) {
++			const line = this._readBuffer.slice(0, index).trim();
++			this._readBuffer = this._readBuffer.slice(index + 1);
++			if (line) {
++				this._handleLine(line);
++			}
++		}
++	}
++
++	private _handleLine(line: string): void {
++		let message: IRpcMessage;
++		try {
++			message = JSON.parse(line);
++		} catch {
++			this._log(`[IcodeAcpClient] ignoring malformed line: ${line}`);
++			return;
++		}
++
++		if (!message || typeof message !== 'object') {
++			this._log(`[IcodeAcpClient] ignoring non-object message: ${line}`);
++			return;
++		}
++
++		if (message.method === undefined) {
++			this._handleResponse(message);
++		} else if (message.id !== undefined) {
++			this._handleServerRequest(message.method, message.id, message.params);
++		} else {
++			this._handleNotification(message.method, message.params);
++		}
++	}
++
++	private _handleResponse(message: IRpcMessage): void {
++		if (message.id === undefined) {
++			this._log('[IcodeAcpClient] ignoring response without id');
++			return;
++		}
++
++		const pending = this._pendingRequests.get(message.id);
++		if (!pending) {
++			this._log(`[IcodeAcpClient] ignoring response for unknown request id ${message.id}`);
++			return;
++		}
++
++		this._pendingRequests.delete(message.id);
++		if (message.error) {
++			pending.reject(new Error(message.error.message));
++		} else {
++			pending.resolve(message.result);
++		}
++	}
++
++	private _handleServerRequest(method: string, id: number | string, params: IcodeJsonValue | undefined): void {
++		const handler = this._requestHandlers.get(method);
++		if (!handler) {
++			this._respondError(id, -32601, 'Method not found');
++			return;
++		}
++
++		Promise.resolve()
++			.then(() => handler(params, id))
++			.then(result => {
++				if (!this._disposed) {
++					this.respond(id, result as IcodeJsonValue);
++				}
++			})
++			.catch(err => {
++				this._log(`[IcodeAcpClient] request handler '${method}' failed: ${err instanceof Error ? err.message : String(err)}`);
++				if (!this._disposed) {
++					this._respondError(id, -32603, err instanceof Error ? err.message : String(err));
++				}
++			});
++	}
++
++	private _handleNotification(method: string, params: IcodeJsonValue | undefined): void {
++		for (const handler of this._notificationHandlers.get(method) ?? []) {
++			try {
++				const result = handler(params) as unknown;
++				if (result instanceof Promise) {
++					result.catch(err => this._log(`[IcodeAcpClient] notification handler '${method}' failed: ${err instanceof Error ? err.message : String(err)}`));
++				}
++			} catch (err) {
++				this._log(`[IcodeAcpClient] notification handler '${method}' failed: ${err instanceof Error ? err.message : String(err)}`);
++			}
++		}
++	}
++
++	private _shutdown(code?: number | null): void {
++		this._rejectPendingRequests(new Error('[IcodeAcpClient] transport closed'));
++		if (this._exitFired || this._disposed) {
++			return;
++		}
++		this._exitFired = true;
++		this._onExit.fire(code ?? null);
++	}
++
++	private _rejectPendingRequests(reason: Error): void {
++		const pending = [...this._pendingRequests.values()];
++		this._pendingRequests.clear();
++		for (const request of pending) {
++			request.reject(reason);
++		}
++	}
++}
+diff --git a/src/vs/platform/agentHost/test/node/icode/icodeAcpClient.test.ts b/src/vs/platform/agentHost/test/node/icode/icodeAcpClient.test.ts
+new file mode 100644
+index 00000000..485f455b
+--- /dev/null
++++ b/src/vs/platform/agentHost/test/node/icode/icodeAcpClient.test.ts
+@@ -0,0 +1,78 @@
++/*---------------------------------------------------------------------------------------------
++ *  Copyright (c) Microsoft Corporation. All rights reserved.
++ *  Licensed under the MIT License. See License.txt in the project root for license information.
++ *--------------------------------------------------------------------------------------------*/
++
++import assert from 'assert';
++import { PassThrough } from 'stream';
++import { timeout } from '../../../../../base/common/async.js';
++import { Event } from '../../../../../base/common/event.js';
++import { DisposableStore } from '../../../../../base/common/lifecycle.js';
++import { ensureNoDisposablesAreLeakedInTestSuite } from '../../../../../base/test/common/utils.js';
++import { IcodeAcpClient, IIcodeAcpTransport } from '../../../node/icode/icodeAcpClient.js';
++
++function createTransport() {
++	const toServer = new PassThrough();
++	const fromServer = new PassThrough();
++	const transport: IIcodeAcpTransport = { stdin: toServer, stdout: fromServer, onExit: Event.None, kill: () => { } };
++	return { transport, toServer, fromServer };
++}
++
++function nextMessage(stream: PassThrough): Promise<any> {
++	return new Promise(resolve => stream.once('data', (chunk: Buffer) => resolve(JSON.parse(chunk.toString().trim()))));
++}
++
++suite('IcodeAcpClient', () => {
++	ensureNoDisposablesAreLeakedInTestSuite();
++
++	test('request writes a JSON-RPC 2.0 line and resolves with the matching result', async () => {
++		const { transport, toServer, fromServer } = createTransport();
++		const client = new IcodeAcpClient(transport, () => { });
++		const pending = client.request('initialize', { protocolVersion: 1 });
++		assert.deepStrictEqual(await nextMessage(toServer), {
++			jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: 1 },
++		});
++		fromServer.write(JSON.stringify({ jsonrpc: '2.0', id: 1, result: { protocolVersion: 1 } }) + '\n');
++		assert.deepStrictEqual(await pending, { protocolVersion: 1 });
++		client.dispose();
++	});
++
++	test('dispatches notifications and server-to-client requests', async () => {
++		const disposables = new DisposableStore();
++		const { transport, toServer, fromServer } = createTransport();
++		const client = new IcodeAcpClient(transport, () => { });
++		const updates: unknown[] = [];
++		disposables.add(client.onNotification('session/update', params => updates.push(params)));
++		disposables.add(client.onRequest('session/request_permission', (_params, id) => ({ id, outcome: { outcome: 'selected', optionId: 'allow' } })));
++
++		fromServer.write(JSON.stringify({ jsonrpc: '2.0', method: 'session/update', params: { sessionId: 's1' } }) + '\n');
++		fromServer.write(JSON.stringify({ jsonrpc: '2.0', id: 7, method: 'session/request_permission', params: { sessionId: 's1' } }) + '\n');
++
++		await timeout(10);
++		assert.deepStrictEqual(updates, [{ sessionId: 's1' }]);
++		assert.deepStrictEqual(await nextMessage(toServer), {
++			jsonrpc: '2.0', id: 7, result: { id: 7, outcome: { outcome: 'selected', optionId: 'allow' } },
++		});
++		disposables.dispose();
++		client.dispose();
++	});
++
++	test('answers an unhandled server request with method-not-found', async () => {
++		const { transport, toServer, fromServer } = createTransport();
++		const client = new IcodeAcpClient(transport, () => { });
++		fromServer.write(JSON.stringify({ jsonrpc: '2.0', id: 9, method: 'unknown/method', params: {} }) + '\n');
++		const response = await nextMessage(toServer);
++		assert.strictEqual(response.id, 9);
++		assert.strictEqual(response.error.code, -32601);
++		client.dispose();
++	});
++
++	test('dispose rejects in-flight requests and ignores later input', async () => {
++		const { transport, fromServer } = createTransport();
++		const client = new IcodeAcpClient(transport, () => { });
++		const pending = client.request('session/new', { cwd: '/tmp' });
++		client.dispose();
++		await assert.rejects(pending);
++		fromServer.write(JSON.stringify({ jsonrpc: '2.0', id: 1, result: {} }) + '\n');
++	});
++});
