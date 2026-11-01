@@ -1,118 +1,208 @@
 diff --git a/src/vs/platform/agentHost/node/icode/icodeAcpClient.ts b/src/vs/platform/agentHost/node/icode/icodeAcpClient.ts
 new file mode 100644
-index 00000000..53a64511
+index 00000000..4393d9d2
 --- /dev/null
 +++ b/src/vs/platform/agentHost/node/icode/icodeAcpClient.ts
-@@ -0,0 +1,255 @@
+@@ -0,0 +1,327 @@
 +/*---------------------------------------------------------------------------------------------
 + *  Copyright (c) Microsoft Corporation. All rights reserved.
 + *  Licensed under the MIT License. See License.txt in the project root for license information.
 + *--------------------------------------------------------------------------------------------*/
 +
++import { isThenable } from '../../../../base/common/async.js';
++import { CancellationToken } from '../../../../base/common/cancellation.js';
++import { BugIndicatingError } from '../../../../base/common/errors.js';
 +import { Emitter, Event } from '../../../../base/common/event.js';
++import { IJsonRpcNotification, IJsonRpcRequest, JsonRpcError, JsonRpcId, JsonRpcMessage, JsonRpcProtocol } from '../../../../base/common/jsonRpcProtocol.js';
 +import { DisposableStore, IDisposable, toDisposable } from '../../../../base/common/lifecycle.js';
++import { StreamSplitter } from '../../../../base/node/nodeStreams.js';
 +
 +export type IcodeJsonValue = null | boolean | number | string | IcodeJsonValue[] | { [key: string]: IcodeJsonValue };
++
++/** JSON-RPC standard error code; `JsonRpcProtocol` keeps its error codes private. */
++const METHOD_NOT_FOUND = -32601;
++/** Request cancellation notification used by the ACP/LSP lineage of JSON-RPC. */
++const CANCEL_REQUEST_METHOD = '$/cancel_request';
++/** Upper bound for a single stdout line; anything larger is a framing failure, not a message. */
++const MAX_LINE_LENGTH = 4 * 1024 * 1024;
 +
 +export interface IIcodeAcpTransport {
 +	readonly stdin: NodeJS.WritableStream;
 +	readonly stdout: NodeJS.ReadableStream;
++	/** Fires exactly once, when the process exited or could not be spawned. */
 +	readonly onExit: Event<number | null>;
++	/** True once the process exited or failed to spawn. */
++	readonly exited: boolean;
++	/** Exit code, or `null` when unknown (signal, spawn failure or still running). */
++	readonly exitCode: number | null;
++	/** The spawn error, when the process could not be started. */
++	readonly error: Error | undefined;
++	/** Graceful and idempotent shutdown; a second call forces immediate termination. */
 +	kill(): void;
 +}
 +
++/**
++ * JSON-RPC 2.0 facade over an iCode ACP subprocess.
++ *
++ * Handler registration is single-registration per method for both
++ * {@link onNotification} and {@link onRequest}: registering a second handler for
++ * the same method is a programming error and throws, so the two cannot drift
++ * apart.
++ */
 +export interface IIcodeAcpClient extends IDisposable {
 +	readonly onExit: Event<number | null>;
-+	request<R = unknown>(method: string, params?: IcodeJsonValue): Promise<R>;
++	/** True once the process exited; late `onExit` subscribers must check this. */
++	readonly exited: boolean;
++	/** Exit code, or `null` while running, on a signal, or after a spawn failure. */
++	readonly exitCode: number | null;
++	request<R = unknown>(method: string, params?: IcodeJsonValue, token?: CancellationToken): Promise<R>;
 +	notify(method: string, params?: IcodeJsonValue): void;
 +	onNotification(method: string, handler: (params: any) => void): IDisposable;
-+	onRequest<R = unknown>(method: string, handler: (params: any, id: number | string) => R | Promise<R>): IDisposable;
-+	respond(id: number | string, result: IcodeJsonValue): void;
-+}
-+
-+interface IRpcMessage {
-+	jsonrpc: '2.0';
-+	id?: number | string;
-+	method?: string;
-+	params?: IcodeJsonValue;
-+	result?: IcodeJsonValue;
-+	error?: { code: number; message: string; data?: IcodeJsonValue };
-+}
-+
-+interface IPendingRequest {
-+	readonly resolve: (value: any) => void;
-+	readonly reject: (reason: Error) => void;
++	/**
++	 * Registers the handler for a server-to-client request. The returned value is
++	 * sent as the response, so a handler that needs the user's answer must return
++	 * a promise that settles later; `undefined` is sent as `null`.
++	 */
++	onRequest<R = unknown>(method: string, handler: (params: any, id: JsonRpcId) => R | Promise<R>): IDisposable;
 +}
 +
 +/**
-+ * JSON-RPC 2.0 client for the iCode ACP subprocess, speaking newline-delimited
-+ * JSON over the transport's stdio pipes.
++ * Newline-delimited JSON-RPC client for the iCode ACP subprocess.
++ *
++ * Framing is delegated to {@link StreamSplitter} and message handling to
++ * {@link JsonRpcProtocol}; this class only owns the transport, the stdout pipe
++ * and the exit state machine.
 + */
 +export class IcodeAcpClient implements IIcodeAcpClient {
 +
 +	private readonly _onExit = new Emitter<number | null>();
-+	readonly onExit = this._onExit.event;
++	readonly onExit: Event<number | null> = this._onExit.event;
++
++	get exited(): boolean {
++		return this._exited;
++	}
++
++	get exitCode(): number | null {
++		return this._exitCode;
++	}
 +
 +	private readonly _store = new DisposableStore();
-+	private readonly _pendingRequests = new Map<number | string, IPendingRequest>();
-+	private readonly _notificationHandlers = new Map<string, Set<(params: any) => void>>();
-+	private readonly _requestHandlers = new Map<string, (params: any, id: number | string) => unknown>();
++	private readonly _protocol: JsonRpcProtocol;
++	private readonly _splitter: StreamSplitter;
++	private readonly _notificationHandlers = new Map<string, (params: any) => void>();
++	private readonly _requestHandlers = new Map<string, (params: any, id: JsonRpcId) => unknown>();
 +
-+	private _nextId = 1;
-+	private _readBuffer = '';
++	private _lineBytes = 0;
++	private _stdoutClosed = false;
++	private _exited = false;
++	private _exitCode: number | null = null;
 +	private _disposed = false;
-+	private _exitFired = false;
 +
 +	constructor(
 +		private readonly _transport: IIcodeAcpTransport,
 +		private readonly _log: (message: string) => void,
 +	) {
++		this._protocol = this._store.add(new JsonRpcProtocol(
++			message => this._write(message),
++			{
++				handleRequest: request => this._handleServerRequest(request),
++				handleNotification: notification => this._dispatchNotification(notification),
++			},
++		));
++
++		this._splitter = new StreamSplitter('\n');
++		this._splitter.setEncoding('utf8'); // decodes multi-byte sequences that straddle chunks
++		this._splitter.on('data', (line: string) => this._onLine(line));
++		this._splitter.on('error', (error: Error) => this._log(`[IcodeAcpClient] stdout framing error: ${error.message}`));
++
 +		const stdout = this._transport.stdout;
-+		const onData = (chunk: Buffer | string) => this._onData(chunk.toString());
-+		const onEnd = () => this._shutdown();
-+		const onError = (err: Error) => {
-+			this._log(`[IcodeAcpClient] stdout error: ${err.message}`);
-+			this._shutdown();
++		const stdin = this._transport.stdin;
++
++		const onStdoutData = (chunk: Buffer | string) => {
++			if (this._disposed || this._stdoutClosed) {
++				return;
++			}
++			const buffer = typeof chunk === 'string' ? Buffer.from(chunk, 'utf8') : chunk;
++			const lastNewline = buffer.lastIndexOf(0x0a);
++			this._lineBytes = lastNewline === -1 ? this._lineBytes + buffer.length : buffer.length - lastNewline - 1;
++			if (this._lineBytes > MAX_LINE_LENGTH) {
++				this._lineBytes = 0;
++				this._log(`[IcodeAcpClient] stdout sent a line longer than ${MAX_LINE_LENGTH} bytes; stopping the transport`);
++				this._transport.kill();
++				return;
++			}
++			this._splitter.write(buffer);
 +		};
-+		stdout.on('data', onData);
-+		stdout.on('end', onEnd);
-+		stdout.on('error', onError);
++		const onStdoutEnd = () => {
++			// stdout ending only means "no more responses"; the process exit (and its
++			// exit code) is reported by the transport, so no exit event is fired here.
++			this._stdoutClosed = true;
++			this._splitter.end();
++			this._protocol.cancelAllRequests();
++		};
++		const onStdoutError = (error: Error) => {
++			this._log(`[IcodeAcpClient] stdout error: ${error.message}`);
++			onStdoutEnd();
++		};
++		const onStdinError = (error: Error) => this._log(`[IcodeAcpClient] stdin error: ${error.message}`);
++
++		stdout.on('data', onStdoutData);
++		stdout.on('end', onStdoutEnd);
++		stdout.on('error', onStdoutError);
++		stdin.on('error', onStdinError);
++
 +		this._store.add(toDisposable(() => {
-+			stdout.removeListener('data', onData);
-+			stdout.removeListener('end', onEnd);
-+			stdout.removeListener('error', onError);
++			stdout.removeListener('data', onStdoutData);
++			stdout.removeListener('end', onStdoutEnd);
++			stdout.removeListener('error', onStdoutError);
++			stdin.removeListener('error', onStdinError);
++			this._splitter.destroy();
 +		}));
-+		this._store.add(this._transport.onExit(code => this._shutdown(code)));
++
++		this._store.add(this._transport.onExit(code => this._onTransportExit(code)));
++		if (this._transport.exited) {
++			// The transport exited before we could subscribe, so onExit will not fire again.
++			this._onTransportExit(this._transport.exitCode);
++		}
 +	}
 +
-+	request<R = unknown>(method: string, params?: IcodeJsonValue): Promise<R> {
-+		if (this._disposed) {
-+			return Promise.reject(new Error(`[IcodeAcpClient] request '${method}' after dispose`));
++	request<R = unknown>(method: string, params?: IcodeJsonValue, token: CancellationToken = CancellationToken.None): Promise<R> {
++		const unavailable = this._unavailableReason();
++		if (unavailable !== undefined) {
++			return Promise.reject(new Error(`[IcodeAcpClient] cannot send request '${method}': ${unavailable}`));
 +		}
 +
-+		const id = this._nextId++;
-+		const promise = new Promise<R>((resolve, reject) => {
-+			this._pendingRequests.set(id, { resolve, reject });
-+		});
-+		this._write({ jsonrpc: '2.0', id, method, ...(params === undefined ? {} : { params }) });
-+		return promise;
++		return this._protocol.sendRequest<R>(
++			{ method, params },
++			token,
++			id => this._protocol.sendNotification({ method: CANCEL_REQUEST_METHOD, params: { requestId: id } }),
++		);
 +	}
 +
 +	notify(method: string, params?: IcodeJsonValue): void {
-+		this._write({ jsonrpc: '2.0', method, ...(params === undefined ? {} : { params }) });
++		if (this._disposed) {
++			this._log(`[IcodeAcpClient] dropping notification '${method}' after dispose`);
++			return;
++		}
++		this._protocol.sendNotification({ method, params });
 +	}
 +
 +	onNotification(method: string, handler: (params: any) => void): IDisposable {
-+		let handlers = this._notificationHandlers.get(method);
-+		if (!handlers) {
-+			handlers = new Set();
-+			this._notificationHandlers.set(method, handlers);
++		if (this._notificationHandlers.has(method)) {
++			throw new BugIndicatingError(`[IcodeAcpClient] a notification handler for '${method}' is already registered`);
 +		}
-+		handlers.add(handler);
-+		return toDisposable(() => handlers.delete(handler));
++		this._notificationHandlers.set(method, handler);
++		return toDisposable(() => {
++			if (this._notificationHandlers.get(method) === handler) {
++				this._notificationHandlers.delete(method);
++			}
++		});
 +	}
 +
-+	onRequest<R = unknown>(method: string, handler: (params: any, id: number | string) => R | Promise<R>): IDisposable {
++	onRequest<R = unknown>(method: string, handler: (params: any, id: JsonRpcId) => R | Promise<R>): IDisposable {
++		if (this._requestHandlers.has(method)) {
++			throw new BugIndicatingError(`[IcodeAcpClient] a request handler for '${method}' is already registered`);
++		}
 +		this._requestHandlers.set(method, handler);
 +		return toDisposable(() => {
 +			if (this._requestHandlers.get(method) === handler) {
@@ -121,253 +211,396 @@ index 00000000..53a64511
 +		});
 +	}
 +
-+	respond(id: number | string, result: IcodeJsonValue): void {
-+		this._write({ jsonrpc: '2.0', id, result });
-+	}
-+
 +	dispose(): void {
 +		if (this._disposed) {
 +			return;
 +		}
-+
 +		this._disposed = true;
-+		this._rejectPendingRequests(new Error('[IcodeAcpClient] client disposed'));
++		this._protocol.cancelAllRequests();
++		this._notificationHandlers.clear();
++		this._requestHandlers.clear();
 +		this._store.dispose();
 +		this._onExit.dispose();
 +		this._transport.kill();
 +	}
 +
-+	private _respondError(id: number | string, code: number, message: string): void {
-+		this._write({ jsonrpc: '2.0', id, error: { code, message } });
++	private _unavailableReason(): string | undefined {
++		if (this._disposed) {
++			return 'client disposed';
++		}
++		if (this._exited) {
++			return `icode exited (${this._exitCode ?? 'no exit code'})`;
++		}
++		if (this._stdoutClosed) {
++			return 'stdout closed';
++		}
++		const stdin = this._transport.stdin as NodeJS.WritableStream & { writableEnded?: boolean; destroyed?: boolean };
++		if (stdin.writable === false || stdin.writableEnded === true || stdin.destroyed === true) {
++			return 'stdin closed';
++		}
++		return undefined;
 +	}
 +
-+	private _write(message: IRpcMessage): void {
-+		if (this._disposed) {
++	private _write(message: JsonRpcMessage): void {
++		if (this._disposed || this._stdoutClosed) {
++			this._log(`[IcodeAcpClient] dropping outgoing message while shut down: ${JSON.stringify(message).slice(0, 512)}`);
 +			return;
 +		}
-+		this._transport.stdin.write(`${JSON.stringify(message)}\n`);
-+	}
-+
-+	private _onData(chunk: string): void {
-+		if (this._disposed) {
-+			return;
-+		}
-+
-+		this._readBuffer += chunk;
-+		let index: number;
-+		while ((index = this._readBuffer.indexOf('\n')) >= 0) {
-+			const line = this._readBuffer.slice(0, index).trim();
-+			this._readBuffer = this._readBuffer.slice(index + 1);
-+			if (line) {
-+				this._handleLine(line);
-+			}
-+		}
-+	}
-+
-+	private _handleLine(line: string): void {
-+		let message: IRpcMessage;
 +		try {
-+			message = JSON.parse(line);
-+		} catch {
-+			this._log(`[IcodeAcpClient] ignoring malformed line: ${line}`);
-+			return;
-+		}
-+
-+		if (!message || typeof message !== 'object') {
-+			this._log(`[IcodeAcpClient] ignoring non-object message: ${line}`);
-+			return;
-+		}
-+
-+		if (message.method === undefined) {
-+			this._handleResponse(message);
-+		} else if (message.id !== undefined) {
-+			this._handleServerRequest(message.method, message.id, message.params);
-+		} else {
-+			this._handleNotification(message.method, message.params);
-+		}
-+	}
-+
-+	private _handleResponse(message: IRpcMessage): void {
-+		if (message.id === undefined) {
-+			this._log('[IcodeAcpClient] ignoring response without id');
-+			return;
-+		}
-+
-+		const pending = this._pendingRequests.get(message.id);
-+		if (!pending) {
-+			this._log(`[IcodeAcpClient] ignoring response for unknown request id ${message.id}`);
-+			return;
-+		}
-+
-+		this._pendingRequests.delete(message.id);
-+		if (message.error) {
-+			pending.reject(new Error(message.error.message));
-+		} else {
-+			pending.resolve(message.result);
-+		}
-+	}
-+
-+	private _handleServerRequest(method: string, id: number | string, params: IcodeJsonValue | undefined): void {
-+		const handler = this._requestHandlers.get(method);
-+		if (!handler) {
-+			this._respondError(id, -32601, 'Method not found');
-+			return;
-+		}
-+
-+		Promise.resolve()
-+			.then(() => handler(params, id))
-+			.then(result => {
-+				if (!this._disposed) {
-+					this.respond(id, result as IcodeJsonValue);
-+				}
-+			})
-+			.catch(err => {
-+				this._log(`[IcodeAcpClient] request handler '${method}' failed: ${err instanceof Error ? err.message : String(err)}`);
-+				if (!this._disposed) {
-+					this._respondError(id, -32603, err instanceof Error ? err.message : String(err));
++			this._transport.stdin.write(`${JSON.stringify(message)}\n`, error => {
++				if (error) {
++					this._log(`[IcodeAcpClient] failed to write to icode: ${error.message}`);
 +				}
 +			});
-+	}
-+
-+	private _handleNotification(method: string, params: IcodeJsonValue | undefined): void {
-+		for (const handler of this._notificationHandlers.get(method) ?? []) {
-+			try {
-+				const result = handler(params) as unknown;
-+				if (result instanceof Promise) {
-+					result.catch(err => this._log(`[IcodeAcpClient] notification handler '${method}' failed: ${err instanceof Error ? err.message : String(err)}`));
-+				}
-+			} catch (err) {
-+				this._log(`[IcodeAcpClient] notification handler '${method}' failed: ${err instanceof Error ? err.message : String(err)}`);
-+			}
++		} catch (error) {
++			this._log(`[IcodeAcpClient] failed to write to icode: ${error instanceof Error ? error.message : String(error)}`);
 +		}
 +	}
 +
-+	private _shutdown(code?: number | null): void {
-+		this._rejectPendingRequests(new Error('[IcodeAcpClient] transport closed'));
-+		if (this._exitFired || this._disposed) {
++	private _onLine(line: string): void {
++		const trimmed = line.trim();
++		if (!trimmed) {
 +			return;
 +		}
-+		this._exitFired = true;
-+		this._onExit.fire(code ?? null);
++
++		let message: unknown;
++		try {
++			message = JSON.parse(trimmed);
++		} catch {
++			this._log(`[IcodeAcpClient] ignoring malformed line: ${trimmed.slice(0, 512)}`);
++			return;
++		}
++
++		if (!isJsonRpcPayload(message)) {
++			this._log(`[IcodeAcpClient] ignoring non-object message: ${trimmed.slice(0, 512)}`);
++			return;
++		}
++
++		void this._protocol.handleMessage(message).catch(error => {
++			this._log(`[IcodeAcpClient] failed to handle message: ${error instanceof Error ? error.message : String(error)}`);
++		});
 +	}
 +
-+	private _rejectPendingRequests(reason: Error): void {
-+		const pending = [...this._pendingRequests.values()];
-+		this._pendingRequests.clear();
-+		for (const request of pending) {
-+			request.reject(reason);
++	private async _handleServerRequest(request: IJsonRpcRequest): Promise<unknown> {
++		const handler = this._requestHandlers.get(request.method);
++		if (!handler) {
++			throw new JsonRpcError(METHOD_NOT_FOUND, `Method not found: ${request.method}`);
++		}
++		const result = await handler(request.params, request.id);
++		// JSON.stringify drops `undefined`, which would leave a response without a
++		// `result`; `null` is the JSON-RPC representation of "no value".
++		return result === undefined ? null : result;
++	}
++
++	private _dispatchNotification(notification: IJsonRpcNotification): void {
++		const handler = this._notificationHandlers.get(notification.method);
++		if (!handler) {
++			this._log(`[IcodeAcpClient] ignoring unhandled notification '${notification.method}'`);
++			return;
++		}
++		try {
++			const result = handler(notification.params) as unknown;
++			if (isThenable(result)) {
++				result.then(undefined, error => this._log(`[IcodeAcpClient] notification handler '${notification.method}' failed: ${error instanceof Error ? error.message : String(error)}`));
++			}
++		} catch (error) {
++			this._log(`[IcodeAcpClient] notification handler '${notification.method}' failed: ${error instanceof Error ? error.message : String(error)}`);
 +		}
 +	}
++
++	private _onTransportExit(code: number | null): void {
++		if (this._exited) {
++			return;
++		}
++		this._exited = true;
++		this._exitCode = code;
++		this._stdoutClosed = true;
++		this._protocol.cancelAllRequests();
++		if (code !== 0) {
++			const spawnError = this._transport.error;
++			this._log(`[IcodeAcpClient] icode exited (${code === null ? 'no exit code' : `code ${code}`})${spawnError ? `: ${spawnError.message}` : ''}`);
++		}
++		this._onExit.fire(code);
++	}
++}
++
++/** Mirrors the structural checks used by `JsonRpcProtocol`, which requires objects. */
++function isJsonRpcPayload(value: unknown): value is JsonRpcMessage | JsonRpcMessage[] {
++	if (Array.isArray(value)) {
++		return value.every(entry => typeof entry === 'object' && entry !== null && !Array.isArray(entry));
++	}
++	return typeof value === 'object' && value !== null;
 +}
 diff --git a/src/vs/platform/agentHost/node/icode/icodeLaunchConfig.ts b/src/vs/platform/agentHost/node/icode/icodeLaunchConfig.ts
 new file mode 100644
-index 00000000..18eac7da
+index 00000000..89074c9c
 --- /dev/null
 +++ b/src/vs/platform/agentHost/node/icode/icodeLaunchConfig.ts
-@@ -0,0 +1,97 @@
+@@ -0,0 +1,258 @@
 +/*---------------------------------------------------------------------------------------------
 + *  Copyright (c) Microsoft Corporation. All rights reserved.
 + *  Licensed under the MIT License. See License.txt in the project root for license information.
 + *--------------------------------------------------------------------------------------------*/
 +
 +import { spawn } from 'child_process';
-+import { posix, win32 } from 'path';
 +import { Emitter } from '../../../../base/common/event.js';
++import { findExecutable, killTree } from '../../../../base/node/processes.js';
++import { StreamSplitter } from '../../../../base/node/nodeStreams.js';
 +import { IIcodeAcpTransport } from './icodeAcpClient.js';
 +
 +export const ICODE_BIN_ENV = 'PICKET_ICODE_BIN';
 +export const ICODE_AGENT_ENV = 'PICKET_ICODE_AGENT';
 +
 +const ICODE_COMMAND = 'icode';
-+const ICODE_COMMAND_WINDOWS = 'icode.cmd';
++const DEFAULT_ICODE_AGENT = 'Code';
++const WINDOWS_SHELL_SCRIPT_RE = /\.(bat|cmd)$/i;
++const STDERR_TAIL_LENGTH = 8192;
++const DEFAULT_GRACE_PERIOD = 10_000;
 +
 +/**
-+ * Resolves the `icode` executable. An explicit `PICKET_ICODE_BIN` is
-+ * authoritative: when it is set but does not point at a file we report "not
-+ * found" rather than silently running whatever happens to be on PATH.
++ * Outcome of {@link resolveIcodeCommand}. The reasons are kept apart so callers
++ * can tell "you pointed `PICKET_ICODE_BIN` at nothing" from "iCode is not on PATH".
 + */
-+export function resolveIcodeCommand(
++export type IcodeCommandResolution =
++	| { readonly command: string }
++	| { readonly reason: 'override-missing' | 'not-found' };
++
++/**
++ * Resolves the `icode` executable.
++ *
++ * `PICKET_ICODE_BIN` is authoritative: when it is set (and not empty) but does
++ * not point at a file, resolution fails instead of silently running whatever
++ * happens to be on PATH.
++ */
++export async function resolveIcodeCommand(
 +	env: Readonly<Record<string, string | undefined>>,
-+	isFile: (path: string) => boolean,
-+	platform: NodeJS.Platform,
-+): string | undefined {
++	fileExists: (path: string) => boolean | Promise<boolean>,
++	cwd?: string,
++): Promise<IcodeCommandResolution> {
 +	const override = env[ICODE_BIN_ENV];
 +	if (override) {
-+		return isFile(override) ? override : undefined;
++		return await fileExists(override) ? { command: override } : { reason: 'override-missing' };
 +	}
 +
-+	const pathValue = env['PATH'];
-+	if (!pathValue) {
-+		return undefined;
-+	}
-+
-+	const command = platform === 'win32' ? ICODE_COMMAND_WINDOWS : ICODE_COMMAND;
-+	const pathJoin = platform === 'win32' ? win32.join : posix.join;
-+	for (const segment of pathValue.split(platform === 'win32' ? ';' : ':')) {
-+		if (!segment) {
-+			continue;
-+		}
-+		const candidate = pathJoin(segment, command);
-+		if (isFile(candidate)) {
-+			return candidate;
-+		}
-+	}
-+
-+	return undefined;
++	const found = await findExecutable(ICODE_COMMAND, cwd, undefined, env, async path => await fileExists(path));
++	return found !== undefined ? { command: found } : { reason: 'not-found' };
 +}
 +
 +export function buildIcodeArgs(agent: string): readonly string[] {
 +	return ['acp', '--approval', 'manual', '-a', agent];
 +}
 +
-+export function createIcodeTransport(command: string, platform: NodeJS.Platform = process.platform): IIcodeAcpTransport {
-+	if (platform === 'win32') {
-+		throw new Error('iCode over ACP is not supported on Windows yet: Node will not spawn a .cmd shim without a shell');
++/**
++ * Formats arguments to avoid issues on Windows for CVE-2024-27980. Copied from
++ * `src/vs/workbench/api/node/extHostMcpNode.ts`, which cannot be imported from
++ * `src/vs/platform/agentHost`.
++ */
++export function escapeCmdArg(arg: string): string {
++	return `"${arg.replace(/"/g, '""')}"`;
++}
++
++export interface IIcodeSpawnCommand {
++	readonly executable: string;
++	readonly args: readonly string[];
++	readonly shell: boolean;
++}
++
++/**
++ * Decides how to start the resolved executable. A `.cmd`/`.bat` shim cannot be
++ * spawned directly on Windows, so it has to go through the shell (Node runs
++ * `cmd.exe /d /s /c "<command line>"` for `shell: true`) with every token
++ * quoted, because `cmd.exe` reparses the line. A normal executable is spawned
++ * with the raw argument array and no shell, so nothing is ever shell-interpolated.
++ */
++export function formatIcodeSpawnCommand(command: string, args: readonly string[], platform: NodeJS.Platform = process.platform): IIcodeSpawnCommand {
++	if (platform !== 'win32' || !WINDOWS_SHELL_SCRIPT_RE.test(command)) {
++		return { executable: command, args, shell: false };
 +	}
 +
-+	const agent = process.env[ICODE_AGENT_ENV] ?? 'Code';
-+	const child = spawn(command, buildIcodeArgs(agent), {
++	return {
++		executable: escapeCmdArg(command),
++		args: args.map(escapeCmdArg),
++		shell: true,
++	};
++}
++
++export interface IIcodeTransportOptions {
++	/** Working directory of the subprocess; defaults to the host's cwd. */
++	readonly cwd?: string;
++	/** Environment of the subprocess; defaults to `process.env`. */
++	readonly env?: Readonly<Record<string, string | undefined>>;
++	/** Sink for `[icode]`-prefixed process diagnostics. */
++	readonly log: (message: string) => void;
++	/** Overridable for tests; defaults to `process.platform`. */
++	readonly platform?: NodeJS.Platform;
++	/** Overridable for tests; defaults to `child_process.spawn`. */
++	readonly spawnProcess?: typeof spawn;
++	/** Delay between the graceful shutdown steps; defaults to 10 seconds. */
++	readonly gracePeriodMs?: number;
++}
++
++/**
++ * Spawns `icode acp` and exposes its stdio as an {@link IIcodeAcpTransport}.
++ *
++ * The returned transport owns the child's process state: stderr is line-buffered
++ * into `log` (with a capped tail kept for diagnostics), `onExit` fires exactly
++ * once from `'close'` (or from a spawn failure, with `null`), and `kill()` walks
++ * stdin close → SIGTERM → SIGKILL, where a second `kill()` skips the wait.
++ */
++export function createIcodeTransport(command: string, options: IIcodeTransportOptions): IIcodeAcpTransport {
++	const platform = options.platform ?? process.platform;
++	const env = options.env ?? process.env;
++	const cwd = options.cwd ?? process.cwd();
++	const log = options.log;
++	const spawnProcess = options.spawnProcess ?? spawn;
++	const gracePeriodMs = options.gracePeriodMs ?? DEFAULT_GRACE_PERIOD;
++	const agent = env[ICODE_AGENT_ENV] || DEFAULT_ICODE_AGENT;
++
++	const spawnCommand = formatIcodeSpawnCommand(command, buildIcodeArgs(agent), platform);
++	const child = spawnProcess(spawnCommand.executable, [...spawnCommand.args], {
++		cwd,
++		env,
++		shell: spawnCommand.shell,
 +		stdio: ['pipe', 'pipe', 'pipe'],
-+		env: process.env,
 +		windowsHide: true,
 +	});
 +
-+	let stderrBuffer = '';
-+	child.stderr.on('data', (chunk: Buffer | string) => {
-+		stderrBuffer += chunk.toString();
-+		let index: number;
-+		while ((index = stderrBuffer.indexOf('\n')) >= 0) {
-+			const line = stderrBuffer.slice(0, index).trimEnd();
-+			stderrBuffer = stderrBuffer.slice(index + 1);
-+			if (line) {
-+				console.error(`[icode] ${line}`);
-+			}
-+		}
-+	});
++	const { stdin, stdout, stderr } = child;
++	if (!stdin || !stdout || !stderr) {
++		throw new Error(`[icode] failed to create stdio pipes for '${command}'`);
++	}
++
++	let exited = false;
++	let exitCode: number | null = null;
++	let spawnError: Error | undefined;
++	let stderrTail = '';
++	let stopping = false;
 +
 +	const onExit = new Emitter<number | null>();
-+	child.on('exit', code => {
-+		if (stderrBuffer.trim()) {
-+			console.error(`[icode] ${stderrBuffer.trim()}`);
-+			stderrBuffer = '';
++	const timers = new Set<NodeJS.Timeout>();
++
++	const clearTimers = () => {
++		for (const timer of timers) {
++			clearTimeout(timer);
 +		}
-+		onExit.fire(code);
-+		onExit.dispose();
++		timers.clear();
++	};
++	const schedule = (delay: number, run: () => void) => {
++		// The cast avoids the dom/node `setTimeout` typing collision; `unref` keeps a
++		// pending escalation from holding the process open when tests or the host exit.
++		const timer = setTimeout(() => {
++			timers.delete(timer);
++			run();
++		}, delay) as unknown as NodeJS.Timeout;
++		timer.unref?.();
++		timers.add(timer);
++	};
++
++	const stderrSplitter = new StreamSplitter('\n');
++	stderrSplitter.setEncoding('utf8');
++	stderrSplitter.on('data', (line: string) => {
++		const text = line.trimEnd();
++		if (!text) {
++			return;
++		}
++		stderrTail = `${stderrTail}${text}\n`.slice(-STDERR_TAIL_LENGTH);
++		log(`[icode] ${text}`);
 +	});
++	stderrSplitter.on('error', (error: Error) => log(`[icode] stderr framing error: ${error.message}`));
++	stderr.pipe(stderrSplitter);
++
++	const finish = (code: number | null, signal?: NodeJS.Signals | null) => {
++		if (exited) {
++			return;
++		}
++		exited = true;
++		exitCode = code;
++		clearTimers();
++		stderrSplitter.destroy();
++
++		const how = signal ? `signal ${signal}` : `code ${code === null ? 'unknown' : code}`;
++		log(`[icode] exited (${how})${spawnError ? `: ${spawnError.message}` : ''}`);
++		if ((code !== 0 || spawnError) && stderrTail.trim()) {
++			log(`[icode] stderr tail:\n${stderrTail.trimEnd()}`);
++		}
++
++		onExit.fire(code);
++	};
++
++	const terminate = async (forceful: boolean): Promise<void> => {
++		if (exited) {
++			return;
++		}
++
++		const pid = child.pid;
++		log(`[icode] ${forceful ? 'forcefully killing' : 'terminating'} iCode${pid !== undefined ? ` (pid ${pid})` : ''}`);
++		if (pid !== undefined) {
++			try {
++				await killTree(pid, forceful);
++				return;
++			} catch (error) {
++				log(`[icode] killTree failed for pid ${pid}: ${error instanceof Error ? error.message : String(error)}`);
++			}
++		}
++
++		try {
++			child.kill(forceful ? 'SIGKILL' : 'SIGTERM');
++		} catch (error) {
++			log(`[icode] failed to send ${forceful ? 'SIGKILL' : 'SIGTERM'}: ${error instanceof Error ? error.message : String(error)}`);
++		}
++	};
++
++	const kill = (): void => {
++		if (exited) {
++			return;
++		}
++		if (stopping) {
++			clearTimers();
++			void terminate(true);
++			return;
++		}
++
++		stopping = true;
++		try {
++			stdin.end();
++		} catch (error) {
++			log(`[icode] failed to close stdin: ${error instanceof Error ? error.message : String(error)}`);
++		}
++		schedule(gracePeriodMs, () => {
++			void terminate(false).then(() => {
++				if (!exited) {
++					schedule(gracePeriodMs, () => void terminate(true));
++				}
++			});
++		});
++	};
++
++	child.on('error', (error: Error) => {
++		spawnError = error;
++		log(`[icode] failed to run '${command}': ${error.message}`);
++		finish(null);
++	});
++	child.on('close', (code, signal) => finish(code, signal));
++	stdin.on('error', (error: Error) => log(`[icode] stdin error: ${error.message}`));
++	stdout.on('error', (error: Error) => log(`[icode] stdout error: ${error.message}`));
++	stderr.on('error', (error: Error) => log(`[icode] stderr error: ${error.message}`));
 +
 +	return {
-+		stdin: child.stdin,
-+		stdout: child.stdout,
++		stdin,
++		stdout,
 +		onExit: onExit.event,
-+		kill: () => child.kill(),
++		get exited() { return exited; },
++		get exitCode() { return exitCode; },
++		get error() { return spawnError; },
++		kill,
 +	};
 +}
 diff --git a/src/vs/platform/agentHost/test/node/icode/icodeAcpClient.test.ts b/src/vs/platform/agentHost/test/node/icode/icodeAcpClient.test.ts
 new file mode 100644
-index 00000000..485f455b
+index 00000000..d34e4c39
 --- /dev/null
 +++ b/src/vs/platform/agentHost/test/node/icode/icodeAcpClient.test.ts
-@@ -0,0 +1,78 @@
+@@ -0,0 +1,380 @@
 +/*---------------------------------------------------------------------------------------------
 + *  Copyright (c) Microsoft Corporation. All rights reserved.
 + *  Licensed under the MIT License. See License.txt in the project root for license information.
@@ -375,134 +608,604 @@ index 00000000..485f455b
 +
 +import assert from 'assert';
 +import { PassThrough } from 'stream';
-+import { timeout } from '../../../../../base/common/async.js';
-+import { Event } from '../../../../../base/common/event.js';
-+import { DisposableStore } from '../../../../../base/common/lifecycle.js';
++import { CancellationTokenSource } from '../../../../../base/common/cancellation.js';
++import { CancellationError } from '../../../../../base/common/errors.js';
++import { Emitter, Event } from '../../../../../base/common/event.js';
++import { JsonRpcError } from '../../../../../base/common/jsonRpcProtocol.js';
 +import { ensureNoDisposablesAreLeakedInTestSuite } from '../../../../../base/test/common/utils.js';
 +import { IcodeAcpClient, IIcodeAcpTransport } from '../../../node/icode/icodeAcpClient.js';
 +
-+function createTransport() {
-+	const toServer = new PassThrough();
-+	const fromServer = new PassThrough();
-+	const transport: IIcodeAcpTransport = { stdin: toServer, stdout: fromServer, onExit: Event.None, kill: () => { } };
-+	return { transport, toServer, fromServer };
++/** Transport backed by in-memory streams; the process exit is driven by the test. */
++class TestTransport implements IIcodeAcpTransport {
++
++	readonly toServer = new PassThrough();
++	readonly fromServer = new PassThrough();
++
++	private readonly _onExit = new Emitter<number | null>();
++	readonly onExit: Event<number | null> = this._onExit.event;
++
++	exited = false;
++	exitCode: number | null = null;
++	error: Error | undefined = undefined;
++	killCount = 0;
++
++	get stdin(): NodeJS.WritableStream { return this.toServer; }
++	get stdout(): NodeJS.ReadableStream { return this.fromServer; }
++
++	kill(): void {
++		this.killCount++;
++	}
++
++	exit(code: number | null): void {
++		this.exited = true;
++		this.exitCode = code;
++		this._onExit.fire(code);
++	}
++
++	send(message: unknown): void {
++		this.fromServer.write(`${JSON.stringify(message)}\n`);
++	}
 +}
 +
-+function nextMessage(stream: PassThrough): Promise<any> {
-+	return new Promise(resolve => stream.once('data', (chunk: Buffer) => resolve(JSON.parse(chunk.toString().trim()))));
++/** Collects the client's outgoing messages so tests never race on stream events. */
++class MessageSink {
++
++	private readonly _messages: any[] = [];
++	private readonly _waiters: ((message: any) => void)[] = [];
++
++	constructor(stream: PassThrough) {
++		stream.on('data', (chunk: Buffer) => {
++			for (const line of chunk.toString('utf8').split('\n')) {
++				if (!line.trim()) {
++					continue;
++				}
++				const message = JSON.parse(line);
++				const waiter = this._waiters.shift();
++				if (waiter) {
++					waiter(message);
++				} else {
++					this._messages.push(message);
++				}
++			}
++		});
++	}
++
++	next(): Promise<any> {
++		const queued = this._messages.shift();
++		return queued !== undefined ? Promise.resolve(queued) : new Promise(resolve => this._waiters.push(resolve));
++	}
 +}
 +
 +suite('IcodeAcpClient', () => {
-+	ensureNoDisposablesAreLeakedInTestSuite();
++	const disposables = ensureNoDisposablesAreLeakedInTestSuite();
 +
-+	test('request writes a JSON-RPC 2.0 line and resolves with the matching result', async () => {
-+		const { transport, toServer, fromServer } = createTransport();
-+		const client = new IcodeAcpClient(transport, () => { });
++	function createClient(logs: string[] = []) {
++		const transport = new TestTransport();
++		const sink = new MessageSink(transport.toServer);
++		const client = new IcodeAcpClient(transport, message => logs.push(message));
++		return { transport, sink, client, logs };
++	}
++
++	test('writes a JSON-RPC 2.0 line and resolves with the matching result', async () => {
++		const { transport, sink, client } = createClient();
++		disposables.add(client);
++
 +		const pending = client.request('initialize', { protocolVersion: 1 });
-+		assert.deepStrictEqual(await nextMessage(toServer), {
++		assert.deepStrictEqual(await sink.next(), {
 +			jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: 1 },
 +		});
-+		fromServer.write(JSON.stringify({ jsonrpc: '2.0', id: 1, result: { protocolVersion: 1 } }) + '\n');
++
++		transport.send({ jsonrpc: '2.0', id: 1, result: { protocolVersion: 1 } });
 +		assert.deepStrictEqual(await pending, { protocolVersion: 1 });
-+		client.dispose();
 +	});
 +
-+	test('dispatches notifications and server-to-client requests', async () => {
-+		const disposables = new DisposableStore();
-+		const { transport, toServer, fromServer } = createTransport();
-+		const client = new IcodeAcpClient(transport, () => { });
-+		const updates: unknown[] = [];
-+		disposables.add(client.onNotification('session/update', params => updates.push(params)));
++	test('handles two messages arriving in one chunk', async () => {
++		const { transport, sink, client } = createClient();
++		disposables.add(client);
++
++		const first = client.request('one');
++		const second = client.request('two');
++		await sink.next();
++		await sink.next();
++
++		transport.fromServer.write(
++			`${JSON.stringify({ jsonrpc: '2.0', id: 1, result: 'a' })}\n${JSON.stringify({ jsonrpc: '2.0', id: 2, result: 'b' })}\n`,
++		);
++
++		assert.strictEqual(await first, 'a');
++		assert.strictEqual(await second, 'b');
++	});
++
++	test('handles a message split across two chunks', async () => {
++		const { transport, sink, client } = createClient();
++		disposables.add(client);
++
++		const pending = client.request('initialize');
++		await sink.next();
++
++		const line = `${JSON.stringify({ jsonrpc: '2.0', id: 1, result: 'complete' })}\n`;
++		transport.fromServer.write(line.slice(0, 11));
++		transport.fromServer.write(line.slice(11));
++
++		assert.strictEqual(await pending, 'complete');
++	});
++
++	test('does not corrupt a CJK string split mid-codepoint', async () => {
++		const { transport, sink, client } = createClient();
++		disposables.add(client);
++
++		const pending = client.request('initialize');
++		await sink.next();
++
++		const buffer = Buffer.from(`${JSON.stringify({ jsonrpc: '2.0', id: 1, result: '你好，世界' })}\n`, 'utf8');
++		const split = buffer.indexOf(Buffer.from('你', 'utf8')) + 1;
++		assert.ok(split > 1);
++
++		transport.fromServer.write(buffer.subarray(0, split));
++		transport.fromServer.write(buffer.subarray(split));
++
++		assert.strictEqual(await pending, '你好，世界');
++	});
++
++	test('logs and skips a malformed line, then parses the next valid line', async () => {
++		const logs: string[] = [];
++		const { transport, sink, client } = createClient(logs);
++		disposables.add(client);
++		disposables.add(client.onRequest('ping', () => ({ pong: true })));
++
++		transport.fromServer.write(`{ this is not json }\n${JSON.stringify({ jsonrpc: '2.0', id: 42, method: 'ping' })}\n`);
++
++		assert.deepStrictEqual(await sink.next(), { jsonrpc: '2.0', id: 42, result: { pong: true } });
++		assert.ok(logs.some(line => /malformed/i.test(line)), `expected a malformed-line log, got:\n${logs.join('\n')}`);
++	});
++
++	test('rejects with a JsonRpcError carrying code and data', async () => {
++		const { transport, sink, client } = createClient();
++		disposables.add(client);
++
++		const pending = client.request('session/new', { cwd: '/tmp' });
++		await sink.next();
++
++		transport.send({ jsonrpc: '2.0', id: 1, error: { code: -32000, message: 'no session', data: { retry: false } } });
++
++		await assert.rejects(pending, (error: any) => {
++			assert.ok(error instanceof JsonRpcError);
++			assert.strictEqual(error.code, -32000);
++			assert.strictEqual(error.message, 'no session');
++			assert.deepStrictEqual(error.data, { retry: false });
++			return true;
++		});
++	});
++
++	test('answers a server-to-client request', async () => {
++		const { transport, sink, client } = createClient();
++		disposables.add(client);
 +		disposables.add(client.onRequest('session/request_permission', (_params, id) => ({ id, outcome: { outcome: 'selected', optionId: 'allow' } })));
 +
-+		fromServer.write(JSON.stringify({ jsonrpc: '2.0', method: 'session/update', params: { sessionId: 's1' } }) + '\n');
-+		fromServer.write(JSON.stringify({ jsonrpc: '2.0', id: 7, method: 'session/request_permission', params: { sessionId: 's1' } }) + '\n');
++		transport.send({ jsonrpc: '2.0', id: 7, method: 'session/request_permission', params: { sessionId: 's1' } });
 +
-+		await timeout(10);
-+		assert.deepStrictEqual(updates, [{ sessionId: 's1' }]);
-+		assert.deepStrictEqual(await nextMessage(toServer), {
++		assert.deepStrictEqual(await sink.next(), {
 +			jsonrpc: '2.0', id: 7, result: { id: 7, outcome: { outcome: 'selected', optionId: 'allow' } },
 +		});
-+		disposables.dispose();
-+		client.dispose();
 +	});
 +
 +	test('answers an unhandled server request with method-not-found', async () => {
-+		const { transport, toServer, fromServer } = createTransport();
-+		const client = new IcodeAcpClient(transport, () => { });
-+		fromServer.write(JSON.stringify({ jsonrpc: '2.0', id: 9, method: 'unknown/method', params: {} }) + '\n');
-+		const response = await nextMessage(toServer);
++		const { transport, sink, client } = createClient();
++		disposables.add(client);
++
++		transport.send({ jsonrpc: '2.0', id: 9, method: 'unknown/method', params: {} });
++
++		const response = await sink.next();
 +		assert.strictEqual(response.id, 9);
 +		assert.strictEqual(response.error.code, -32601);
-+		client.dispose();
 +	});
 +
-+	test('dispose rejects in-flight requests and ignores later input', async () => {
-+		const { transport, fromServer } = createTransport();
-+		const client = new IcodeAcpClient(transport, () => { });
++	test('answers a throwing handler with an internal error', async () => {
++		const { transport, sink, client } = createClient();
++		disposables.add(client);
++		disposables.add(client.onRequest('boom', () => { throw new Error('kaboom'); }));
++		disposables.add(client.onRequest('asyncBoom', async () => { throw new Error('async kaboom'); }));
++
++		transport.send({ jsonrpc: '2.0', id: 3, method: 'boom' });
++		const syncResponse = await sink.next();
++		assert.strictEqual(syncResponse.id, 3);
++		assert.strictEqual(syncResponse.error.code, -32603);
++		assert.strictEqual(syncResponse.error.message, 'kaboom');
++
++		transport.send({ jsonrpc: '2.0', id: 4, method: 'asyncBoom' });
++		const asyncResponse = await sink.next();
++		assert.strictEqual(asyncResponse.id, 4);
++		assert.strictEqual(asyncResponse.error.code, -32603);
++		assert.strictEqual(asyncResponse.error.message, 'async kaboom');
++	});
++
++	test('answers a handler returning undefined with result null', async () => {
++		const { transport, sink, client } = createClient();
++		disposables.add(client);
++		disposables.add(client.onRequest('void', () => undefined));
++
++		transport.send({ jsonrpc: '2.0', id: 4, method: 'void' });
++
++		const response = await sink.next();
++		assert.deepStrictEqual(response, { jsonrpc: '2.0', id: 4, result: null });
++		assert.ok('result' in response);
++	});
++
++	test('dispose rejects in-flight requests', async () => {
++		const { sink, client } = createClient();
++		disposables.add(client);
++
 +		const pending = client.request('session/new', { cwd: '/tmp' });
++		await sink.next();
++
 +		client.dispose();
-+		await assert.rejects(pending);
-+		fromServer.write(JSON.stringify({ jsonrpc: '2.0', id: 1, result: {} }) + '\n');
++		await assert.rejects(pending, CancellationError);
++	});
++
++	test('request after exit rejects immediately and the exit event fires once', async () => {
++		const logs: string[] = [];
++		const { transport, client } = createClient(logs);
++		disposables.add(client);
++
++		const exits: (number | null)[] = [];
++		disposables.add(client.onExit(code => exits.push(code)));
++
++		transport.exit(7);
++		assert.strictEqual(client.exited, true);
++		assert.strictEqual(client.exitCode, 7);
++		assert.deepStrictEqual(exits, [7]);
++
++		transport.exit(3);
++		assert.deepStrictEqual(exits, [7], 'the exit event must fire exactly once');
++
++		await assert.rejects(client.request('session/new'), /exited/);
++	});
++
++	test('a spawn failure surfaces as an exit without an exit code', async () => {
++		const logs: string[] = [];
++		const { transport, sink, client } = createClient(logs);
++		disposables.add(client);
++		transport.error = new Error('spawn icode ENOENT');
++
++		const pending = client.request('session/new');
++		await sink.next();
++
++		transport.exit(null);
++
++		await assert.rejects(pending, CancellationError);
++		assert.strictEqual(client.exited, true);
++		assert.strictEqual(client.exitCode, null);
++		await assert.rejects(client.request('session/new'), /exited/);
++		assert.ok(logs.some(line => /exited/.test(line) && /ENOENT/.test(line)), `expected a diagnostic log, got:\n${logs.join('\n')}`);
++	});
++
++	test('stdout end does not masquerade as a process exit', async () => {
++		const { transport, sink, client } = createClient();
++		disposables.add(client);
++
++		const exits: (number | null)[] = [];
++		disposables.add(client.onExit(code => exits.push(code)));
++
++		const pending = client.request('session/new');
++		await sink.next();
++
++		transport.fromServer.end();
++
++		await assert.rejects(pending, CancellationError);
++		assert.deepStrictEqual(exits, [], 'stdout end must not fire the exit event');
++		assert.strictEqual(client.exited, false);
++		await assert.rejects(client.request('session/new'), /stdout closed/);
++
++		transport.exit(5);
++		assert.deepStrictEqual(exits, [5]);
++		assert.strictEqual(client.exitCode, 5);
++	});
++
++	test('notify after dispose is logged instead of vanishing', async () => {
++		const logs: string[] = [];
++		const { sink, client } = createClient(logs);
++		disposables.add(client);
++
++		client.notify('session/cancel', { sessionId: 's1' });
++		assert.deepStrictEqual(await sink.next(), { jsonrpc: '2.0', method: 'session/cancel', params: { sessionId: 's1' } });
++
++		client.dispose();
++		client.notify('session/cancel', { sessionId: 's1' });
++
++		assert.ok(logs.some(line => line.includes('session/cancel') && /dispose/i.test(line)), `expected a dispose log, got:\n${logs.join('\n')}`);
++	});
++
++	test('registrations are single per method and disposable', async () => {
++		const logs: string[] = [];
++		const { transport, sink, client } = createClient(logs);
++		disposables.add(client);
++
++		const updates: unknown[] = [];
++		const notificationRegistration = client.onNotification('session/update', params => updates.push(params));
++		disposables.add(notificationRegistration);
++		assert.throws(() => client.onNotification('session/update', () => { }), /already registered/);
++
++		const requestRegistration = client.onRequest('ping', () => 'pong');
++		disposables.add(requestRegistration);
++		assert.throws(() => client.onRequest('ping', () => 'pong'), /already registered/);
++
++		requestRegistration.dispose();
++		notificationRegistration.dispose();
++
++		// A request is answered after the notification was handled, so its response
++		// proves the disposed notification handler did not run.
++		transport.send({ jsonrpc: '2.0', method: 'session/update', params: { sessionId: 's1' } });
++		transport.send({ jsonrpc: '2.0', id: 11, method: 'ping' });
++
++		const response = await sink.next();
++		assert.strictEqual(response.id, 11);
++		assert.strictEqual(response.error.code, -32601, 'the disposed request handler must not answer');
++		assert.deepStrictEqual(updates, [], 'the disposed notification handler must not run');
++
++		// Both kinds of registration can be created again after disposal.
++		disposables.add(client.onNotification('session/update', () => { }));
++		disposables.add(client.onRequest('ping', () => 'pong'));
++	});
++
++	test('a failing async notification handler is logged, not thrown', async () => {
++		const logs: string[] = [];
++		const { transport, sink, client } = createClient(logs);
++		disposables.add(client);
++		disposables.add(client.onNotification('session/update', () => Promise.reject(new Error('nope'))));
++
++		transport.send({ jsonrpc: '2.0', method: 'session/update', params: {} });
++		transport.send({ jsonrpc: '2.0', id: 12, method: 'ping' });
++
++		const response = await sink.next();
++		assert.strictEqual(response.id, 12);
++		assert.ok(logs.some(line => line.includes('session/update') && line.includes('nope')), `expected a handler failure log, got:\n${logs.join('\n')}`);
++	});
++
++	test('cancelling the token rejects and notifies the server', async () => {
++		const { sink, client } = createClient();
++		disposables.add(client);
++
++		const source = new CancellationTokenSource();
++		disposables.add(source);
++
++		const pending = client.request('session/prompt', { sessionId: 's1' }, source.token);
++		assert.deepStrictEqual(await sink.next(), {
++			jsonrpc: '2.0', id: 1, method: 'session/prompt', params: { sessionId: 's1' },
++		});
++
++		source.cancel();
++		await assert.rejects(pending, CancellationError);
++
++		assert.deepStrictEqual(await sink.next(), {
++			jsonrpc: '2.0', method: '$/cancel_request', params: { requestId: 1 },
++		});
 +	});
 +});
 diff --git a/src/vs/platform/agentHost/test/node/icode/icodeLaunchConfig.test.ts b/src/vs/platform/agentHost/test/node/icode/icodeLaunchConfig.test.ts
 new file mode 100644
-index 00000000..bfa2ce79
+index 00000000..448debe9
 --- /dev/null
 +++ b/src/vs/platform/agentHost/test/node/icode/icodeLaunchConfig.test.ts
-@@ -0,0 +1,54 @@
+@@ -0,0 +1,222 @@
 +/*---------------------------------------------------------------------------------------------
 + *  Copyright (c) Microsoft Corporation. All rights reserved.
 + *  Licensed under the MIT License. See License.txt in the project root for license information.
 + *--------------------------------------------------------------------------------------------*/
 +
 +import assert from 'assert';
++import { type ChildProcess, spawn } from 'child_process';
++import { EventEmitter } from 'events';
++import { PassThrough } from 'stream';
 +import { ensureNoDisposablesAreLeakedInTestSuite } from '../../../../../base/test/common/utils.js';
-+import { buildIcodeArgs, createIcodeTransport, resolveIcodeCommand } from '../../../node/icode/icodeLaunchConfig.js';
++import {
++	buildIcodeArgs,
++	createIcodeTransport,
++	escapeCmdArg,
++	formatIcodeSpawnCommand,
++	ICODE_AGENT_ENV,
++	ICODE_BIN_ENV,
++	resolveIcodeCommand,
++} from '../../../node/icode/icodeLaunchConfig.js';
++
++interface ISpawnCall {
++	readonly command: string;
++	readonly args: readonly string[];
++	readonly options: any;
++}
++
++interface IFakeChild extends EventEmitter {
++	pid: number | undefined;
++	stdin: PassThrough;
++	stdout: PassThrough;
++	stderr: PassThrough;
++	killed: string[];
++	kill(signal?: string): boolean;
++}
++
++function createFakeChild(): IFakeChild {
++	const child = new EventEmitter() as IFakeChild;
++	child.pid = undefined;
++	child.stdin = new PassThrough();
++	child.stdout = new PassThrough();
++	child.stderr = new PassThrough();
++	child.killed = [];
++	child.kill = (signal?: string) => {
++		child.killed.push(signal ?? 'SIGTERM');
++		return true;
++	};
++	return child;
++}
++
++function recordSpawn(calls: ISpawnCall[], child: IFakeChild): typeof spawn {
++	return ((command: string, args: readonly string[], options: any) => {
++		calls.push({ command, args, options });
++		return child as unknown as ChildProcess;
++	}) as unknown as typeof spawn;
++}
 +
 +suite('icodeLaunchConfig', () => {
 +	ensureNoDisposablesAreLeakedInTestSuite();
 +
-+	test('PICKET_ICODE_BIN wins when it points at a file', () => {
-+		const command = resolveIcodeCommand(
-+			{ PICKET_ICODE_BIN: '/opt/icode/bin/icode', PATH: '/usr/bin' },
-+			p => p === '/opt/icode/bin/icode',
-+			'linux',
++	test('PICKET_ICODE_BIN wins when it points at a file', async () => {
++		const probed: string[] = [];
++		const resolution = await resolveIcodeCommand(
++			{ [ICODE_BIN_ENV]: '/opt/icode/bin/icode', PATH: '/usr/bin' },
++			path => {
++				probed.push(path);
++				return path === '/opt/icode/bin/icode';
++			},
++			'/work',
 +		);
-+		assert.strictEqual(command, '/opt/icode/bin/icode');
++
++		assert.deepStrictEqual(resolution, { command: '/opt/icode/bin/icode' });
++		assert.deepStrictEqual(probed, ['/opt/icode/bin/icode'], 'PATH must not be consulted when the override is valid');
 +	});
 +
-+	test('an invalid override does not fall through to PATH', () => {
-+		const command = resolveIcodeCommand(
-+			{ PICKET_ICODE_BIN: '/missing/icode', PATH: '/usr/bin' },
-+			p => p === '/usr/bin/icode',
-+			'linux',
++	test('an invalid override fails resolution instead of falling through to PATH', async () => {
++		const probed: string[] = [];
++		const resolution = await resolveIcodeCommand(
++			{ [ICODE_BIN_ENV]: '/missing/icode', PATH: '/usr/bin' },
++			path => {
++				probed.push(path);
++				return path === '/usr/bin/icode';
++			},
++			'/work',
 +		);
-+		assert.strictEqual(command, undefined);
++
++		assert.deepStrictEqual(resolution, { reason: 'override-missing' });
++		assert.deepStrictEqual(probed, ['/missing/icode'], 'PATH must not be consulted when the override is set');
 +	});
 +
-+	test('finds icode on PATH and uses icode.cmd on Windows', () => {
-+		assert.strictEqual(
-+			resolveIcodeCommand({ PATH: '/one:/two' }, p => p === '/two/icode', 'linux'),
-+			'/two/icode',
++	test('an empty override counts as unset', async () => {
++		const resolution = await resolveIcodeCommand(
++			{ [ICODE_BIN_ENV]: '', PATH: '/one:/two' },
++			path => path === '/two/icode',
++			'/work',
 +		);
-+		assert.strictEqual(
-+			resolveIcodeCommand({ PATH: 'C:\\one;C:\\two' }, p => p === 'C:\\two\\icode.cmd', 'win32'),
-+			'C:\\two\\icode.cmd',
-+		);
++
++		assert.deepStrictEqual(resolution, { command: '/two/icode' });
 +	});
 +
-+	test('returns undefined when nothing is found', () => {
-+		assert.strictEqual(resolveIcodeCommand({ PATH: '/one' }, () => false, 'linux'), undefined);
-+		assert.strictEqual(resolveIcodeCommand({}, () => true, 'linux'), undefined);
++	test('finds icode on PATH and skips empty segments', async () => {
++		const resolution = await resolveIcodeCommand(
++			{ PATH: ':/one::/two' },
++			path => path === '/two/icode',
++			'/work',
++		);
++
++		assert.deepStrictEqual(resolution, { command: '/two/icode' });
++	});
++
++	test('reports not-found when icode is not on PATH', async () => {
++		assert.deepStrictEqual(
++			await resolveIcodeCommand({ PATH: '/one' }, () => false, '/work'),
++			{ reason: 'not-found' },
++		);
++		assert.deepStrictEqual(
++			await resolveIcodeCommand({ PATH: '/one' }, async () => false, '/work'),
++			{ reason: 'not-found' },
++		);
 +	});
 +
 +	test('builds the fixed manual-approval argument list', () => {
 +		assert.deepStrictEqual(buildIcodeArgs('Code'), ['acp', '--approval', 'manual', '-a', 'Code']);
++		assert.deepStrictEqual(buildIcodeArgs('Fast'), ['acp', '--approval', 'manual', '-a', 'Fast']);
 +	});
 +
-+	test('refuses to spawn the Windows shim', () => {
-+		assert.throws(() => createIcodeTransport('C:\\two\\icode.cmd', 'win32'), /not supported on Windows/);
++	test('quotes arguments for cmd.exe', () => {
++		assert.strictEqual(escapeCmdArg('acp'), '"acp"');
++		assert.strictEqual(escapeCmdArg('say "hi"'), '"say ""hi"""');
++	});
++
++	test('routes a Windows .cmd shim through the shell with escaped tokens', () => {
++		assert.deepStrictEqual(formatIcodeSpawnCommand('C:\\tools\\icode.cmd', ['acp', '-a', 'Code'], 'win32'), {
++			executable: '"C:\\tools\\icode.cmd"',
++			args: ['"acp"', '"-a"', '"Code"'],
++			shell: true,
++		});
++		assert.deepStrictEqual(formatIcodeSpawnCommand('C:\\tools\\ICODE.BAT', ['acp'], 'win32'), {
++			executable: '"C:\\tools\\ICODE.BAT"',
++			args: ['"acp"'],
++			shell: true,
++		});
++	});
++
++	test('never shell-interpolates a plain executable', () => {
++		assert.deepStrictEqual(formatIcodeSpawnCommand('C:\\tools\\icode.exe', ['acp', '-a', 'Code'], 'win32'), {
++			executable: 'C:\\tools\\icode.exe',
++			args: ['acp', '-a', 'Code'],
++			shell: false,
++		});
++		assert.deepStrictEqual(formatIcodeSpawnCommand('/usr/local/bin/icode', ['acp', '-a', 'Code'], 'linux'), {
++			executable: '/usr/local/bin/icode',
++			args: ['acp', '-a', 'Code'],
++			shell: false,
++		});
++	});
++
++	test('createIcodeTransport composes the spawn options without a shell on Linux', () => {
++		const calls: ISpawnCall[] = [];
++		const env = { PATH: '/usr/local/bin', [ICODE_AGENT_ENV]: 'Fast' };
++
++		createIcodeTransport('/usr/local/bin/icode', {
++			cwd: '/work',
++			env,
++			log: () => { },
++			platform: 'linux',
++			spawnProcess: recordSpawn(calls, createFakeChild()),
++			gracePeriodMs: 60_000,
++		});
++
++		assert.strictEqual(calls.length, 1);
++		assert.strictEqual(calls[0].command, '/usr/local/bin/icode');
++		assert.deepStrictEqual(calls[0].args, ['acp', '--approval', 'manual', '-a', 'Fast']);
++		assert.strictEqual(calls[0].options.shell, false);
++		assert.strictEqual(calls[0].options.cwd, '/work');
++		assert.strictEqual(calls[0].options.windowsHide, true);
++		assert.deepStrictEqual(calls[0].options.stdio, ['pipe', 'pipe', 'pipe']);
++		assert.deepStrictEqual(calls[0].options.env, env);
++	});
++
++	test('createIcodeTransport defaults the agent and honours a Windows shim', () => {
++		const calls: ISpawnCall[] = [];
++		const child = createFakeChild();
++
++		createIcodeTransport('C:\\tools\\icode.cmd', {
++			cwd: 'C:\\work',
++			env: { PATH: 'C:\\bin' },
++			log: () => { },
++			platform: 'win32',
++			spawnProcess: recordSpawn(calls, child),
++			gracePeriodMs: 60_000,
++		});
++
++		assert.strictEqual(calls.length, 1);
++		assert.strictEqual(calls[0].command, '"C:\\tools\\icode.cmd"');
++		assert.deepStrictEqual(calls[0].args, ['"acp"', '"--approval"', '"manual"', '"-a"', '"Code"']);
++		assert.strictEqual(calls[0].options.shell, true);
++		assert.strictEqual(calls[0].options.cwd, 'C:\\work');
++	});
++
++	test('surfaces a spawn failure on onExit without crashing', async () => {
++		const logs: string[] = [];
++		const command = `${process.cwd()}/.icode-that-does-not-exist-${Date.now()}`;
++
++		const transport = createIcodeTransport(command, {
++			cwd: process.cwd(),
++			env: process.env,
++			log: message => logs.push(message),
++		});
++
++		const code = await new Promise<number | null>(resolve => {
++			const listener = transport.onExit(exitCode => {
++				listener.dispose();
++				resolve(exitCode);
++			});
++		});
++
++		assert.strictEqual(code, null);
++		assert.strictEqual(transport.exited, true);
++		assert.ok(transport.error instanceof Error, 'the spawn error must be surfaced on the transport');
++		assert.ok(logs.some(line => line.startsWith('[icode]')), `expected an [icode] log, got:\n${logs.join('\n')}`);
 +	});
 +});

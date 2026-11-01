@@ -21,7 +21,7 @@
 - 审批模式固定 `--approval manual`，任何路径都不得传 `bypass`。
 - 每个 host 进程一个 `icode acp` 子进程；每个 chat 一个 ACP session；`session/new` 的 `cwd` 取该 turn 的第一个工作目录的 `fsPath`，必须是**已存在的绝对目录**；无工作目录时用 `os.homedir()`；最终 `cwd` 校验不过就抛可操作错误，不发 `session/new`。
 - 同一 chat 同一时刻只允许一个 turn：上一个 `session/prompt` 未返回时再次 `sendMessage` 立即抛错，不排队、不覆盖 turn state（iCode 后端同样是单 turn 语义，并发请求会以 `invalid_params` 失败）。
-- P3 只在 POSIX 真机验收。Windows 上 `resolveIcodeCommand` 仍解析到 `icode.cmd`，但 `createIcodeTransport` 直接抛明确错误：Node ≥18.20.2 禁止无 shell 地 spawn `.cmd`/`.bat`，而本计划不使用 shell 字符串。
+- P3 只在 POSIX 真机验收。Windows 走 `.cmd` shim：`findExecutable` 靠 `PATHEXT` 解析到 `icode.cmd`，`formatIcodeSpawnCommand` 按上游 `extHostMcpNode.ts:199-226` 的 CVE-2024-27980 配方转义后以 `shell: true` 启动（每个 token 加引号、`"` 加倍），**没有真机验证**，属于已知风险而非拒绝启动。
 - 新代码只放 `src/vs/platform/agentHost/node/icode/`，测试只放 `src/vs/platform/agentHost/test/node/icode/`。
 - 测试命令固定为：先 `cd vscode && ./node_modules/.bin/tsc -p src/tsconfig.json --noCheck --outDir out --rootDir src`（**不要**用 `npm run build-fast`：`build/next/build-fast.ts` 硬读已删除的 `extensions/copilot/package.json`；也不要用 `npm run compile`，它会连带 `compile-copilot` 失败），再 `npm run test-node -- --run <源文件路径>`。
 - 类型检查：这棵打过 52–61 的树有 219 个既有类型错误（`src/vs/platform/agentHost/node/copilot/**` 仍引用已删除的 `@github/copilot-sdk`），`npm run typecheck-client` 永远非 0。门禁是「错误列表里没有 `agentHost/node/icode` 或 `agentHost/test/node/icode` 的行」。
@@ -36,7 +36,7 @@
 4. 用户拒绝审批（`reject_once` / `cancelled`）：工具调用结束为取消，turn 仍能正常完成；绝不能把拒绝当同意。宿主也会以 `context.decisionSource` 主动兜底拒绝一次，重复或迟到的 `requestId` 必须静默忽略。对应 Task 6 测试。
 5. 工作目录不存在或不是一个目录：不发 `session/new`、不 spawn 进程，直接抛可操作错误。对应 Task 5 测试。
 6. 上一 turn 未结束时再次发送：立即失败，不排队、不串台。对应 Task 6 测试。
-7. Windows 上 `icode` 是 `.cmd` shim：解析必须命中 `icode.cmd`，spawn 时不能依赖 shell 字符串；P3 在 Windows 上显式拒绝启动。对应 Task 3 测试。
+7. Windows 上 `icode` 是 `.cmd` shim：`findExecutable` 必须命中 `icode.cmd`，启动时用上游的 cmd 转义配方（每个 token 加引号 + `shell: true`），P3 只在 POSIX 真机验收。对应 Task 3 测试。
 
 ---
 
@@ -183,17 +183,26 @@ export type IcodeJsonValue = null | boolean | number | string | IcodeJsonValue[]
 export interface IIcodeAcpTransport {
 	readonly stdin: NodeJS.WritableStream;
 	readonly stdout: NodeJS.ReadableStream;
+	/** 只在进程退出或 spawn 失败时触发一次。 */
 	readonly onExit: Event<number | null>;
+	/** 退出状态；晚订阅 `onExit` 的调用方必须先查这里。 */
+	readonly exited: boolean;
+	readonly exitCode: number | null;
+	readonly error: Error | undefined;
+	/** 优雅且幂等：stdin.end → SIGTERM → SIGKILL；第二次调用立即强杀。 */
 	kill(): void;
 }
 
 export interface IIcodeAcpClient extends IDisposable {
 	readonly onExit: Event<number | null>;
-	request<R = unknown>(method: string, params?: IcodeJsonValue): Promise<R>;
+	readonly exited: boolean;
+	readonly exitCode: number | null;
+	/** `token` 取消时向服务端发 `$/cancel_request`。 */
+	request<R = unknown>(method: string, params?: IcodeJsonValue, token?: CancellationToken): Promise<R>;
 	notify(method: string, params?: IcodeJsonValue): void;
 	onNotification(method: string, handler: (params: any) => void): IDisposable;
-	onRequest<R = unknown>(method: string, handler: (params: any, id: number | string) => R | Promise<R>): IDisposable;
-	respond(id: number | string, result: IcodeJsonValue): void;
+	/** 返回值即响应体；需要等用户决定的 handler 返回挂起的 Promise（`undefined` 发 `null`）。 */
+	onRequest<R = unknown>(method: string, handler: (params: any, id: JsonRpcId) => R | Promise<R>): IDisposable;
 }
 
 export class IcodeAcpClient implements IIcodeAcpClient {
@@ -201,6 +210,8 @@ export class IcodeAcpClient implements IIcodeAcpClient {
 	// 见上
 }
 ```
+
+**不要自己实现 JSON-RPC。**客户端是 `base/common/jsonRpcProtocol.ts` 的 `JsonRpcProtocol` 加 `base/node/nodeStreams.ts` 的 `StreamSplitter('\n')` 之上的一层薄封装：id 分配、`sendRequest` 的取消与 `onCancel`、批量消息、`JsonRpcError(code, message, data)` 全由上游提供。**没有 `respond()`**——`JsonRpcProtocol._handleRequest` 自己把 handler 的返回值写回去（`jsonRpcProtocol.ts:240`），facade 再暴露 `respond` 就会补发第二条响应。单注册语义：同一 method 重复注册抛 `BugIndicatingError`。
 
 **动手前先核对上游契约。**本计划后四个 Task 依赖下列签名与形状；`vscode/` 是刚 clone 的 1.143.1，与本节不符时以上游为准并同步修订本计划（Task 5/6 的 `IAgent` 成员尤其容易漂移）：
 
@@ -217,7 +228,6 @@ grep -n "export function isAgentEnabled"   src/vs/platform/agentHost/common/agen
 ```ts
 import assert from 'assert';
 import { PassThrough } from 'stream';
-import { timeout } from '../../../../../base/common/async.js';
 import { Event } from '../../../../../base/common/event.js';
 import { DisposableStore } from '../../../../../base/common/lifecycle.js';
 import { ensureNoDisposablesAreLeakedInTestSuite } from '../../../../../base/test/common/utils.js';
@@ -226,69 +236,38 @@ import { IcodeAcpClient, IIcodeAcpTransport } from '../../../node/icode/icodeAcp
 function createTransport() {
 	const toServer = new PassThrough();
 	const fromServer = new PassThrough();
-	const transport: IIcodeAcpTransport = { stdin: toServer, stdout: fromServer, onExit: Event.None, kill: () => { } };
+	const transport: IIcodeAcpTransport = { stdin: toServer, stdout: fromServer, onExit: Event.None, exited: false, exitCode: null, error: undefined, kill: () => { } };
 	return { transport, toServer, fromServer };
 }
 
-function nextMessage(stream: PassThrough): Promise<any> {
-	return new Promise(resolve => stream.once('data', (chunk: Buffer) => resolve(JSON.parse(chunk.toString().trim()))));
-}
-
-suite('IcodeAcpClient', () => {
-	ensureNoDisposablesAreLeakedInTestSuite();
-
-	test('request writes a JSON-RPC 2.0 line and resolves with the matching result', async () => {
-		const { transport, toServer, fromServer } = createTransport();
-		const client = new IcodeAcpClient(transport, () => { });
-		const pending = client.request('initialize', { protocolVersion: 1 });
-		assert.deepStrictEqual(await nextMessage(toServer), {
-			jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: 1 },
-		});
-		fromServer.write(JSON.stringify({ jsonrpc: '2.0', id: 1, result: { protocolVersion: 1 } }) + '\n');
-		assert.deepStrictEqual(await pending, { protocolVersion: 1 });
-		client.dispose();
-	});
-
-	test('dispatches notifications and server-to-client requests', async () => {
-		const disposables = new DisposableStore();
-		const { transport, toServer, fromServer } = createTransport();
-		const client = new IcodeAcpClient(transport, () => { });
-		const updates: unknown[] = [];
-		disposables.add(client.onNotification('session/update', params => updates.push(params)));
-		disposables.add(client.onRequest('session/request_permission', (_params, id) => ({ id, outcome: { outcome: 'selected', optionId: 'allow' } })));
-
-		fromServer.write(JSON.stringify({ jsonrpc: '2.0', method: 'session/update', params: { sessionId: 's1' } }) + '\n');
-		fromServer.write(JSON.stringify({ jsonrpc: '2.0', id: 7, method: 'session/request_permission', params: { sessionId: 's1' } }) + '\n');
-
-		await timeout(10);
-		assert.deepStrictEqual(updates, [{ sessionId: 's1' }]);
-		assert.deepStrictEqual(await nextMessage(toServer), {
-			jsonrpc: '2.0', id: 7, result: { id: 7, outcome: { outcome: 'selected', optionId: 'allow' } },
-		});
-		disposables.dispose();
-		client.dispose();
-	});
-
-	test('answers an unhandled server request with method-not-found', async () => {
-		const { transport, toServer, fromServer } = createTransport();
-		const client = new IcodeAcpClient(transport, () => { });
-		fromServer.write(JSON.stringify({ jsonrpc: '2.0', id: 9, method: 'unknown/method', params: {} }) + '\n');
-		const response = await nextMessage(toServer);
-		assert.strictEqual(response.id, 9);
-		assert.strictEqual(response.error.code, -32601);
-		client.dispose();
-	});
-
-	test('dispose rejects in-flight requests and ignores later input', async () => {
-		const { transport, fromServer } = createTransport();
-		const client = new IcodeAcpClient(transport, () => { });
-		const pending = client.request('session/new', { cwd: '/tmp' });
-		client.dispose();
-		await assert.rejects(pending);
-		fromServer.write(JSON.stringify({ jsonrpc: '2.0', id: 1, result: {} }) + '\n');
-	});
+test('handles a message split across two chunks, and a CJK string split mid-codepoint', async () => {
+	const { transport, fromServer } = createTransport();
+	const client = new IcodeAcpClient(transport, () => { });
+	const pending = client.request('session/new', { cwd: '/tmp' });
+	const line = Buffer.from(JSON.stringify({ jsonrpc: '2.0', id: 1, result: { title: '你好，世界' } }) + '\n');
+	const cut = line.indexOf(Buffer.from('你')) + 1; // 切在 3 字节字符的中间
+	fromServer.write(line.subarray(0, cut));
+	fromServer.write(line.subarray(cut));
+	assert.deepStrictEqual(await pending, { title: '你好，世界' });
+	client.dispose();
 });
 ```
+
+断言按事件驱动（`sink.next()` 返回下一个写出消息的 Promise），**不要用 `timeout(10)` 竞态**。测试文件必须覆盖：
+
+| 路径 | 断言要点 |
+|---|---|
+| 完整行 | 写出 `{jsonrpc:'2.0',id:1,method,params}`，按 id 结算 |
+| 一个 chunk 两条消息 / 一条消息跨两个 chunk / 空行 | 两条都结算；跨 chunk 拼接正确 |
+| CJK 被切在码点中间 | 不出现 U+FFFD |
+| 坏行 | 写日志并跳过，**下一行仍能解析** |
+| 错误响应 | reject 的是 `JsonRpcError`，带 `code` 与 `data` |
+| 服务端请求 | handler 返回值即响应体；未注册方法回 `-32601`；handler 抛错回 `-32603`；返回 `undefined` 回 `result: null` |
+| 退出 | `dispose` 让在途请求以 `CancellationError` 拒绝；退出后 `request` 立即 reject 且 `onExit` 只触发一次并带真实 code |
+| spawn 失败 | 不崩进程，`exited === true`、`exitCode === null`，日志里有 ENOENT |
+| stdout `end` | **不算进程退出**：不触发 `onExit`，只让在途请求失效 |
+| 重复注册 | 同 method 第二次 `onRequest`/`onNotification` 抛 `BugIndicatingError`；dispose 注册后可重注册 |
+| 取消 | 取消 token → reject 且服务端收到 `$/cancel_request` |
 
 - [x] **Step 2: 运行测试确认失败**
 
@@ -301,18 +280,20 @@ Expected: FAIL，`Cannot find module .../icode/icodeAcpClient.js`。
 
 - [x] **Step 3: 实现客户端**
 
-要点（实现细节由签名与测试确定）：
-- `_nextId = 1`；`request` 记录 `{ resolve, reject }`，写出 `{ jsonrpc: '2.0', id, method, params }`；`params === undefined` 时不带该键。
-- 读侧按 `\n` 缓冲；空行跳过；`JSON.parse` 失败时写日志并继续，不抛出进程级异常。
-- 有 `id` 且无 `method` → 响应，按 `id` 结算，`error` 存在时以 `Error(message)` 拒绝；有 `method` 且有 `id` → 服务端请求，查 handler 表，`await handler(params, id)` 后 `respond(id, result)`；查不到时 `respond` 一个 `{ error: { code: -32601, message: 'Method not found' } }`——为此实现一个私有 `_respondError(id, code, message)`，公开的 `respond` 只发结果。
-- 只有 `method` 无 `id` → 通知，按 method 分发给所有 handler，handler 抛错只记日志。
-- `stdout` 的 `end`/`error` 与 `transport.onExit` 都走同一个 `_shutdown`：拒绝所有 pending，触发 `onExit`，且只触发一次。
-- `dispose()`：标记 disposed，拒绝 pending，`transport.kill()`。
+要点：
+- 构造：`new JsonRpcProtocol(message => this._write(message), { handleRequest, handleNotification })` 放进 `DisposableStore`；`stdout` → `StreamSplitter('\n')`（`setEncoding('utf8')`，这样跨 chunk 的多字节字符由 `StringDecoder` 拼接，不要在 chunk 上直接 `toString()`）→ `JSON.parse` → `protocol.handleMessage(...)`。
+- 坏行（`JSON.parse` 抛错、非对象）只记日志并跳过；单行超过 4 MiB 视为 framing 失败，`transport.kill()`。
+- 服务端请求由 `protocol` 自己回包：handler 返回值即 `result`，`undefined` 归一成 `null`；未注册方法抛 `new JsonRpcError(-32601, ...)`，handler 抛错由 protocol 回 `-32603`。
+- 退出状态机以 `transport.onExit` 为唯一真源：`'close'` 驱动，带真实 `code`，只触发一次；构造时若 `transport.exited` 已经是 `true` 就立刻补一次。`stdout` 的 `end`/`error` **只**表示「收不到更多消息」——`_stdoutClosed = true` 并 `protocol.cancelAllRequests()`，不 fire `onExit`。
+- `request()` 先查 `_disposed`/`_exited`/`_stdoutClosed`/stdin 可写位：任一成立就立即 reject，绝不让 Promise 悬挂。
+- `_write()` 用 `stdin.write(line, cb)` 接错误；`stdin`/`stdout` 各自挂 `'error'` 监听（EPIPE 不会变成未捕获异常），写失败只记日志。
+- `dispose()`：标记 disposed → `cancelAllRequests()` → 清 handler 表 → 释放 store（含 protocol 与 stdout 监听）→ `_onExit.dispose()` → `transport.kill()`；幂等。
+- 单注册语义：同一 method 重复 `onNotification`/`onRequest` 抛 `BugIndicatingError`，返回的 disposable 只删除自己那一条。
 
 - [x] **Step 4: 运行测试确认通过**
 
 Run: `./node_modules/.bin/tsc -p src/tsconfig.json --noCheck --outDir out --rootDir src && npm run test-node -- --run src/vs/platform/agentHost/test/node/icode/icodeAcpClient.test.ts`
-Expected: PASS（4 passing）。
+Expected: PASS（19 passing）。
 
 - [x] **Step 5: 导出补丁并提交**
 
@@ -334,76 +315,68 @@ git commit -m "feat(agenthost): add the ACP stdio client for iCode"
 - Test: `vscode/src/vs/platform/agentHost/test/node/icode/icodeLaunchConfig.test.ts`
 
 **Interfaces:**
-- Consumes: `node:path`（`join`）、`node:fs`（仅生产调用方传入 `existsSync`/`statSync` 派生的判断函数）、`node:child_process`（`spawn`）。
+- Consumes: `base/node/processes.js` 的 `findExecutable` 与 `killTree`、`base/node/nodeStreams.js` 的 `StreamSplitter`、`child_process` 的 `spawn`。
 - Produces:
 
 ```ts
 export const ICODE_BIN_ENV = 'PICKET_ICODE_BIN';
 export const ICODE_AGENT_ENV = 'PICKET_ICODE_AGENT';
 
+/** 两个失败原因分开，调用方才能给出不同的用户提示。 */
+export type IcodeCommandResolution =
+	| { readonly command: string }
+	| { readonly reason: 'override-missing' | 'not-found' };
+
 export function resolveIcodeCommand(
 	env: Readonly<Record<string, string | undefined>>,
-	isFile: (path: string) => boolean,
-	platform: NodeJS.Platform,
-): string | undefined;
+	fileExists: (path: string) => boolean | Promise<boolean>,
+	cwd?: string,
+): Promise<IcodeCommandResolution>;
 
 export function buildIcodeArgs(agent: string): readonly string[];
-export function createIcodeTransport(command: string, platform?: NodeJS.Platform): IIcodeAcpTransport;
+export function escapeCmdArg(arg: string): string;
+
+export interface IIcodeSpawnCommand { readonly executable: string; readonly args: readonly string[]; readonly shell: boolean; }
+export function formatIcodeSpawnCommand(command: string, args: readonly string[], platform?: NodeJS.Platform): IIcodeSpawnCommand;
+
+export interface IIcodeTransportOptions {
+	readonly cwd?: string;
+	readonly env?: Readonly<Record<string, string | undefined>>;
+	readonly log: (message: string) => void;
+	readonly platform?: NodeJS.Platform;
+	readonly spawnProcess?: typeof spawn;
+	readonly gracePeriodMs?: number;
+}
+export function createIcodeTransport(command: string, options: IIcodeTransportOptions): IIcodeAcpTransport;
 ```
+
+**不要手写 PATH 扫描**：`findExecutable`（`base/node/processes.ts:86`）已经处理绝对路径短路、相对 `dir/`、`PATH` 拆分和 Windows 的 `PATHEXT` 展开，`agentHostGitService.ts`/`devContainerAgentHostService.ts` 都是这么用的。也不要 `import ... from 'path'`——本仓 eslint 的 `local/code-import-patterns` 明确要求用 `base/common/path.ts`（`findExecutable` 内部做 join 后，本文件根本不需要它）。
 
 - [x] **Step 1: 写失败测试**
 
 ```ts
 import assert from 'assert';
 import { ensureNoDisposablesAreLeakedInTestSuite } from '../../../../../base/test/common/utils.js';
-import { buildIcodeArgs, createIcodeTransport, resolveIcodeCommand } from '../../../node/icode/icodeLaunchConfig.js';
+import { buildIcodeArgs, createIcodeTransport, escapeCmdArg, formatIcodeSpawnCommand, resolveIcodeCommand } from '../../../node/icode/icodeLaunchConfig.js';
 
-suite('icodeLaunchConfig', () => {
-	ensureNoDisposablesAreLeakedInTestSuite();
+test('an invalid override does not fall through to PATH', async () => {
+	assert.deepStrictEqual(
+		await resolveIcodeCommand({ PICKET_ICODE_BIN: '/missing/icode', PATH: '/usr/bin' }, p => p === '/usr/bin/icode'),
+		{ reason: 'override-missing' },
+	);
+});
 
-	test('PICKET_ICODE_BIN wins when it points at a file', () => {
-		const command = resolveIcodeCommand(
-			{ PICKET_ICODE_BIN: '/opt/icode/bin/icode', PATH: '/usr/bin' },
-			p => p === '/opt/icode/bin/icode',
-			'linux',
-		);
-		assert.strictEqual(command, '/opt/icode/bin/icode');
+test('a .cmd shim on Windows goes through the shell with every token quoted', () => {
+	assert.deepStrictEqual(formatIcodeSpawnCommand('C:\\two\\icode.cmd', ['acp', '-a', 'Code'], 'win32'), {
+		executable: '"C:\\two\\icode.cmd"', args: ['"acp"', '"-a"', '"Code"'], shell: true,
 	});
-
-	test('an invalid override does not fall through to PATH', () => {
-		const command = resolveIcodeCommand(
-			{ PICKET_ICODE_BIN: '/missing/icode', PATH: '/usr/bin' },
-			p => p === '/usr/bin/icode',
-			'linux',
-		);
-		assert.strictEqual(command, undefined);
-	});
-
-	test('finds icode on PATH and uses icode.cmd on Windows', () => {
-		assert.strictEqual(
-			resolveIcodeCommand({ PATH: '/one:/two' }, p => p === '/two/icode', 'linux'),
-			'/two/icode',
-		);
-		assert.strictEqual(
-			resolveIcodeCommand({ PATH: 'C:\\one;C:\\two' }, p => p === 'C:\\two\\icode.cmd', 'win32'),
-			'C:\\two\\icode.cmd',
-		);
-	});
-
-	test('returns undefined when nothing is found', () => {
-		assert.strictEqual(resolveIcodeCommand({ PATH: '/one' }, () => false, 'linux'), undefined);
-		assert.strictEqual(resolveIcodeCommand({}, () => true, 'linux'), undefined);
-	});
-
-	test('builds the fixed manual-approval argument list', () => {
-		assert.deepStrictEqual(buildIcodeArgs('Code'), ['acp', '--approval', 'manual', '-a', 'Code']);
-	});
-
-	test('refuses to spawn the Windows shim', () => {
-		assert.throws(() => createIcodeTransport('C:\\two\\icode.cmd', 'win32'), /not supported on Windows/);
+	assert.deepStrictEqual(formatIcodeSpawnCommand('/usr/bin/icode', ['acp'], 'linux'), {
+		executable: '/usr/bin/icode', args: ['acp'], shell: false,
 	});
 });
 ```
+
+测试文件必须覆盖：`PICKET_ICODE_BIN` 命中 / 指向不存在文件（`override-missing`）/ 空字符串回落 PATH / PATH 空段与目录候选 / `not-found` / `buildIcodeArgs` 顺序 / `escapeCmdArg` 的双引号加倍 / `formatIcodeSpawnCommand` 在 win32+`.cmd`、win32+`.exe`、POSIX 三种输入下的 `{executable,args,shell}` / 注入 `spawnProcess` 后 `createIcodeTransport` 的 spawn 选项（args、`cwd`、`env`、`windowsHide`）/ spawn 失败经 `log` 上报且 `exited === true`。
 
 - [x] **Step 2: 运行测试确认失败**
 
@@ -413,13 +386,16 @@ Expected: FAIL，模块不存在。
 - [x] **Step 3: 实现**
 
 要点：
-- `resolveIcodeCommand`（用 `path.win32.join` / `path.posix.join` 按 `platform` 拼接，本机是 linux 时也要产出 `C:\\two\\icode.cmd`）：`PICKET_ICODE_BIN` 存在时只认它（`isFile` 为真返回，否则 `undefined`，不回落）；否则按 `platform === 'win32' ? ';' : ':'` 拆 `PATH`，跳过空段，Windows 候选名 `icode.cmd`，其他 `icode`；路径用 `join` 拼接，不经过 shell。
+- `resolveIcodeCommand`：`PICKET_ICODE_BIN` 非空且 `fileExists` 为真 → `{ command }`；非空但不存在 → `{ reason: 'override-missing' }`（**不回落 PATH**）；否则 `await findExecutable('icode', cwd, undefined, env, fileExists)`，有值 `{ command }`，否则 `{ reason: 'not-found' }`。Windows 的 `icode.cmd` 由 `findExecutable` 的 `PATHEXT` 展开负责。
 - `buildIcodeArgs(agent)` 返回 `['acp', '--approval', 'manual', '-a', agent]`，顺序固定。
-- `createIcodeTransport(command, platform = process.platform)`：`platform === 'win32'` 时先抛 `new Error('iCode over ACP is not supported on Windows yet: Node will not spawn a .cmd shim without a shell')`（不 spawn、不建进程）；否则 `spawn(command, buildIcodeArgs(env[ICODE_AGENT_ENV] ?? 'Code'), { stdio: ['pipe', 'pipe', 'pipe'], env: process.env, windowsHide: true })`，`stderr` 逐行写 `console.error`；返回 `{ stdin, stdout, onExit, kill }`，`onExit` 用 `Emitter<number | null>`，在 `exit` 时 `fire(code)` 并 `dispose`。
+- `formatIcodeSpawnCommand`：非 win32 或非 `.cmd/.bat` → `{ executable: command, args, shell: false }`（裸数组、无 shell，`PICKET_ICODE_AGENT` 无法注入参数）；win32 的 `.cmd/.bat` → `{ executable: escapeCmdArg(command), args: args.map(escapeCmdArg), shell: true }`，即上游 `extHostMcpNode.ts:199-226` 针对 CVE-2024-27980 的配方（该文件在 workbench 层不可 import，配方已复制并注明出处）。
+- `createIcodeTransport(command, options)`：`spawn(spawnCommand.executable, [...spawnCommand.args], { cwd, env, shell, stdio: ['pipe','pipe','pipe'], windowsHide: true })`；`stderr` 经 `StreamSplitter('\n')` 逐行 `log('[icode] …')` 并保留 8 KiB 尾缓冲（非零退出时附在日志里）；`'close'` → `finish(code, signal)`，只 fire 一次 `onExit`；`child.on('error')` → 记 `spawnError` 并 `finish(null)`（**必须有，否则 ENOENT 直接崩 host**）。
+- `kill()` 阶梯：`stdin.end()` → `gracePeriodMs` 后 `killTree(pid, false)` → 再等一个 `gracePeriodMs` 后 `killTree(pid, true)`；第二次 `kill()` 立即强杀。定时器 `unref()` 并集中清理，避免拖住测试与主机退出。
+- `stdin`/`stdout`/`stderr` 各挂 `'error'` 监听，只记日志。
 
 - [x] **Step 4: 运行测试确认通过**
 
-Expected: PASS（6 passing）。
+Expected: PASS（13 passing）。
 
 - [x] **Step 5: 导出补丁并提交**
 
@@ -645,6 +621,8 @@ import { IcodeAgent } from '../../node/icode/icodeAgent.js';
 
 class FakeIcodeClient implements IIcodeAcpClient {
 	readonly onExit = Event.None;
+	readonly exited = false;
+	readonly exitCode = null;
 	readonly requests: { method: string; params: any }[] = [];
 	readonly notifications: { method: string; params: any }[] = [];
 	private readonly notificationHandlers = new Map<string, (params: any) => void>();
@@ -663,7 +641,6 @@ class FakeIcodeClient implements IIcodeAcpClient {
 	notify(method: string, params?: unknown): void { this.notifications.push({ method, params }); }
 	onNotification(method: string, handler: (params: any) => void) { this.notificationHandlers.set(method, handler); return { dispose: () => this.notificationHandlers.delete(method) }; }
 	onRequest(): { dispose(): void } { return { dispose: () => { } }; }
-	respond(): void { }
 	emitNotification(method: string, params: unknown): void { this.notificationHandlers.get(method)?.(params); }
 	finishPrompt(result: unknown): void { this.resolvePrompt?.(result); }
 	dispose(): void { }
@@ -1018,12 +995,12 @@ Expected: `release contract check passed`，提交成功。
 ## Self-Review Notes
 
 - **Spec coverage:** §6.1 注册点 → Task 7；§6.2 补丁机制 → Task 1/7；§6.3 四件套 → Task 2–5；§6.4 app-server 前提 → Task 7 文档修正；§6.5 UI 路线 → Task 1 门；§8 P2.5/P3 验证门 → Task 1/7。
-- **明确不做（P4）:** diff 预览（iCode 直接改工作区，不走 ACP diff）、多轮增量上下文复用之外的会话恢复（`session/load`）、`ask_user` 映射（`_chrys/request_input`）、模型目录动态刷新、Windows 真机冒烟（连启动都显式拒绝）。
+- **明确不做（P4）:** diff 预览（iCode 直接改工作区，不走 ACP diff）、多轮增量上下文复用之外的会话恢复（`session/load`）、`ask_user` 映射（`_chrys/request_input`）、模型目录动态刷新、Windows 真机冒烟（`.cmd` 转义只有单测，未在真机验证）。
 - **已知取舍:**
   - provider 只在 `icode` 可解析时注册，宁可没有 agent 也不注册一个必然失败的 provider。
   - 审批模式固定 manual，Picket 的无头 exit-bypass 红线不进入适配器。
   - 不发 `initialize`：不做能力协商，版本不兼容走 `session/new` 的错误路径暴露。
   - 单 turn fail-fast：并发发送直接报错，不排队、不自动 `session/cancel` 前一个 turn。
-  - Windows 上解析得到 `icode.cmd` 但拒绝 spawn（Node 禁止无 shell spawn `.cmd`），P3 只验收 POSIX。
+  - Windows 上 `findExecutable` 解析到 `icode.cmd`，启动走 cmd 转义配方（每个 token 加引号 + `shell: true`，CVE-2024-27980 防护）；只有单测覆盖，真机未验证。
   - `usage_update`（只有 `used`/`size`）不映射为 token 用量；`ChatUsage` 只在 `session/prompt` 的 `result.usage` 带数字字段时发，字段缺失就跳过。
   - 工具结果优先取结构化 `content` 的 text block，其次 `rawOutput`；图像/资源类 block 一律丢弃。
