@@ -3,3 +3,4 @@ vscode/
 *.tar.gz
 *.zip
 .DS_Store
+.superpowers/
