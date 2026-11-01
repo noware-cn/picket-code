@@ -259,6 +259,109 @@ index 00000000..53a64511
 +		}
 +	}
 +}
+diff --git a/src/vs/platform/agentHost/node/icode/icodeLaunchConfig.ts b/src/vs/platform/agentHost/node/icode/icodeLaunchConfig.ts
+new file mode 100644
+index 00000000..18eac7da
+--- /dev/null
++++ b/src/vs/platform/agentHost/node/icode/icodeLaunchConfig.ts
+@@ -0,0 +1,97 @@
++/*---------------------------------------------------------------------------------------------
++ *  Copyright (c) Microsoft Corporation. All rights reserved.
++ *  Licensed under the MIT License. See License.txt in the project root for license information.
++ *--------------------------------------------------------------------------------------------*/
++
++import { spawn } from 'child_process';
++import { posix, win32 } from 'path';
++import { Emitter } from '../../../../base/common/event.js';
++import { IIcodeAcpTransport } from './icodeAcpClient.js';
++
++export const ICODE_BIN_ENV = 'PICKET_ICODE_BIN';
++export const ICODE_AGENT_ENV = 'PICKET_ICODE_AGENT';
++
++const ICODE_COMMAND = 'icode';
++const ICODE_COMMAND_WINDOWS = 'icode.cmd';
++
++/**
++ * Resolves the `icode` executable. An explicit `PICKET_ICODE_BIN` is
++ * authoritative: when it is set but does not point at a file we report "not
++ * found" rather than silently running whatever happens to be on PATH.
++ */
++export function resolveIcodeCommand(
++	env: Readonly<Record<string, string | undefined>>,
++	isFile: (path: string) => boolean,
++	platform: NodeJS.Platform,
++): string | undefined {
++	const override = env[ICODE_BIN_ENV];
++	if (override) {
++		return isFile(override) ? override : undefined;
++	}
++
++	const pathValue = env['PATH'];
++	if (!pathValue) {
++		return undefined;
++	}
++
++	const command = platform === 'win32' ? ICODE_COMMAND_WINDOWS : ICODE_COMMAND;
++	const pathJoin = platform === 'win32' ? win32.join : posix.join;
++	for (const segment of pathValue.split(platform === 'win32' ? ';' : ':')) {
++		if (!segment) {
++			continue;
++		}
++		const candidate = pathJoin(segment, command);
++		if (isFile(candidate)) {
++			return candidate;
++		}
++	}
++
++	return undefined;
++}
++
++export function buildIcodeArgs(agent: string): readonly string[] {
++	return ['acp', '--approval', 'manual', '-a', agent];
++}
++
++export function createIcodeTransport(command: string, platform: NodeJS.Platform = process.platform): IIcodeAcpTransport {
++	if (platform === 'win32') {
++		throw new Error('iCode over ACP is not supported on Windows yet: Node will not spawn a .cmd shim without a shell');
++	}
++
++	const agent = process.env[ICODE_AGENT_ENV] ?? 'Code';
++	const child = spawn(command, buildIcodeArgs(agent), {
++		stdio: ['pipe', 'pipe', 'pipe'],
++		env: process.env,
++		windowsHide: true,
++	});
++
++	let stderrBuffer = '';
++	child.stderr.on('data', (chunk: Buffer | string) => {
++		stderrBuffer += chunk.toString();
++		let index: number;
++		while ((index = stderrBuffer.indexOf('\n')) >= 0) {
++			const line = stderrBuffer.slice(0, index).trimEnd();
++			stderrBuffer = stderrBuffer.slice(index + 1);
++			if (line) {
++				console.error(`[icode] ${line}`);
++			}
++		}
++	});
++
++	const onExit = new Emitter<number | null>();
++	child.on('exit', code => {
++		if (stderrBuffer.trim()) {
++			console.error(`[icode] ${stderrBuffer.trim()}`);
++			stderrBuffer = '';
++		}
++		onExit.fire(code);
++		onExit.dispose();
++	});
++
++	return {
++		stdin: child.stdin,
++		stdout: child.stdout,
++		onExit: onExit.event,
++		kill: () => child.kill(),
++	};
++}
 diff --git a/src/vs/platform/agentHost/test/node/icode/icodeAcpClient.test.ts b/src/vs/platform/agentHost/test/node/icode/icodeAcpClient.test.ts
 new file mode 100644
 index 00000000..485f455b
@@ -341,5 +444,65 @@ index 00000000..485f455b
 +		client.dispose();
 +		await assert.rejects(pending);
 +		fromServer.write(JSON.stringify({ jsonrpc: '2.0', id: 1, result: {} }) + '\n');
++	});
++});
+diff --git a/src/vs/platform/agentHost/test/node/icode/icodeLaunchConfig.test.ts b/src/vs/platform/agentHost/test/node/icode/icodeLaunchConfig.test.ts
+new file mode 100644
+index 00000000..bfa2ce79
+--- /dev/null
++++ b/src/vs/platform/agentHost/test/node/icode/icodeLaunchConfig.test.ts
+@@ -0,0 +1,54 @@
++/*---------------------------------------------------------------------------------------------
++ *  Copyright (c) Microsoft Corporation. All rights reserved.
++ *  Licensed under the MIT License. See License.txt in the project root for license information.
++ *--------------------------------------------------------------------------------------------*/
++
++import assert from 'assert';
++import { ensureNoDisposablesAreLeakedInTestSuite } from '../../../../../base/test/common/utils.js';
++import { buildIcodeArgs, createIcodeTransport, resolveIcodeCommand } from '../../../node/icode/icodeLaunchConfig.js';
++
++suite('icodeLaunchConfig', () => {
++	ensureNoDisposablesAreLeakedInTestSuite();
++
++	test('PICKET_ICODE_BIN wins when it points at a file', () => {
++		const command = resolveIcodeCommand(
++			{ PICKET_ICODE_BIN: '/opt/icode/bin/icode', PATH: '/usr/bin' },
++			p => p === '/opt/icode/bin/icode',
++			'linux',
++		);
++		assert.strictEqual(command, '/opt/icode/bin/icode');
++	});
++
++	test('an invalid override does not fall through to PATH', () => {
++		const command = resolveIcodeCommand(
++			{ PICKET_ICODE_BIN: '/missing/icode', PATH: '/usr/bin' },
++			p => p === '/usr/bin/icode',
++			'linux',
++		);
++		assert.strictEqual(command, undefined);
++	});
++
++	test('finds icode on PATH and uses icode.cmd on Windows', () => {
++		assert.strictEqual(
++			resolveIcodeCommand({ PATH: '/one:/two' }, p => p === '/two/icode', 'linux'),
++			'/two/icode',
++		);
++		assert.strictEqual(
++			resolveIcodeCommand({ PATH: 'C:\\one;C:\\two' }, p => p === 'C:\\two\\icode.cmd', 'win32'),
++			'C:\\two\\icode.cmd',
++		);
++	});
++
++	test('returns undefined when nothing is found', () => {
++		assert.strictEqual(resolveIcodeCommand({ PATH: '/one' }, () => false, 'linux'), undefined);
++		assert.strictEqual(resolveIcodeCommand({}, () => true, 'linux'), undefined);
++	});
++
++	test('builds the fixed manual-approval argument list', () => {
++		assert.deepStrictEqual(buildIcodeArgs('Code'), ['acp', '--approval', 'manual', '-a', 'Code']);
++	});
++
++	test('refuses to spawn the Windows shim', () => {
++		assert.throws(() => createIcodeTransport('C:\\two\\icode.cmd', 'win32'), /not supported on Windows/);
 +	});
 +});

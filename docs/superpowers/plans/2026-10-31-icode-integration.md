@@ -351,12 +351,12 @@ export function buildIcodeArgs(agent: string): readonly string[];
 export function createIcodeTransport(command: string, platform?: NodeJS.Platform): IIcodeAcpTransport;
 ```
 
-- [ ] **Step 1: 写失败测试**
+- [x] **Step 1: 写失败测试**
 
 ```ts
 import assert from 'assert';
-import { ensureNoDisposablesAreLeakedInTestSuite } from '../../../../base/test/common/utils.js';
-import { buildIcodeArgs, createIcodeTransport, resolveIcodeCommand } from '../../node/icode/icodeLaunchConfig.js';
+import { ensureNoDisposablesAreLeakedInTestSuite } from '../../../../../base/test/common/utils.js';
+import { buildIcodeArgs, createIcodeTransport, resolveIcodeCommand } from '../../../node/icode/icodeLaunchConfig.js';
 
 suite('icodeLaunchConfig', () => {
 	ensureNoDisposablesAreLeakedInTestSuite();
@@ -405,23 +405,23 @@ suite('icodeLaunchConfig', () => {
 });
 ```
 
-- [ ] **Step 2: 运行测试确认失败**
+- [x] **Step 2: 运行测试确认失败**
 
 Run: `./node_modules/.bin/tsc -p src/tsconfig.json --noCheck --outDir out --rootDir src && npm run test-node -- --run src/vs/platform/agentHost/test/node/icode/icodeLaunchConfig.test.ts`
 Expected: FAIL，模块不存在。
 
-- [ ] **Step 3: 实现**
+- [x] **Step 3: 实现**
 
 要点：
-- `resolveIcodeCommand`：`PICKET_ICODE_BIN` 存在时只认它（`isFile` 为真返回，否则 `undefined`，不回落）；否则按 `platform === 'win32' ? ';' : ':'` 拆 `PATH`，跳过空段，Windows 候选名 `icode.cmd`，其他 `icode`；路径用 `join` 拼接，不经过 shell。
+- `resolveIcodeCommand`（用 `path.win32.join` / `path.posix.join` 按 `platform` 拼接，本机是 linux 时也要产出 `C:\\two\\icode.cmd`）：`PICKET_ICODE_BIN` 存在时只认它（`isFile` 为真返回，否则 `undefined`，不回落）；否则按 `platform === 'win32' ? ';' : ':'` 拆 `PATH`，跳过空段，Windows 候选名 `icode.cmd`，其他 `icode`；路径用 `join` 拼接，不经过 shell。
 - `buildIcodeArgs(agent)` 返回 `['acp', '--approval', 'manual', '-a', agent]`，顺序固定。
 - `createIcodeTransport(command, platform = process.platform)`：`platform === 'win32'` 时先抛 `new Error('iCode over ACP is not supported on Windows yet: Node will not spawn a .cmd shim without a shell')`（不 spawn、不建进程）；否则 `spawn(command, buildIcodeArgs(env[ICODE_AGENT_ENV] ?? 'Code'), { stdio: ['pipe', 'pipe', 'pipe'], env: process.env, windowsHide: true })`，`stderr` 逐行写 `console.error`；返回 `{ stdin, stdout, onExit, kill }`，`onExit` 用 `Emitter<number | null>`，在 `exit` 时 `fire(code)` 并 `dispose`。
 
-- [ ] **Step 4: 运行测试确认通过**
+- [x] **Step 4: 运行测试确认通过**
 
 Expected: PASS（6 passing）。
 
-- [ ] **Step 5: 导出补丁并提交**
+- [x] **Step 5: 导出补丁并提交**
 
 ```bash
 cd /home/dsun/workspace/picket-code/vscode
