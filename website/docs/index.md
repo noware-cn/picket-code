@@ -87,7 +87,7 @@ hero:
 <div class="pc-section">
 
 <h2 class="pc-title">分层架构 <span>To Be</span></h2>
-<p class="pc-sub">复用上游、减法优先：沿 VSCodium 验证过的构建路径做减法，先删后补。六层架构中，发行层与扩展层已落地，AgentHost 平台层裁剪为"零 provider + 编排核心"且已在无 Copilot 包的情况下启动，iCode 经适配层接入（适配层待落地，当前发行版无可用 agent 后端）。</p>
+<p class="pc-sub">复用上游、减法优先：沿 VSCodium 验证过的构建路径做减法，先删后补。六层架构中，发行层与扩展层已落地，AgentHost 平台层裁剪为"零 provider + 编排核心"且已在无 Copilot 包的情况下启动，iCode 经适配层接入（P3 已通过：注册、单轮往返与打断在 Agents Window 实测可用；常驻会话与 diff 预览属 P4）。</p>
 
 <div class="pc-stack">
   <div class="pc-stack-head">

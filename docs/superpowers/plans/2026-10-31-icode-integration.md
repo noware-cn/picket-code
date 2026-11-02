@@ -1011,7 +1011,7 @@ bash build/apply-patches.sh /tmp/vscode-verify                            # 先�
 
 Expected: `==> [picket-code] All patches applied.`，且 `git apply --check` 无错误。实测：补丁 **10 文件 2495 行**（含两个入口文件），在 `vscode/` 内反向校验通过；`./vscode` 本身就是 `1.143.1 + 52–62` 的提交树，等于正向目标态，因此没有再拉 874 MB 的干净 clone 重跑 apply 链。注册实测（`node scripts/code-agent-host.js --port 8092 --log info`）：`Registering agent provider: icode` / `[AgentHostServer] iCode provider registered (/home/dsun/.local/bin/icode)`；把 `PICKET_ICODE_BIN` 指向不存在路径时日志为 `iCode provider not registered (override-missing, enabled=default)`。
 
-- [ ] **Step 4: 手动 P3 验收（真实模型）**
+- [x] **Step 4: 手动 P3 验收（真实模型）**
 
 **原方案的离线 mock 走不通**（2026-11-02 实测）：`~/.chrys/models/*.yaml` 里写 `provider: mock` 不会被识别成脚本化 provider，而是落到 OpenAI 兼容客户端，报 `Could not resolve authentication method. Expected either api_key or admin_api_key`。因此验收改用真实模型。
 
@@ -1033,6 +1033,13 @@ env -u HTTPS_PROXY -u HTTP_PROXY -u ALL_PROXY -u https_proxy -u http_proxy -u al
 ```
 
 （首次启动若卡在 `Synchronizing built-in extensions` 并从 GH 403，是 api.github.com 未认证配额用尽；用 `HTTPS_PROXY=http://127.0.0.1:7892 NODE_USE_ENV_PROXY=1` 预拉一次即可，产物缓存在 `.build/builtInExtensions/`。）
+
+实测结果（2026-11-02 21:05 / 21:08）：
+- `hello` → `AgentHostFirstResponse provider="icode" outcome="success" hasResponseText=true totalElapsedMs=9663`；
+- 运行中打断 → `Cancellation requested … dispatching turnCancelled` + `outcome="cancelled"`，面板回到可输入状态；
+- 启动时若 `agenthost.log` 出现 `[icode] inheriting proxy env: …`，说明那个「working…」卡顿/失败来自代理，按上表处理。
+
+**启动延迟（已知体验问题，不阻塞验收）**：同一台机器用 CLI 直连测，`session/new` 握手 2.4–3.2s，第一轮首个可见 chunk 6.2–9.6s（含进程冷启动 + 模型首 token），同一会话第二轮只需 2.0s。但 app 里第二轮出现 56.7s 才到首个 chunk（`timeToFirstProgress=56674`），窗口内 iCode 只打了两次 `WorkspaceScanner: hit max_files cap` 警告、没有发出任何模型请求 —— 即时间花在 iCode 的 turn 前置工作（工作区扫描/上下文装配），且当时我们正在 `transpile-client` 重写 `vscode/out`（数千文件），扫缓存在该窗口被失效。改善方向留待 P4（把早期 `_chrys/turn_started` 映射成可见进度信号；或让会话 cwd 用工作区目录而非 home）。
 
 **不需要远程 host**：Agents Window 的聊天面板用的是进程内 agent host（日志 `[AgentHostProcessManager] agent host started` + `providerId="local-agent-host"`），它同样会执行注册逻辑，所以 `chat.remoteAgentHosts` 保持空数组即可；计划早先写的 8082 远程 host 只是 Task 1 验证 P2.5 用的手段。
 

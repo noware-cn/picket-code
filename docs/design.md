@@ -297,7 +297,7 @@ src/vs/platform/agentHost/node/icode/
 | P1 | 品牌与微软绑定裁剪（已大部分完成） | 构建产物抓包无遥测/市场/更新出网 |
 | P2 | 零 provider 核心：52/53 对齐 | host 启动正常、编辑器正常、产物无三套 SDK |
 | P2.5 | 核心 UI 验证（新增，已决策路线） | ✅ 2026-11-01 实测通过：mock provider 会话在 **Agents Window** 可见、`createSession` 成功、`hello` 往返成功（编辑器窗口不支持远程 host；另需 62 号补丁修复默认 agent 门槛） |
-| P3 | iCode 骨架注册 | 适配器代码与注册已落地（2026-11-02，63 号补丁，47 个单测）；面板验收项（picker 出现 iCode、hello 往返、打断）待 Agents Window 实测确认 |
+| P3 | iCode 骨架注册 | **已通过（2026-11-02）**：63 号补丁 + 47 个单测；Agents Window 实测 picker 出现 iCode、`hello` 真实模型往返（`AgentHostFirstResponse outcome=success`，9.7s）、运行中打断（`outcome=cancelled`，面板不卡运行中） |
 | P4 | 常驻会话（ACP） | 多轮上下文、diff 预览、会话恢复（`session/load`）、`ask_user` 映射 |
 | P5 | UI/分发与品牌 | 安装包无国外 agent 字节；双平台冒烟 |
 
