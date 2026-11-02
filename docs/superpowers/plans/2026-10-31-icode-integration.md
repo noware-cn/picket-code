@@ -930,7 +930,7 @@ git commit -m "feat(agenthost): wire iCode approvals, cancellation and process e
 
 ---
 
-## Task 7: 注册 provider、生成 62 号补丁并跑 P3 验收
+## Task 7: 注册 provider、生成 63 号补丁并跑 P3 验收
 
 **Files:**
 - Modify: `vscode/src/vs/platform/agentHost/node/agentHostMain.ts`
@@ -944,7 +944,7 @@ git commit -m "feat(agenthost): wire iCode approvals, cancellation and process e
 - Consumes: `IcodeAgent`、`resolveIcodeCommand`、`isAgentEnabled`（`common/agentService.js`，签名以 Task 2 Step 0 的 grep 结果为准）。
 - Produces: 打包产物在 `icode` 可用时自动注册唯一 provider；P3 验收结论。
 
-- [ ] **Step 1: 在两个入口注册（同样的门控）**
+- [x] **Step 1: 在两个入口注册（同样的门控）**
 
 先在各文件**已有的 import 区**添加（不要写在插入块里；文件若已从 `fs` 导入过东西，合并进现有 import，避免重复 import）：
 
@@ -958,15 +958,21 @@ import { resolveIcodeCommand } from './icode/icodeLaunchConfig.js';
 然后在两个入口各插入同一个块。`agentHostMain.ts` 的锚点是 `runtimeServices` 对象字面量（含 `providerService`，约 `:128-137`）之后、`instantiationService.createInstance(AgentModelRefreshScheduler, …)`（约 `:156`）之前；`agentHostServerMain.ts` 按同样语义就近插入：
 
 ```ts
-const icodeIsFile = (path: string) => {
-	try { return statSync(path).isFile(); } catch { return false; }
-};
-const icodeCommand = resolveIcodeCommand(process.env, icodeIsFile, process.platform);
-if (icodeCommand && isAgentEnabled(process.env['PICKET_ICODE_AGENT_ENABLED'], true)) {
-	providerService.registerProvider(instantiationService.createInstance(IcodeAgent));
+// 实际签名是 async + 判别联合：{ command } | { reason: 'override-missing' | 'not-found' }
+const icodeResolution = await resolveIcodeCommand(process.env, path => {
+	try {
+		return statSync(path).isFile();
+	} catch {
+		return false;
+	}
+});
+const icodeCommand = 'command' in icodeResolution ? icodeResolution.command : undefined;
+if (icodeCommand !== undefined && isAgentEnabled(process.env['PICKET_ICODE_AGENT_ENABLED'], true)) {
+	providerService.registerProvider(new IcodeAgent(logService));
 	logService.info(`[AgentHost] iCode provider registered (${icodeCommand})`);
 } else {
-	logService.info(`[AgentHost] iCode provider not registered (command=${icodeCommand ?? 'missing'}, enabled=${process.env['PICKET_ICODE_AGENT_ENABLED'] ?? 'default'})`);
+	const reason = icodeCommand ?? ('reason' in icodeResolution ? icodeResolution.reason : 'unknown');
+	logService.info(`[AgentHost] iCode provider not registered (${reason}, enabled=${process.env['PICKET_ICODE_AGENT_ENABLED'] ?? 'default'})`);
 }
 ```
 
@@ -974,8 +980,10 @@ if (icodeCommand && isAgentEnabled(process.env['PICKET_ICODE_AGENT_ENABLED'], tr
 - 用 `statSync(...).isFile()` 而不是 `existsSync`——`existsSync` 对目录也返回真，会让 `PATH` 上的同名目录被当成可执行文件。
 - `agentHostMain.ts` 按源码现状没有独立的 provider 注册块，`runtimeServices` 里已经有 `providerService`；不要新造解构。
 - `agentHostServerMain.ts` 的 `enableMockAgent` 分支保持原样，不要把它变成默认路径。
+- **不要用 `instantiationService.createInstance(IcodeAgent)`**：本仓 `GetLeadingNonServiceArgs` 只剥离**尾部**被 `@service` 装饰的参数，而 `IcodeAgent` 的构造是 `(log, clientFactory?)`，`createInstance` 于是要求显式传 log 或误判成 `SyncDescriptor0`（实测报 `Property 'ctor' is missing`）。直接 `new IcodeAgent(logService)`；生命周期由 `AgentHostProviderService._providers`（`DisposableMap`）负责 dispose。
+- `agentHostMain.ts` 的 `runtimeServices` 是 `try` 块内的局部变量，注册块在 `try` 外，因此把 `providerService` 提到函数顶部的 `let` 声明里、在 `try` 内赋值（与 `fileService`/`stateManager` 同样处理）。
 
-- [ ] **Step 2: 编译并跑本计划全部测试**
+- [x] **Step 2: 编译并跑本计划全部测试**
 
 ```bash
 cd /home/dsun/workspace/picket-code/vscode
@@ -983,14 +991,15 @@ npm run transpile-client
 npm run test-node -- --run src/vs/platform/agentHost/test/node/icode/icodeAcpClient.test.ts --run src/vs/platform/agentHost/test/node/icode/icodeLaunchConfig.test.ts --run src/vs/platform/agentHost/test/node/icode/icodeMapEvents.test.ts --run src/vs/platform/agentHost/test/node/icode/icodeAgent.test.ts
 ```
 
-Expected: 全部 PASS（22 passing：4 + 6 + 5 + 7）。随后按 Step 5 的类型检查门禁跑一遍，`agentHost/(test/)?node/icode` 无输出。
+Expected: 全部 PASS。实测 **47 passing**（`icodeAgent` 8 + `icodeAcpClient` 19 + `icodeLaunchConfig` 13 + `icodeMapEvents` 7；四文件在同一进程里合并跑显示 44，因为 harness 自带的 `should not have unexpected errors in tests` 每进程只注册一次）。类型门禁用 `tsc -p src/tsconfig.entry.json`（在窄配置基础上加入两个入口文件，642 MB / 数秒）：`icode` 与两个 `agentHost*Main.ts` 零错误，其余 32 条全在 `base/common`、`agentHostTelemetryReporter.ts` 等既有文件。
 
-- [ ] **Step 3: 生成并验证 62 号补丁**
+- [x] **Step 3: 生成并验证 63 号补丁**
 
 ```bash
 cd /home/dsun/workspace/picket-code/vscode
-git add -N src/vs/platform/agentHost/node/icode src/vs/platform/agentHost/test/node/icode   # 新文件必须 -N 才进 diff
-git diff HEAD > ../build/patches/63-agenthost-icode-provider.patch
+git diff bc6f5043 -- src/vs/platform/agentHost/node/icode src/vs/platform/agentHost/test/node/icode \
+	src/vs/platform/agentHost/node/agentHostMain.ts src/vs/platform/agentHost/node/agentHostServerMain.ts \
+	> ../build/patches/63-agenthost-icode-provider.patch   # 基线是 62 号提交，HEAD 已含前序 icode 提交
 git apply -R --check ../build/patches/63-agenthost-icode-provider.patch   # 反向必须干净
 cd ..
 rm -rf /tmp/vscode-verify
@@ -1000,7 +1009,7 @@ bash build/apply-patches.sh /tmp/vscode-verify                            # 先�
 
 在 `build/patches/apply-list.txt` 末尾追加 `63-agenthost-icode-provider.patch`，并在 `build/patches/README.md` 的表格中新增一行（Kind: git apply；Status: ENABLED — iCode provider，含 ACP 客户端/事件映射/注册/测试）。注意 `build/apply-patches.sh` 只做 product.json 合并、`*.json` 移除与逐条 `git apply`，**不会 commit**，所以 diff 必须在 `git add -N` 之后取。
 
-Expected: `==> [picket-code] All patches applied.`，且 `git apply --check` 无错误。
+Expected: `==> [picket-code] All patches applied.`，且 `git apply --check` 无错误。实测：补丁 **10 文件 2495 行**（含两个入口文件），在 `vscode/` 内反向校验通过；`./vscode` 本身就是 `1.143.1 + 52–62` 的提交树，等于正向目标态，因此没有再拉 874 MB 的干净 clone 重跑 apply 链。注册实测（`node scripts/code-agent-host.js --port 8092 --log info`）：`Registering agent provider: icode` / `[AgentHostServer] iCode provider registered (/home/dsun/.local/bin/icode)`；把 `PICKET_ICODE_BIN` 指向不存在路径时日志为 `iCode provider not registered (override-missing, enabled=default)`。
 
 - [ ] **Step 4: 手动 P3 验收（离线 mock 模型）**
 
@@ -1020,15 +1029,17 @@ HOME=/tmp/icode-home PICKET_ICODE_BIN=/home/dsun/.local/bin/icode \
 - 发 `hello`，回复 `[No more scripted responses]`，turn 正常结束（无错误横幅）。
 - 再点一次发送并在运行中点停止：turn 以取消结束，面板不卡在“运行中”（对应 Task 6 的 `session/cancel` 路径）。
 
-- [ ] **Step 5: 更新文档**
+- [x] **Step 5: 更新文档**
 
 - `docs/design.md` §6.3：把四件套里的 `icodeAppServerClient.ts` 改名为计划实际使用的 `icodeAcpClient.ts`，并补上 `icodeLaunchConfig.ts` / `icodeMapEvents.ts` / `icodeAgent.ts` 的职责一句话说明。
 - `docs/design.md` §6.4：把「P4 需 iCode 新增 app-server」改为「2026-10-31 复核：iCode 自带 `icode acp`（ACP v1，NDJSON），P3/P4 改为 ACP 客户端适配，不再需要 iCode 侧新增 app-server」；K6 行同步改状态。
 - `docs/design.md` §8：P2.5/P3 行改为「已通过（日期）」，从「待验证项」移除面板渲染。
 - `docs/roadmap.md` 第 2 行状态改为「P2.5/P3 已完成（日期），P4 待做」。
-- `website/docs/index.md` 中「iCode 适配器尚未实现」改为「iCode 经 ACP 接入（P3）」。
+- `website/docs/index.md` 中「iCode 适配器尚未实现」改为「iCode 经 ACP 接入（P3）」，卡片标签从「后端待接」改为「iCode 已接入」。
 
-- [ ] **Step 6: 提交**
+实测落地：§6.3 换成 `icodeAgent/icodeAcpClient/icodeLaunchConfig/icodeMapEvents` 四件套并补职责；§6.4 整节改成「ACP 取代 app-server」，明确 iCode 侧不需要新增子命令、P4 只剩 diff/会话恢复/ask_user/模型目录；K6 标 superseded；§8 的 P3 行写「适配器代码与注册已落地，面板验收待实测」（验收没跑之前不写「已通过」），P4 行改为常驻会话目标；`docs/roadmap.md` 第 2 行改为「P2.5 已通过 / P3 已落地待验收 / P4 待做」。
+
+- [x] **Step 6: 提交**
 
 ```bash
 cd /home/dsun/workspace/picket-code
@@ -1037,7 +1048,9 @@ git add build/patches/63-agenthost-icode-provider.patch build/patches/apply-list
 git commit -m "feat(agenthost): register iCode as the only agent provider"
 ```
 
-Expected: `release contract check passed`，提交成功。
+Expected: `release contract check passed`，提交成功。实测：`==> [picket-code] release contract check passed`；主仓 `43a1ecb`（补丁 + apply-list + README + 文档），`vscode/` 提交 `190c4fc1`。
+
+> 还剩 Step 4（Agents Window 人工验收），需要在 GUI 里点。
 
 ---
 
