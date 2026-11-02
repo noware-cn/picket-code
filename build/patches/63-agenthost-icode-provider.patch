@@ -438,10 +438,10 @@ index 00000000..4393d9d2
 +}
 diff --git a/src/vs/platform/agentHost/node/icode/icodeAgent.ts b/src/vs/platform/agentHost/node/icode/icodeAgent.ts
 new file mode 100644
-index 00000000..669f7a52
+index 00000000..02e66e95
 --- /dev/null
 +++ b/src/vs/platform/agentHost/node/icode/icodeAgent.ts
-@@ -0,0 +1,566 @@
+@@ -0,0 +1,647 @@
 +/*---------------------------------------------------------------------------------------------
 + *  Copyright (c) Microsoft Corporation. All rights reserved.
 + *  Licensed under the MIT License. See License.txt in the project root for license information.
@@ -484,8 +484,10 @@ index 00000000..669f7a52
 +import { ActionType } from '../../common/state/sessionActions.js';
 +import { createErrorResponsePart, type ChatInputAnswer, type ChatInputResponseKind, type ClientPluginCustomization, type Customization, type ToolCallResult, type Turn } from '../../common/state/sessionState.js';
 +import { IcodeAcpClient, type IIcodeAcpClient } from './icodeAcpClient.js';
++import { buildIcodeTurns } from './icodeHistory.js';
 +import { createIcodeTransport, resolveIcodeCommand } from './icodeLaunchConfig.js';
 +import { createIcodeTurnState, mapAcpPermissionRequest, mapAcpSessionUpdate, type IcodePermissionRequest, type IcodeSessionUpdate, type IIcodeTurnState } from './icodeMapEvents.js';
++import { decodeIcodeProviderData, encodeIcodeProviderData } from './icodeProviderData.js';
 +
 +/** Creates the ACP client; async because resolving the executable touches the file system. */
 +export type IcodeClientFactory = () => IIcodeAcpClient | undefined | Promise<IIcodeAcpClient | undefined>;
@@ -543,7 +545,8 @@ index 00000000..669f7a52
 +	private readonly _onDidChatProgress = this._register(new Emitter<AgentSignal>());
 +	readonly onDidChatProgress = this._onDidChatProgress.event;
 +	readonly onDidMaterializeChat: IAgent['onDidMaterializeChat'] = this._register(new Emitter<IAgentMaterializeChatEvent>()).event;
-+	readonly onDidChangeChatData: IAgent['onDidChangeChatData'] = this._register(new Emitter<IAgentChatDataChange>()).event;
++	private readonly _onDidChangeChatData = this._register(new Emitter<IAgentChatDataChange>());
++	readonly onDidChangeChatData: IAgent['onDidChangeChatData'] = this._onDidChangeChatData.event;
 +	readonly onDidSpawnChat: IAgent['onDidSpawnChat'] = this._register(new Emitter<IAgentSpawnChatEvent>()).event;
 +	readonly onDidDiscoverChats: IAgent['onDidDiscoverChats'] = this._register(new Emitter<readonly IAgentDiscoveredChat[]>()).event;
 +
@@ -556,6 +559,12 @@ index 00000000..669f7a52
 +	/** ACP session id back to the chat it belongs to, for `session/update` routing. */
 +	private readonly _chatsBySessionId = new Map<string, URI>();
 +	private readonly _turns = new Map<string, IIcodeTurnState>();
++	/** Transcript rebuilt from the last `session/load`, keyed by chat. */
++	private readonly _history = new Map<string, readonly Turn[]>();
++	/** Chats whose `providerData` was already published; one blob per ACP session. */
++	private readonly _announcedChats = new Set<string>();
++	/** Set while a `session/load` replay is streaming, so its updates are not treated as live. */
++	private _replay: { readonly sessionId: string; readonly chatKey: string; readonly updates: IcodeSessionUpdate[] } | undefined;
 +	/** One in-flight turn per chat; the value is the running `sendMessage`. */
 +	private readonly _activePrompts = new Map<string, Promise<void>>();
 +	/** Live turns by turn id, so a process exit can report each one with its duration. */
@@ -604,6 +613,10 @@ index 00000000..669f7a52
 +			this._chats.delete(chatKey);
 +			// A pending approval can never be answered once its chat is gone.
 +			this._cancelPendingPermissions(chatKey);
++			// A replay still streaming for this chat must not be buffered any further.
++			if (this._replay?.chatKey === chatKey) {
++				this._replay = undefined;
++			}
 +
 +			const session = this._sessions.get(chatKey);
 +			if (!session) {
@@ -652,13 +665,44 @@ index 00000000..669f7a52
 +		changeAgent: (_chat: URI, _agent: AgentSelection | undefined, _context: AgentChatOperationContext): Promise<void> => {
 +			return Promise.resolve();
 +		},
-+		getMessages: (_chat: URI, _context: AgentChatOperationContext): Promise<readonly Turn[]> => {
-+			return Promise.resolve([]);
++		getMessages: (chat: URI, _context: AgentChatOperationContext): Promise<readonly Turn[]> => {
++			return Promise.resolve(this._history.get(chat.toString()) ?? []);
 +		},
 +	};
 +
-+	async materializeChat(_chat: URI, _context: URI | IAgentChatContext, _providerData: string | undefined): Promise<IAgentCreateChatResult | void> {
-+		// iCode keeps no resumable provider data, so there is nothing to re-attach.
++	async materializeChat(chat: URI, _context: URI | IAgentChatContext, providerData: string | undefined): Promise<IAgentCreateChatResult | void> {
++		const data = decodeIcodeProviderData(providerData);
++		if (!data) {
++			return;
++		}
++
++		const chatKey = chat.toString();
++		// Seed the session before loading: iCode replays the session's updates
++		// while `session/load` is still in flight, and they have to be routed.
++		this._sessions.set(chatKey, { sessionId: data.sessionId, cwd: data.cwd });
++		this._chatsBySessionId.set(data.sessionId, chat);
++		this._announcedChats.add(chatKey);
++
++		const replay = { sessionId: data.sessionId, chatKey, updates: [] as IcodeSessionUpdate[] };
++		this._replay = replay;
++		try {
++			const client = await this._ensureClient();
++			await client.request('session/load', { sessionId: data.sessionId, cwd: data.cwd, mcpServers: [] });
++			if (this._replay === replay) {
++				this._history.set(chatKey, buildIcodeTurns(replay.updates));
++			}
++		} catch (error) {
++			// iCode drops sessions it no longer stores; the chat must still open, and
++			// the next `sendMessage` starts a fresh session instead.
++			this._logService.warn(`[icode] failed to reload session ${data.sessionId}: ${error instanceof Error ? error.message : String(error)}`);
++			this._sessions.delete(chatKey);
++			this._chatsBySessionId.delete(data.sessionId);
++			this._history.delete(chatKey);
++		} finally {
++			if (this._replay === replay) {
++				this._replay = undefined;
++			}
++		}
 +	}
 +
 +	async setWorkingDirectory(_chat: URI, _context: URI | IAgentChatContext, _workingDirectory: URI): Promise<void> {
@@ -671,8 +715,17 @@ index 00000000..669f7a52
 +		return [];
 +	}
 +
-+	async getChatMetadata(_chat: URI, _context: URI | IAgentChatContext, _providerData?: string): Promise<IAgentChatMetadata | undefined> {
-+		return undefined;
++	async getChatMetadata(chat: URI, _context: URI | IAgentChatContext, providerData?: string): Promise<IAgentChatMetadata | undefined> {
++		const data = decodeIcodeProviderData(providerData);
++		if (!data) {
++			return undefined;
++		}
++		return {
++			chat,
++			startTime: data.createdAt,
++			modifiedTime: data.createdAt,
++			workingDirectories: [URI.file(data.cwd)],
++		};
 +	}
 +
 +	async resolveChatConfig(params: IAgentResolveChatConfigParams): Promise<ResolveSessionConfigResult> {
@@ -778,6 +831,7 @@ index 00000000..669f7a52
 +	private async _runTurn(chat: URI, chatKey: string, prompt: string, cwd: string, turnId: string): Promise<void> {
 +		const client = await this._ensureClient();
 +		const sessionId = await this._ensureSession(client, chat, chatKey, cwd);
++		this._announceSession(chat, chatKey, sessionId, cwd);
 +		const state = createIcodeTurnState(turnId);
 +		this._turns.set(chatKey, state);
 +
@@ -827,6 +881,22 @@ index 00000000..669f7a52
 +
 +	private _fireAction(chat: URI, action: IAgentActionSignal['action']): void {
 +		this._onDidChatProgress.fire({ kind: 'action', resource: chat, action });
++	}
++
++	/**
++	 * Publishes the ACP session backing a chat so the host can restore it after
++	 * a restart. One blob per chat: a re-announce would only rewrite the same
++	 * session, and a replaced session is handled by the load-failure path.
++	 */
++	private _announceSession(chat: URI, chatKey: string, sessionId: string, cwd: string): void {
++		if (this._announcedChats.has(chatKey)) {
++			return;
++		}
++		this._announcedChats.add(chatKey);
++		this._onDidChangeChatData.fire({
++			chat,
++			providerData: encodeIcodeProviderData({ v: 1, sessionId, cwd, createdAt: Date.now() }),
++		});
 +	}
 +
 +	private async _ensureSession(client: IIcodeAcpClient, chat: URI, chatKey: string, cwd: string): Promise<string> {
@@ -954,6 +1024,8 @@ index 00000000..669f7a52
 +		this._sessions.clear();
 +		this._chatsBySessionId.clear();
 +		this._turns.clear();
++		// Nothing more will be replayed into an in-flight load.
++		this._replay = undefined;
 +		this._cancelPendingPermissions();
 +
 +		// A dead process rejects the in-flight `session/prompt` with a plain
@@ -977,6 +1049,14 @@ index 00000000..669f7a52
 +		const update: unknown = params?.update;
 +		if (typeof sessionId !== 'string' || typeof update !== 'object' || update === null) {
 +			this._logService.trace(`[icode] ignoring malformed session/update: ${JSON.stringify(params).slice(0, 512)}`);
++			return;
++		}
++
++		// A `session/load` replays the whole stored transcript before it resolves;
++		// those updates are history, not progress for a live turn.
++		const replay = this._replay;
++		if (replay && replay.sessionId === sessionId) {
++			replay.updates.push(update as IcodeSessionUpdate);
 +			return;
 +		}
 +
@@ -1005,8 +1085,237 @@ index 00000000..669f7a52
 +		this._sessions.clear();
 +		this._chatsBySessionId.clear();
 +		this._turns.clear();
++		this._replay = undefined;
 +		client?.dispose();
 +	}
++}
+diff --git a/src/vs/platform/agentHost/node/icode/icodeHistory.ts b/src/vs/platform/agentHost/node/icode/icodeHistory.ts
+new file mode 100644
+index 00000000..9ec0e9b7
+--- /dev/null
++++ b/src/vs/platform/agentHost/node/icode/icodeHistory.ts
+@@ -0,0 +1,222 @@
++/*---------------------------------------------------------------------------------------------
++ *  Copyright (c) Microsoft Corporation. All rights reserved.
++ *  Licensed under the MIT License. See License.txt in the project root for license information.
++ *--------------------------------------------------------------------------------------------*/
++
++import { generateUuid } from '../../../../base/common/uuid.js';
++import { MessageKind, ResponsePartKind, ToolCallCancellationReason, ToolCallConfirmationReason, ToolCallStatus, ToolResultContentType, TurnState, type MarkdownResponsePart, type ReasoningResponsePart, type ToolCallResponsePart, type ToolCallState, type ToolResultTextContent, type Turn } from '../../common/state/sessionState.js';
++import type { IcodeSessionUpdate } from './icodeMapEvents.js';
++
++/** Reasoning is a single stream per turn, so one key is enough. */
++const THOUGHT_PART_KEY = '__thought__';
++/** Text chunks without a `messageId` still belong to one logical message. */
++const ANONYMOUS_TEXT_PART_KEY = '__message__';
++
++type IcodeTextPart = MarkdownResponsePart | ReasoningResponsePart;
++
++/** Scratch state while a replayed turn is still being assembled. */
++interface ITurnBuilder {
++	readonly turn: Turn;
++	/** Stream key to its text/reasoning part, so chunks of one message accumulate. */
++	readonly parts: Map<string, IcodeTextPart>;
++	/** Tool call id to its response part, so `tool_call_update` can close it. */
++	readonly toolParts: Map<string, ToolCallResponsePart>;
++}
++
++/**
++ * Rebuilds the transcript `session/load` replays as it streams the session's
++ * `session/update` notifications.
++ *
++ * A `user_message_chunk` opens a turn; everything after it belongs to that
++ * turn until the next user message. Updates that arrive before any user
++ * message are dropped rather than attributed to an invented turn.
++ */
++export function buildIcodeTurns(updates: readonly IcodeSessionUpdate[]): Turn[] {
++	const turns: Turn[] = [];
++	let current: ITurnBuilder | undefined;
++
++	for (const update of updates) {
++		switch (update.sessionUpdate) {
++			case 'user_message_chunk': {
++				const text = extractText(update.content);
++				if (text !== undefined) {
++					current = createTurnBuilder(text);
++					turns.push(current.turn);
++				}
++				break;
++			}
++			case 'agent_message_chunk':
++				appendTextPart(current, update, ResponsePartKind.Markdown);
++				break;
++			case 'agent_thought_chunk':
++				appendTextPart(current, update, ResponsePartKind.Reasoning);
++				break;
++			case 'tool_call':
++				startToolCall(current, update);
++				break;
++			case 'tool_call_update':
++				updateToolCall(current, update);
++				break;
++			default:
++				// `plan`, `usage_update`, `session_info_update` and anything iCode
++				// adds later carry no transcript content here.
++				break;
++		}
++	}
++
++	return turns;
++}
++
++/**
++ * A replayed turn is already over by the time it is assembled: every ACP
++ * session reports its finished turns, never an in-flight one.
++ */
++function createTurnBuilder(text: string): ITurnBuilder {
++	return {
++		turn: {
++			id: generateUuid(),
++			message: { text, origin: { kind: MessageKind.User } },
++			responseParts: [],
++			usage: undefined,
++			state: TurnState.Complete,
++		},
++		parts: new Map(),
++		toolParts: new Map(),
++	};
++}
++
++function appendTextPart(builder: ITurnBuilder | undefined, update: IcodeSessionUpdate, kind: ResponsePartKind.Markdown | ResponsePartKind.Reasoning): void {
++	if (!builder) {
++		return;
++	}
++	const text = extractText(update.content);
++	if (text === undefined) {
++		return;
++	}
++
++	const key = kind === ResponsePartKind.Markdown ? update.messageId ?? ANONYMOUS_TEXT_PART_KEY : THOUGHT_PART_KEY;
++	let part = builder.parts.get(key);
++	if (part === undefined || part.kind !== kind) {
++		part = createTextPart(kind);
++		builder.parts.set(key, part);
++		builder.turn.responseParts.push(part);
++	}
++	part.content += text;
++}
++
++function startToolCall(builder: ITurnBuilder | undefined, update: IcodeSessionUpdate): void {
++	const toolCallId = update.toolCallId;
++	if (!builder || toolCallId === undefined) {
++		return;
++	}
++	pushToolPart(builder, createToolCallState(toolCallId, update.title ?? toolCallId, update));
++}
++
++function updateToolCall(builder: ITurnBuilder | undefined, update: IcodeSessionUpdate): void {
++	const toolCallId = update.toolCallId;
++	if (!builder || toolCallId === undefined) {
++		return;
++	}
++
++	const existing = builder.toolParts.get(toolCallId);
++	const displayName = update.title ?? existing?.toolCall.displayName ?? toolCallId;
++	const state = createToolCallState(toolCallId, displayName, update);
++	if (existing) {
++		existing.toolCall = state;
++	} else {
++		// A replay may start with the completion of a call it never announced.
++		pushToolPart(builder, state);
++	}
++}
++
++function pushToolPart(builder: ITurnBuilder, toolCall: ToolCallState): void {
++	const part: ToolCallResponsePart = { kind: ResponsePartKind.ToolCall, toolCall };
++	builder.toolParts.set(toolCall.toolCallId, part);
++	builder.turn.responseParts.push(part);
++}
++
++function createToolCallState(toolCallId: string, displayName: string, update: IcodeSessionUpdate): ToolCallState {
++	const invocationMessage = displayName;
++	const toolInput = update.rawInput !== undefined ? JSON.stringify(update.rawInput) : undefined;
++	const content = extractResultContent(update);
++	const base = {
++		toolCallId,
++		// The replayed title is the most specific name a finished call still carries.
++		toolName: displayName,
++		displayName,
++		invocationMessage,
++		...(toolInput !== undefined ? { toolInput } : {}),
++	};
++
++	switch (update.status) {
++		case 'completed':
++			return {
++				...base,
++				status: ToolCallStatus.Completed,
++				confirmed: ToolCallConfirmationReason.NotNeeded,
++				success: true,
++				pastTenseMessage: displayName,
++				...(content !== undefined ? { content } : {}),
++			};
++		case 'failed':
++			return {
++				...base,
++				status: ToolCallStatus.Completed,
++				confirmed: ToolCallConfirmationReason.NotNeeded,
++				success: false,
++				pastTenseMessage: displayName,
++				error: { message: failureMessage(update) },
++				...(content !== undefined ? { content } : {}),
++			};
++		case 'cancelled':
++			return {
++				...base,
++				status: ToolCallStatus.Cancelled,
++				reason: ToolCallCancellationReason.Skipped,
++			};
++		default:
++			return {
++				...base,
++				status: ToolCallStatus.Running,
++				confirmed: ToolCallConfirmationReason.NotNeeded,
++			};
++	}
++}
++
++function createTextPart(kind: ResponsePartKind.Markdown | ResponsePartKind.Reasoning): IcodeTextPart {
++	const id = generateUuid();
++	return kind === ResponsePartKind.Markdown
++		? { kind: ResponsePartKind.Markdown, id, content: '' }
++		: { kind: ResponsePartKind.Reasoning, id, content: '' };
++}
++
++/** Joins the `text` blocks of an ACP content payload, or `undefined` when it carries no text. */
++function extractText(content: IcodeSessionUpdate['content']): string | undefined {
++	const blocks = Array.isArray(content) ? content : content !== undefined ? [content] : [];
++	const text = blocks
++		.filter((block): block is { readonly type: string; readonly text: string } => block.type === 'text' && typeof block.text === 'string')
++		.map(block => block.text)
++		.join('');
++	return text.length > 0 ? text : undefined;
++}
++
++/** The `text` blocks iCode reported, else its raw output, else nothing at all. */
++function extractResultContent(update: IcodeSessionUpdate): ToolResultTextContent[] | undefined {
++	const text = extractText(update.content);
++	if (text !== undefined) {
++		return [{ type: ToolResultContentType.Text, text }];
++	}
++	if (update.rawOutput === undefined) {
++		return undefined;
++	}
++	const raw = typeof update.rawOutput === 'string' ? update.rawOutput : JSON.stringify(update.rawOutput);
++	return raw.length > 0 ? [{ type: ToolResultContentType.Text, text: raw }] : undefined;
++}
++
++function failureMessage(update: IcodeSessionUpdate): string {
++	if (typeof update.rawOutput === 'string' && update.rawOutput.length > 0) {
++		return update.rawOutput;
++	}
++	const text = extractText(update.content);
++	return text ?? 'iCode tool call failed';
 +}
 diff --git a/src/vs/platform/agentHost/node/icode/icodeLaunchConfig.ts b/src/vs/platform/agentHost/node/icode/icodeLaunchConfig.ts
 new file mode 100644
@@ -1631,6 +1940,73 @@ index 00000000..e9520162
 +		default: return undefined;
 +	}
 +}
+diff --git a/src/vs/platform/agentHost/node/icode/icodeProviderData.ts b/src/vs/platform/agentHost/node/icode/icodeProviderData.ts
+new file mode 100644
+index 00000000..1a739e84
+--- /dev/null
++++ b/src/vs/platform/agentHost/node/icode/icodeProviderData.ts
+@@ -0,0 +1,61 @@
++/*---------------------------------------------------------------------------------------------
++ *  Copyright (c) Microsoft Corporation. All rights reserved.
++ *  Licensed under the MIT License. See License.txt in the project root for license information.
++ *--------------------------------------------------------------------------------------------*/
++
++/** Version of the opaque blob this provider persists; bump it whenever the shape changes. */
++export const ICODE_PROVIDER_DATA_VERSION = 1;
++
++/**
++ * What `IcodeAgent` stores in a chat's `providerData` so the chat can be
++ * restored after a restart: the ACP session id to reload plus the directory the
++ * session was created in.
++ */
++export interface IIcodeProviderData {
++	readonly v: typeof ICODE_PROVIDER_DATA_VERSION;
++	readonly sessionId: string;
++	readonly cwd: string;
++	/** When the session was created, reused as the restored chat's start time. */
++	readonly createdAt: number;
++}
++
++export function encodeIcodeProviderData(data: IIcodeProviderData): string {
++	return JSON.stringify(data);
++}
++
++/**
++ * Decodes a persisted blob without ever throwing: the host stores provider data
++ * verbatim and hands it back as-is, so it may be absent, empty, or written by an
++ * older build.
++ */
++export function decodeIcodeProviderData(raw: string | undefined): IIcodeProviderData | undefined {
++	if (raw === undefined || raw.length === 0) {
++		return undefined;
++	}
++
++	let parsed: unknown;
++	try {
++		parsed = JSON.parse(raw);
++	} catch {
++		return undefined;
++	}
++	if (typeof parsed !== 'object' || parsed === null) {
++		return undefined;
++	}
++
++	const record = parsed as Record<string, unknown>;
++	if (record.v !== ICODE_PROVIDER_DATA_VERSION) {
++		return undefined;
++	}
++	if (typeof record.sessionId !== 'string' || record.sessionId.length === 0) {
++		return undefined;
++	}
++	if (typeof record.cwd !== 'string' || record.cwd.length === 0) {
++		return undefined;
++	}
++	if (typeof record.createdAt !== 'number' || !Number.isFinite(record.createdAt)) {
++		return undefined;
++	}
++
++	return { v: ICODE_PROVIDER_DATA_VERSION, sessionId: record.sessionId, cwd: record.cwd, createdAt: record.createdAt };
++}
 diff --git a/src/vs/platform/agentHost/test/node/icode/icodeAcpClient.test.ts b/src/vs/platform/agentHost/test/node/icode/icodeAcpClient.test.ts
 new file mode 100644
 index 00000000..d34e4c39
@@ -2019,10 +2395,10 @@ index 00000000..d34e4c39
 +});
 diff --git a/src/vs/platform/agentHost/test/node/icode/icodeAgent.test.ts b/src/vs/platform/agentHost/test/node/icode/icodeAgent.test.ts
 new file mode 100644
-index 00000000..658f0aac
+index 00000000..aca09584
 --- /dev/null
 +++ b/src/vs/platform/agentHost/test/node/icode/icodeAgent.test.ts
-@@ -0,0 +1,225 @@
+@@ -0,0 +1,328 @@
 +/*---------------------------------------------------------------------------------------------
 + *  Copyright (c) Microsoft Corporation. All rights reserved.
 + *  Licensed under the MIT License. See License.txt in the project root for license information.
@@ -2041,6 +2417,9 @@ index 00000000..658f0aac
 +import { ToolCallStatus } from '../../../common/state/sessionState.js';
 +import { IIcodeAcpClient } from '../../../node/icode/icodeAcpClient.js';
 +import { IcodeAgent } from '../../../node/icode/icodeAgent.js';
++import { decodeIcodeProviderData, encodeIcodeProviderData } from '../../../node/icode/icodeProviderData.js';
++
++const SESSION_ID = 'sess-new';
 +
 +class FakeIcodeClient implements IIcodeAcpClient {
 +	private readonly exitEmitter = new Emitter<number | null>();
@@ -2049,6 +2428,10 @@ index 00000000..658f0aac
 +	exitCode: number | null = null;
 +	readonly requests: { method: string; params: any }[] = [];
 +	readonly notifications: { method: string; params: any }[] = [];
++	/** `session/update` payloads replayed for `session/load`, emitted while the request is in flight. */
++	respondToLoad: readonly any[] = [];
++	/** When set, `session/load` rejects with it, mimicking a session iCode already dropped. */
++	loadError: Error | undefined;
 +	private readonly notificationHandlers = new Map<string, (params: any) => void>();
 +	private readonly requestHandlers = new Map<string, (params: any, id?: any) => unknown>();
 +	private resolvePrompt: ((value: any) => void) | undefined;
@@ -2057,7 +2440,17 @@ index 00000000..658f0aac
 +	request<R>(method: string, params?: unknown): Promise<R> {
 +		this.requests.push({ method, params });
 +		if (method === 'session/new') {
-+			return Promise.resolve({ sessionId: 's1', modes: { availableModes: [], currentModeId: 'manual' }, models: { availableModels: [], currentModelId: 'mock' } } as R);
++			return Promise.resolve({ sessionId: SESSION_ID, modes: { availableModes: [], currentModeId: 'manual' }, models: { availableModels: [], currentModelId: 'mock' } } as R);
++		}
++		if (method === 'session/load') {
++			if (this.loadError) {
++				return Promise.reject(this.loadError);
++			}
++			const sessionId = (params as { sessionId?: string } | undefined)?.sessionId;
++			for (const update of this.respondToLoad) {
++				this.emitNotification('session/update', { sessionId, update });
++			}
++			return Promise.resolve({} as R);
 +		}
 +		if (method === 'session/prompt') {
 +			return new Promise<R>((resolve, reject) => {
@@ -2083,6 +2476,8 @@ index 00000000..658f0aac
 +		return Promise.resolve(handler(params));
 +	}
 +	finishPrompt(result: unknown): void { this.resolvePrompt?.(result); }
++	/** Settles the in-flight `session/prompt` with a bare stop reason. */
++	completePrompt(stopReason: string): void { this.finishPrompt({ stopReason }); }
 +	emitExit(code: number | null): void {
 +		this.exited = true;
 +		this.exitCode = code;
@@ -2095,6 +2490,13 @@ index 00000000..658f0aac
 +
 +const chat = URI.parse('ahp-chat://test/chat');
 +const workspace = URI.file(tmpdir());	// must really exist: sendMessage validates that cwd is an existing absolute directory
++/** A chat restored from the catalog; its provider data names a directory that need not exist. */
++const restoredChat = URI.parse('file:///chat');
++const RESTORED_CWD = '/repo';
++
++function providerData(sessionId: string): string {
++	return encodeIcodeProviderData({ v: 1, sessionId, cwd: RESTORED_CWD, createdAt: 1 });
++}
 +
 +suite('IcodeAgent', () => {
 +	const disposables = ensureNoDisposablesAreLeakedInTestSuite();
@@ -2110,7 +2512,7 @@ index 00000000..658f0aac
 +		assert.deepStrictEqual(client.requests[0], { method: 'session/new', params: { cwd: workspace.fsPath, mcpServers: [] } });
 +
 +		client.emitNotification('session/update', {
-+			sessionId: 's1',
++			sessionId: SESSION_ID,
 +			update: { sessionUpdate: 'agent_message_chunk', messageId: 'm1', content: { type: 'text', text: 'hello' } },
 +		});
 +		client.finishPrompt({ stopReason: 'end_turn', usage: { inputTokens: 1, outputTokens: 2, totalTokens: 3 } });
@@ -2158,7 +2560,7 @@ index 00000000..658f0aac
 +		await agent.chats.abort(chat, chat);
 +		// The host already marked the turn cancelled; firing a completion here
 +		// would complete the same turn twice.
-+		assert.deepStrictEqual(client.notifications, [{ method: 'session/cancel', params: { sessionId: 's1' } }]);
++		assert.deepStrictEqual(client.notifications, [{ method: 'session/cancel', params: { sessionId: SESSION_ID } }]);
 +		assert.deepStrictEqual(signals, []);
 +
 +		client.finishPrompt({ stopReason: 'cancelled' });
@@ -2177,7 +2579,7 @@ index 00000000..658f0aac
 +		await timeout(10);
 +
 +		const pending = client.emitRequest('session/request_permission', {
-+			sessionId: 's1',
++			sessionId: SESSION_ID,
 +			toolCall: { toolCallId: 't1', title: 'Run ls', kind: 'execute', status: 'pending', rawInput: { command: 'ls' } },
 +			options: [{ optionId: 'allow', name: 'Allow once', kind: 'allow_once' }, { optionId: 'reject', name: 'Reject once', kind: 'reject_once' }],
 +		});
@@ -2246,6 +2648,136 @@ index 00000000..658f0aac
 +		clients[1].finishPrompt({ stopReason: 'end_turn' });
 +		await second;
 +		agent.dispose();
++	});
++
++	test('materializeChat loads the persisted session and getMessages returns the replay', async () => {
++		const client = new FakeIcodeClient();
++		const agent = new IcodeAgent(new NullLogService(), () => client);
++		client.respondToLoad = [
++			{ sessionUpdate: 'user_message_chunk', content: { type: 'text', text: 'hello' } },
++			{ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'hi' }, messageId: 'm1' },
++		];
++
++		await agent.materializeChat(restoredChat, chat, providerData('sess-1'));
++		assert.deepStrictEqual(client.requests[0], { method: 'session/load', params: { sessionId: 'sess-1', cwd: RESTORED_CWD, mcpServers: [] } });
++
++		const turns = await agent.chats.getMessages(restoredChat, chat);
++		assert.strictEqual(turns.length, 1);
++		assert.strictEqual(turns[0].message.text, 'hello');
++		agent.dispose();
++	});
++
++	test('a failed load still lets the chat open, and the next sendMessage creates a fresh session', async () => {
++		const client = new FakeIcodeClient();
++		const agent = new IcodeAgent(new NullLogService(), () => client);
++		client.loadError = new Error('Session not found: sess-1');
++
++		await agent.materializeChat(restoredChat, chat, providerData('sess-1'));
++		assert.deepStrictEqual(await agent.chats.getMessages(restoredChat, chat), []);
++
++		const sending = agent.chats.sendMessage(restoredChat, 'hello', [workspace], [], 'turn-1');
++		await timeout(10);
++		assert.deepStrictEqual(client.requests.map(r => r.method), ['session/load', 'session/new', 'session/prompt']);
++
++		client.completePrompt('end_turn');
++		await sending;
++		agent.dispose();
++	});
++
++	test('getChatMetadata returns undefined without providerData and reports the persisted cwd otherwise', async () => {
++		const client = new FakeIcodeClient();
++		const agent = new IcodeAgent(new NullLogService(), () => client);
++
++		assert.strictEqual(await agent.getChatMetadata(restoredChat, chat, undefined), undefined);
++		const metadata = await agent.getChatMetadata(restoredChat, chat, providerData('sess-1'));
++		assert.strictEqual(metadata?.startTime, 1);
++		assert.deepStrictEqual(metadata?.workingDirectories?.map(u => u.fsPath), [RESTORED_CWD]);
++		agent.dispose();
++	});
++
++	test('an aborted replay leaves no buffered history behind', async () => {
++		const client = new FakeIcodeClient();
++		const agent = new IcodeAgent(new NullLogService(), () => client);
++		client.loadError = new Error('cancelled');
++
++		await agent.materializeChat(restoredChat, chat, providerData('sess-1'));
++		client.emitNotification('session/update', { sessionId: 'sess-1', update: { sessionUpdate: 'user_message_chunk', content: { type: 'text', text: 'late' } } });
++		assert.deepStrictEqual(await agent.chats.getMessages(restoredChat, chat), []);
++		agent.dispose();
++	});
++
++	test('announces the new session id as chat data once per chat', async () => {
++		const client = new FakeIcodeClient();
++		const agent = new IcodeAgent(new NullLogService(), () => client);
++		const seen: string[] = [];
++		disposables.add(agent.onDidChangeChatData(e => seen.push(e.providerData)));
++
++		const first = agent.chats.sendMessage(restoredChat, 'hello', [workspace], [], 'turn-1');
++		await timeout(10);
++		client.completePrompt('end_turn');
++		await first;
++
++		const second = agent.chats.sendMessage(restoredChat, 'again', [workspace], [], 'turn-2');
++		await timeout(10);
++		client.completePrompt('end_turn');
++		await second;
++
++		assert.strictEqual(seen.length, 1);
++		assert.strictEqual(decodeIcodeProviderData(seen[0])?.sessionId, SESSION_ID);
++		agent.dispose();
++	});
++});
+diff --git a/src/vs/platform/agentHost/test/node/icode/icodeHistory.test.ts b/src/vs/platform/agentHost/test/node/icode/icodeHistory.test.ts
+new file mode 100644
+index 00000000..1be9ba5a
+--- /dev/null
++++ b/src/vs/platform/agentHost/test/node/icode/icodeHistory.test.ts
+@@ -0,0 +1,47 @@
++/*---------------------------------------------------------------------------------------------
++ *  Copyright (c) Microsoft Corporation. All rights reserved.
++ *  Licensed under the MIT License. See License.txt in the project root for license information.
++ *--------------------------------------------------------------------------------------------*/
++
++import assert from 'assert';
++import { ensureNoDisposablesAreLeakedInTestSuite } from '../../../../../base/test/common/utils.js';
++import { MessageKind, ResponsePartKind, ToolCallStatus, TurnState } from '../../../common/state/sessionState.js';
++import { buildIcodeTurns } from '../../../node/icode/icodeHistory.js';
++
++suite('icodeHistory', () => {
++	ensureNoDisposablesAreLeakedInTestSuite();
++
++	test('groups replayed updates into turns with parts in stream order', () => {
++		const turns = buildIcodeTurns([
++			{ sessionUpdate: 'user_message_chunk', content: { type: 'text', text: 'hello' } },
++			{ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'Hi' }, messageId: 'm1' },
++			{ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: ' there' }, messageId: 'm1' },
++			{ sessionUpdate: 'user_message_chunk', content: { type: 'text', text: 'again' } },
++		] as never);
++		assert.strictEqual(turns.length, 2);
++		assert.deepStrictEqual(turns[0].message, { text: 'hello', origin: { kind: MessageKind.User } });
++		assert.deepStrictEqual(turns[0].responseParts.map(p => p.kind), [ResponsePartKind.Markdown]);
++		assert.strictEqual((turns[0].responseParts[0] as { content: string }).content, 'Hi there');
++		assert.strictEqual(turns[0].state, TurnState.Complete);
++		assert.strictEqual(turns[1].message.text, 'again');
++	});
++
++	test('keeps thought chunks in a separate reasoning part and closes tools on their final status', () => {
++		const turns = buildIcodeTurns([
++			{ sessionUpdate: 'user_message_chunk', content: { type: 'text', text: 'go' } },
++			{ sessionUpdate: 'agent_thought_chunk', content: { type: 'text', text: 'thinking' } },
++			{ sessionUpdate: 'tool_call', toolCallId: 't1', title: 'zsh', kind: 'execute', status: 'in_progress', rawInput: { command: 'ls' } },
++			{ sessionUpdate: 'tool_call_update', toolCallId: 't1', status: 'completed', rawOutput: 'ok' },
++		] as never);
++		const parts = turns[0].responseParts;
++		assert.deepStrictEqual(parts.map(p => p.kind), [ResponsePartKind.Reasoning, ResponsePartKind.ToolCall]);
++		const tool = parts[1] as { toolCall: { status: string; success: boolean; toolName: string } };
++		assert.strictEqual(tool.toolCall.status, ToolCallStatus.Completed);
++		assert.strictEqual(tool.toolCall.success, true);
++		assert.strictEqual(tool.toolCall.toolName, 'zsh');
++	});
++
++	test('drops updates that arrive before any user message instead of inventing a turn', () => {
++		assert.deepStrictEqual(buildIcodeTurns([{ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'x' } }] as never), []);
 +	});
 +});
 diff --git a/src/vs/platform/agentHost/test/node/icode/icodeLaunchConfig.test.ts b/src/vs/platform/agentHost/test/node/icode/icodeLaunchConfig.test.ts
@@ -2607,5 +3139,35 @@ index 00000000..a9af5454
 +		assert.deepStrictEqual(mapAcpSessionUpdate(chat, state, { sessionUpdate: 'session_info_update' }), []);
 +		assert.deepStrictEqual(mapAcpSessionUpdate(chat, state, { sessionUpdate: 'current_mode_update' }), []);
 +		assert.deepStrictEqual(mapAcpSessionUpdate(chat, state, { sessionUpdate: 'branch_snapshot' }), []);
++	});
++});
+diff --git a/src/vs/platform/agentHost/test/node/icode/icodeProviderData.test.ts b/src/vs/platform/agentHost/test/node/icode/icodeProviderData.test.ts
+new file mode 100644
+index 00000000..356c154e
+--- /dev/null
++++ b/src/vs/platform/agentHost/test/node/icode/icodeProviderData.test.ts
+@@ -0,0 +1,24 @@
++/*---------------------------------------------------------------------------------------------
++ *  Copyright (c) Microsoft Corporation. All rights reserved.
++ *  Licensed under the MIT License. See License.txt in the project root for license information.
++ *--------------------------------------------------------------------------------------------*/
++
++import assert from 'assert';
++import { ensureNoDisposablesAreLeakedInTestSuite } from '../../../../../base/test/common/utils.js';
++import { decodeIcodeProviderData, encodeIcodeProviderData } from '../../../node/icode/icodeProviderData.js';
++
++suite('icodeProviderData', () => {
++	ensureNoDisposablesAreLeakedInTestSuite();
++
++	test('round-trips a versioned record', () => {
++		const raw = encodeIcodeProviderData({ v: 1, sessionId: 'abc', cwd: '/repo', createdAt: 1_700_000_000_000 });
++		assert.deepStrictEqual(decodeIcodeProviderData(raw), { v: 1, sessionId: 'abc', cwd: '/repo', createdAt: 1_700_000_000_000 });
++	});
++
++	test('returns undefined for absent, unparsable, or foreign data', () => {
++		assert.strictEqual(decodeIcodeProviderData(undefined), undefined);
++		assert.strictEqual(decodeIcodeProviderData(''), undefined);
++		assert.strictEqual(decodeIcodeProviderData('{"v":2,"sessionId":"a","cwd":"/r","createdAt":1}'), undefined);
++		assert.strictEqual(decodeIcodeProviderData('{"v":1,"sessionId":"a"}'), undefined);
 +	});
 +});
