@@ -1,3 +1,108 @@
+diff --git a/src/vs/platform/agentHost/node/agentHostMain.ts b/src/vs/platform/agentHost/node/agentHostMain.ts
+index 24ef8433..cefa88be 100644
+--- a/src/vs/platform/agentHost/node/agentHostMain.ts
++++ b/src/vs/platform/agentHost/node/agentHostMain.ts
+@@ -13,9 +13,10 @@ import { DisposableStore, IDisposable, MutableDisposable, toDisposable } from '.
+ import { isWindows } from '../../../base/common/platform.js';
+ import { URI } from '../../../base/common/uri.js';
+ import { generateUuid } from '../../../base/common/uuid.js';
++import { statSync } from 'fs';
+ import * as os from 'os';
+ import * as inspector from 'inspector';
+-import { AgentHostIpcChannels, IAgentHostInspectInfo, IAgentHostSocketInfo, IConnectionTrackerService } from '../common/agentService.js';
++import { AgentHostIpcChannels, IAgentHostInspectInfo, IAgentHostSocketInfo, IConnectionTrackerService, isAgentEnabled } from '../common/agentService.js';
+ import { AgentModelRefreshScheduler, MODEL_REFRESH_INTERVAL_MS } from './agentModelRefreshScheduler.js';
+ import { AgentService } from './agentService.js';
+ import { AgentHostStateManager, IAgentHostStateManager } from './agentHostStateManager.js';
+@@ -31,6 +32,8 @@ import { WebSocketProtocolServer } from './webSocketTransport.js';
+ import { MessagePortProtocolServer } from './messagePortProtocolServer.js';
+ import { cleanupLocalAgentHostEndpointMetadataSync, cleanupLocalAgentHostEndpointSocketSync, createLocalAgentHostEndpointMetadata, prepareLocalAgentHostEndpointMetadataDirectory, prepareLocalAgentHostEndpointSocketDirectory, publishLocalAgentHostEndpointMetadata, type ILocalAgentHostEndpointMetadata } from './localAgentHostMetadata.js';
+ import { AgentHostManagementService } from './agentHostManagementService.js';
++import { IcodeAgent } from './icode/icodeAgent.js';
++import { resolveIcodeCommand } from './icode/icodeLaunchConfig.js';
+ import { NativeEnvironmentService } from '../../environment/node/environmentService.js';
+ import { parseArgs, OPTIONS } from '../../environment/node/argv.js';
+ import { getLogLevel, ILogService, isDevConsoleLogForwardingEnabled, registerDevConsoleLogForwarder } from '../../log/common/log.js';
+@@ -102,6 +105,7 @@ async function startAgentHost(): Promise<void> {
+ 	let fileService!: IFileService;
+ 	let stateManager!: AgentHostStateManager;
+ 	let completionTriggerCharacters!: readonly string[];
++	let providerService!: IAgentHostProviderService;
+ 	// Hoisted out of the `try` below so the protocol handlers (constructed
+ 	// after the block) can forward agent-SDK download progress to clients.
+ 	let sdkDownloadProgress: Event<IAgentSdkDownloadProgress> | undefined;
+@@ -140,12 +144,31 @@ async function startAgentHost(): Promise<void> {
+ 		stateManager = runtimeServices.stateManager;
+ 		errorTelemetry.value = new ErrorTelemetry(runtimeServices.telemetryService);
+ 		completionTriggerCharacters = runtimeServices.completions.triggerCharacters;
++		providerService = runtimeServices.providerService;
+ 	} catch (err) {
+ 		logService.error('Failed to create AgentService', err);
+ 		disposables.dispose();
+ 		throw err;
+ 	}
+ 
++	// Register the iCode agent when its CLI is available. Resolving the path
++	// first keeps a host that cannot possibly run a turn from advertising one.
++	const icodeResolution = await resolveIcodeCommand(process.env, path => {
++		try {
++			return statSync(path).isFile();
++		} catch {
++			return false;
++		}
++	});
++	const icodeCommand = 'command' in icodeResolution ? icodeResolution.command : undefined;
++	if (icodeCommand !== undefined && isAgentEnabled(process.env['PICKET_ICODE_AGENT_ENABLED'], true)) {
++		providerService.registerProvider(new IcodeAgent(logService));
++		logService.info(`[AgentHost] iCode provider registered (${icodeCommand})`);
++	} else {
++		const reason = icodeCommand ?? ('reason' in icodeResolution ? icodeResolution.reason : 'unknown');
++		logService.info(`[AgentHost] iCode provider not registered (${reason}, enabled=${process.env['PICKET_ICODE_AGENT_ENABLED'] ?? 'default'})`);
++	}
++
+ 	// Keep every provider's model catalog fresh. Provider-owned refresh
+ 	// triggers (authentication, transport flips, client restarts) are all
+ 	// edge-based, so this periodic tick is the only thing that notices a model
+diff --git a/src/vs/platform/agentHost/node/agentHostServerMain.ts b/src/vs/platform/agentHost/node/agentHostServerMain.ts
+index 6fc58640..af031ba1 100644
+--- a/src/vs/platform/agentHost/node/agentHostServerMain.ts
++++ b/src/vs/platform/agentHost/node/agentHostServerMain.ts
+@@ -39,7 +39,9 @@ import { BANG_COMMAND_PREFIX } from './agentHostBangCommand.js';
+ import { IAgentSdkDownloader } from './agentSdkDownloader.js';
+ import { IAgentHostProviderService } from './agentHostProviderService.js';
+ import { AgentModelRefreshScheduler, MODEL_REFRESH_INTERVAL_MS } from './agentModelRefreshScheduler.js';
+-import { AgentHostClaudeSdkRootEnvVar, AgentHostCodexAgentSdkRootEnvVar } from '../common/agentService.js';
++import { AgentHostClaudeSdkRootEnvVar, AgentHostCodexAgentSdkRootEnvVar, isAgentEnabled } from '../common/agentService.js';
++import { IcodeAgent } from './icode/icodeAgent.js';
++import { resolveIcodeCommand } from './icode/icodeLaunchConfig.js';
+ import { WebSocketProtocolServer } from './webSocketTransport.js';
+ import { ProtocolServerHandler } from './protocolServerHandler.js';
+ import { AgentHostClientFileSystemProvider } from '../common/agentHostClientFileSystemProvider.js';
+@@ -227,6 +229,24 @@ async function main(): Promise<void> {
+ 		});
+ 	}
+ 
++	// Register the iCode agent when its CLI is available. Resolving the path
++	// first keeps a host that cannot possibly run a turn from advertising one.
++	const icodeResolution = await resolveIcodeCommand(process.env, path => {
++		try {
++			return fs.statSync(path).isFile();
++		} catch {
++			return false;
++		}
++	});
++	const icodeCommand = 'command' in icodeResolution ? icodeResolution.command : undefined;
++	if (icodeCommand !== undefined && isAgentEnabled(process.env['PICKET_ICODE_AGENT_ENABLED'], true)) {
++		providerService.registerProvider(new IcodeAgent(logService));
++		logService.info(`[AgentHostServer] iCode provider registered (${icodeCommand})`);
++	} else {
++		const reason = icodeCommand ?? ('reason' in icodeResolution ? icodeResolution.reason : 'unknown');
++		logService.info(`[AgentHostServer] iCode provider not registered (${reason}, enabled=${process.env['PICKET_ICODE_AGENT_ENABLED'] ?? 'default'})`);
++	}
++
+ 	// Keep every provider's model catalog fresh. Provider-owned refresh
+ 	// triggers (authentication, transport flips, client restarts) are all
+ 	// edge-based, so this periodic tick is the only thing that notices a model
 diff --git a/src/vs/platform/agentHost/node/icode/icodeAcpClient.ts b/src/vs/platform/agentHost/node/icode/icodeAcpClient.ts
 new file mode 100644
 index 00000000..4393d9d2

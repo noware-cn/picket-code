@@ -82,7 +82,7 @@
 | K3 | workbench 中约 56 个文件含 copilot 专属逻辑（多为引导/设置类），删除扩展后的降级行为未逐文件验证 | inferred | P2 后需完整构建 + 冒烟 |
 | K4 | README 与 docs/roadmap.md 曾引用已删除的 `build/prepare.sh` | confirmed | 随本设计文档发布一并修订 |
 | K5 | 扩展删除清单含大量语言扩展（python/sql/java/docker 等约 41 个），银行数据开发场景可能需保留 SQL/Python 语言服务 | confirmed | 发布前按场景复核清单 |
-| K6 | iCode 无常驻流式 app-server：现有 `icode run --json` 为 one-shot | confirmed | P4 阶段需 iCode 侧新增 `app-server` 子命令 |
+| K6 | ~~iCode 无常驻流式 app-server~~ | superseded（2026-10-31 复核）：iCode 自带 `icode acp`（ACP v1，NDJSON），P3/P4 改为 ACP 客户端适配 | iCode 侧无需新增 `app-server` 子命令 |
 
 ---
 
@@ -224,26 +224,27 @@ versions ──► compile(linux) ──┐
 
 ```
 src/vs/platform/agentHost/node/icode/
-├── icodeAgent.ts           # 实现 IAgent；从裁剪后 mockAgent 抄结构
-├── icodeAppServerClient.ts # spawn 常驻子进程；参考 node/codex/codexAppServerClient.ts（18KB）
-├── icodeLaunchConfig.ts    # 解析系统 icode 或内置 Python 运行时
-└── icodeMapEvents.ts       # 事件映射：markdown/tool/审批/diff/idle/usage
+├── icodeAgent.ts         # IAgent：单 turn 执行、审批往返、中断、进程退出恢复
+├── icodeAcpClient.ts     # ACP v1（NDJSON JSON-RPC）客户端，复用 JsonRpcProtocol + StreamSplitter
+├── icodeLaunchConfig.ts  # 解析 PICKET_ICODE_BIN / PATH、拼参数与 spawn（含 Windows .cmd 转义）、关闭阶梯
+└── icodeMapEvents.ts     # session/update → AgentSignal：文本 / 思考 / 工具调用 / 审批
 ```
 
 - 完整度参考：codex 适配器 `codexAgent.ts` 约 458KB + 35 个支撑文件；iCode 首版不需要对齐其全部功能。
 - mockAgent 位于 `test/` 且依赖测试 fixture，不能整体搬进生产代码；复制结构后按生产标准重写。
 - IAgent 是内部接口而非扩展 API：**必须 fork 上游代码实现适配**，不能以扩展方式接入。
+- 落地状态（2026-11-02）：四件套已实现并通过 47 个单测（`test/node/icode/`），由 63 号补丁承载；两个 agent host 入口在 `icode` 可解析为文件时注册 provider。原计划里的 `icodeAppServerClient.ts` 未出现——iCode 自带 `icode acp`，客户端只需实现 ACP 的 NDJSON 帧与 JSON-RPC 请求/通知。
 
-### 6.4 常驻 app-server（P4，iCode 侧新增）
+### 6.4 常驻会话服务（P4，已由 ACP 取代原方案）
 
-| 现状 | 目标 |
+| 现状 | 说明 |
 |---|---|
-| `icode run "<prompt>" --agent QA --json`：one-shot，一次往返即退出 | `icode app-server`：常驻进程，JSON-RPC 流式会话 |
-| 无增量上下文、无工具回调 | 支持多轮、工具审批、diff 预览、中断恢复 |
-| 会话状态在 CLI 进程内 | 会话状态由 AgentHost 会话 DB 管理 |
+| `icode run "<prompt>" --agent QA --json`：one-shot，一次往返即退出 | 不适合常驻会话，**已不再使用** |
+| `icode acp`：常驻进程 + ACP v1（NDJSON JSON-RPC） | 2026-10-31 复核确认可用，P3/P4 改为 ACP 客户端适配，iCode 侧无需新增 `app-server` 子命令 |
+| 会话状态在 CLI 进程内 | 仍由 iCode 进程持有；`session/new` 按 chat + cwd 惰性创建并复用 |
 
-- 这是最大工作量判断，未变。
-- 审批语义必须完整映射：iCode workflow 的 manual 审批 ↔ AgentHost 的 pending_confirmation 信号。
+- 审批语义映射已落地：iCode workflow 的 manual 审批 ↔ AgentHost 的 `pending_confirmation` 信号 + `respondToPermissionRequest`。
+- P4 剩余项（不属于本次 P3）：diff 预览、`session/load` 会话恢复、`ask_user`（`_chrys/request_input`）映射、模型目录动态刷新。
 
 ### 6.5 聊天 UI 结论（复核修正）
 
@@ -296,8 +297,8 @@ src/vs/platform/agentHost/node/icode/
 | P1 | 品牌与微软绑定裁剪（已大部分完成） | 构建产物抓包无遥测/市场/更新出网 |
 | P2 | 零 provider 核心：52/53 对齐 | host 启动正常、编辑器正常、产物无三套 SDK |
 | P2.5 | 核心 UI 验证（新增，已决策路线） | ✅ 2026-11-01 实测通过：mock provider 会话在 **Agents Window** 可见、`createSession` 成功、`hello` 往返成功（编辑器窗口不支持远程 host；另需 62 号补丁修复默认 agent 门槛） |
-| P3 | iCode 骨架注册 | picker 出现 iCode，hello 往返成功 |
-| P4 | 常驻 app-server | 多轮、工具审批、diff、中断全链路 |
+| P3 | iCode 骨架注册 | 适配器代码与注册已落地（2026-11-02，63 号补丁，47 个单测）；面板验收项（picker 出现 iCode、hello 往返、打断）待 Agents Window 实测确认 |
+| P4 | 常驻会话（ACP） | 多轮上下文、diff 预览、会话恢复（`session/load`）、`ask_user` 映射 |
 | P5 | UI/分发与品牌 | 安装包无国外 agent 字节；双平台冒烟 |
 
 待验证项：56 个 copilot 引导文件降级行为、release.yml 四段真实 runner 验证（2026-10-23 run #13 已触发，versions 已通过，compile 进行中）、G6 L1 哈希比对脚本落地。（P2.5 面板渲染已于 2026-11-01 实测通过，见 §6.5。）

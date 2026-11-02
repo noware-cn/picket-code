@@ -51,3 +51,4 @@
 59-voice-welcome-byok.patch
 61-build-source-adaptations.patch
 62-chat-default-agent-fallback.patch
+63-agenthost-icode-provider.patch
