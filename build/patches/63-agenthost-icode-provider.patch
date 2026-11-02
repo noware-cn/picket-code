@@ -438,10 +438,10 @@ index 00000000..4393d9d2
 +}
 diff --git a/src/vs/platform/agentHost/node/icode/icodeAgent.ts b/src/vs/platform/agentHost/node/icode/icodeAgent.ts
 new file mode 100644
-index 00000000..6a791977
+index 00000000..aeae6b19
 --- /dev/null
 +++ b/src/vs/platform/agentHost/node/icode/icodeAgent.ts
-@@ -0,0 +1,712 @@
+@@ -0,0 +1,803 @@
 +/*---------------------------------------------------------------------------------------------
 + *  Copyright (c) Microsoft Corporation. All rights reserved.
 + *  Licensed under the MIT License. See License.txt in the project root for license information.
@@ -482,9 +482,10 @@ index 00000000..6a791977
 +import type { ResolveSessionConfigResult, SessionConfigCompletionsResult } from '../../common/state/protocol/commands.js';
 +import { ProtectedResourceMetadata, type AgentSelection, type MessageAttachment, type ModelSelection, type ToolDefinition } from '../../common/state/protocol/state.js';
 +import { ActionType } from '../../common/state/sessionActions.js';
-+import { createErrorResponsePart, type ChatInputAnswer, type ChatInputResponseKind, type ClientPluginCustomization, type Customization, type ToolCallResult, type Turn } from '../../common/state/sessionState.js';
++import { ChatInputResponseKind, createErrorResponsePart, type ChatInputAnswer, type ClientPluginCustomization, type Customization, type ToolCallResult, type Turn } from '../../common/state/sessionState.js';
 +import { IcodeAcpClient, type IIcodeAcpClient } from './icodeAcpClient.js';
 +import { buildIcodeTurns } from './icodeHistory.js';
++import { CANCELLED_INPUT_REPLY, toChatInputRequest, toIcodeInputReply, type IIcodeInputReply, type IIcodeInputRequest, type IIcodeQuestion } from './icodeInputRequests.js';
 +import { createIcodeTransport, resolveIcodeCommand } from './icodeLaunchConfig.js';
 +import { createIcodeTurnState, mapAcpNotification, mapAcpPermissionRequest, mapAcpSessionUpdate, type IcodePermissionRequest, type IcodeSessionUpdate, type IIcodeTurnState } from './icodeMapEvents.js';
 +import { decodeIcodeProviderData, encodeIcodeProviderData } from './icodeProviderData.js';
@@ -523,6 +524,14 @@ index 00000000..6a791977
 +	readonly resolve: (response: IcodePermissionResponse) => void;
 +}
 +
++/** An `ask_user` request waiting for the host's answer. */
++interface IIcodePendingInput {
++	readonly chatKey: string;
++	/** The ACP questions, kept so the positional reply can be built once answered. */
++	readonly questions: readonly IIcodeQuestion[];
++	readonly resolve: (reply: IIcodeInputReply) => void;
++}
++
 +const CANCELLED_PERMISSION: IcodePermissionResponse = { outcome: { outcome: 'cancelled' } };
 +
 +/**
@@ -540,6 +549,11 @@ index 00000000..6a791977
 +function permissionOptionId(options: IcodePermissionRequest['options'], approved: boolean): string {
 +	const kindPrefix = approved ? 'allow' : 'reject';
 +	return options.find(option => option.kind.startsWith(kindPrefix))?.optionId ?? kindPrefix;
++}
++
++/** True for a `_chrys/request_input` question this agent can turn into a protocol question. */
++function isIcodeQuestion(value: unknown): value is IIcodeQuestion {
++	return typeof (value as IIcodeQuestion | undefined)?.question === 'string';
 +}
 +
 +/** True for the signals that put real content into the transcript. */
@@ -592,6 +606,8 @@ index 00000000..6a791977
 +	private readonly _liveTurns = new Map<string, { readonly chat: URI; readonly startedAt: number }>();
 +	/** Permission requests waiting for the host's answer, keyed by ACP tool call id. */
 +	private readonly _pendingPermissions = new Map<string, IIcodePendingPermission>();
++	/** `ask_user` requests waiting for the host's answer, keyed by iCode request id. */
++	private readonly _pendingInputs = new Map<string, IIcodePendingInput>();
 +
 +	private readonly _clientStore = this._register(new DisposableStore());
 +	private readonly _clientFactory: IcodeClientFactory;
@@ -634,6 +650,7 @@ index 00000000..6a791977
 +			this._chats.delete(chatKey);
 +			// A pending approval can never be answered once its chat is gone.
 +			this._cancelPendingPermissions(chatKey);
++			this._cancelPendingInputs(chatKey);
 +			// A replay still streaming for this chat must not be buffered any further.
 +			if (this._replay?.chatKey === chatKey) {
 +				this._replay = undefined;
@@ -670,9 +687,13 @@ index 00000000..6a791977
 +			return this._sendMessage(chat, prompt, workingDirectoriesOrDirectory, turnId);
 +		},
 +		abort: (chat: URI, _context: AgentChatOperationContext): Promise<void> => {
-+			const session = this._sessions.get(chat.toString());
++			const chatKey = chat.toString();
++			// iCode waits on an `ask_user` request until it is answered, so a
++			// cancelled turn has to settle them before the session is stopped.
++			this._cancelPendingInputs(chatKey);
++			const session = this._sessions.get(chatKey);
 +			if (!session || !this._client) {
-+				this._logService.trace(`[icode] abort ignored: no live session for ${chat.toString()}`);
++				this._logService.trace(`[icode] abort ignored: no live session for ${chatKey}`);
 +				return Promise.resolve();
 +			}
 +			// The host already marked the turn cancelled and told the reducer, so
@@ -802,8 +823,15 @@ index 00000000..6a791977
 +		});
 +	}
 +
-+	respondToUserInputRequest(_requestId: string, _response: ChatInputResponseKind, _answers?: Record<string, ChatInputAnswer>): void {
-+		// iCode's ask-user path (`_chrys/request_input`) is out of scope.
++	respondToUserInputRequest(requestId: string, response: ChatInputResponseKind, answers?: Record<string, ChatInputAnswer>): void {
++		const pending = this._pendingInputs.get(requestId);
++		if (!pending) {
++			// A stale click, or an answer for a request the turn already abandoned.
++			this._logService.trace(`[icode] ignoring input response for '${requestId}' (response: ${response})`);
++			return;
++		}
++		this._pendingInputs.delete(requestId);
++		pending.resolve(toIcodeInputReply(pending.questions, response, answers));
 +	}
 +
 +	// ---- Provider lifecycle --------------------------------------------------
@@ -969,6 +997,7 @@ index 00000000..6a791977
 +			this._clientStore.add(client.onNotification(name, params => this._handleActivityNotification(name, params)));
 +		}
 +		this._clientStore.add(client.onRequest('session/request_permission', params => this._onPermissionRequest(params)));
++		this._clientStore.add(client.onRequest('_chrys/request_input', params => this._onInputRequest(params)));
 +		this._clientStore.add(client.onExit(code => this._handleClientExit(client, code)));
 +
 +		this._client = client;
@@ -1038,6 +1067,66 @@ index 00000000..6a791977
 +		}
 +	}
 +
++	/**
++	 * Turns one iCode `ask_user` request into a `ChatInputRequested` action and
++	 * parks a promise that `respondToUserInputRequest` settles.
++	 *
++	 * iCode blocks the turn until it gets a reply, so anything this agent cannot
++	 * honour is answered with `cancelled` right away: neither a malformed request
++	 * nor one for a session that is no longer live may leave the subprocess
++	 * waiting forever.
++	 */
++	private _onInputRequest(params: unknown): Promise<IIcodeInputReply> {
++		const request = params as Partial<IIcodeInputRequest> | undefined;
++		const sessionId = request?.sessionId;
++		const requestId = request?.requestId;
++		const questions = request?.questions;
++		if (typeof sessionId !== 'string' || typeof requestId !== 'string' || !Array.isArray(questions) || !questions.every(isIcodeQuestion)) {
++			this._logService.warn(`[icode] ignoring malformed _chrys/request_input: ${JSON.stringify(params ?? null).slice(0, 512)}`);
++			return Promise.resolve(CANCELLED_INPUT_REPLY);
++		}
++
++		const chat = this._chatsBySessionId.get(sessionId);
++		const state = chat && this._turns.get(chat.toString());
++		if (!chat || !state) {
++			this._logService.warn(`[icode] auto-cancelling input request '${requestId}': no live turn for session '${sessionId}'`);
++			return Promise.resolve(CANCELLED_INPUT_REPLY);
++		}
++
++		// A repeated request id supersedes the earlier one: exactly one answer
++		// must reach the subprocess.
++		this._cancelInput(requestId);
++
++		this._fireAction(chat, { type: ActionType.ChatInputRequested, request: toChatInputRequest(requestId, questions) });
++
++		return new Promise<IIcodeInputReply>(resolve => {
++			this._pendingInputs.set(requestId, { chatKey: chat.toString(), questions, resolve });
++		});
++	}
++
++	/**
++	 * Cancels one pending input request. The reply still carries one entry per
++	 * question: iCode pairs them by position and would otherwise read the
++	 * cancellation as "the user answered nothing".
++	 */
++	private _cancelInput(requestId: string): void {
++		const pending = this._pendingInputs.get(requestId);
++		if (!pending) {
++			return;
++		}
++		this._pendingInputs.delete(requestId);
++		pending.resolve(toIcodeInputReply(pending.questions, ChatInputResponseKind.Cancel, undefined));
++	}
++
++	/** Cancel every pending input request, or only those of one chat. */
++	private _cancelPendingInputs(chatKey?: string): void {
++		for (const requestId of [...this._pendingInputs.keys()]) {
++			if (chatKey === undefined || this._pendingInputs.get(requestId)?.chatKey === chatKey) {
++				this._cancelInput(requestId);
++			}
++		}
++	}
++
 +	private _handleClientExit(client: IIcodeAcpClient, code: number | null): void {
 +		this._logService.info(`[icode] icode exited (${code === null ? 'no exit code' : `code ${code}`})`);
 +		if (this._client !== client) {
@@ -1051,6 +1140,7 @@ index 00000000..6a791977
 +		// Nothing more will be replayed into an in-flight load.
 +		this._replay = undefined;
 +		this._cancelPendingPermissions();
++		this._cancelPendingInputs();
 +
 +		// A dead process rejects the in-flight `session/prompt` with a plain
 +		// cancellation, which the host would read as a user abort, so the exit has
@@ -1144,6 +1234,7 @@ index 00000000..6a791977
 +	private _disposeClient(): void {
 +		this._clientStore.clear();
 +		this._cancelPendingPermissions();
++		this._cancelPendingInputs();
 +		const client = this._client;
 +		this._client = undefined;
 +		this._clientCreation = undefined;
@@ -1383,6 +1474,181 @@ index 00000000..c7603b7c
 +	}
 +	const text = extractText(update.content);
 +	return text ?? 'iCode tool call failed';
++}
+diff --git a/src/vs/platform/agentHost/node/icode/icodeInputRequests.ts b/src/vs/platform/agentHost/node/icode/icodeInputRequests.ts
+new file mode 100644
+index 00000000..97ec01fd
+--- /dev/null
++++ b/src/vs/platform/agentHost/node/icode/icodeInputRequests.ts
+@@ -0,0 +1,169 @@
++/*---------------------------------------------------------------------------------------------
++ *  Copyright (c) Microsoft Corporation. All rights reserved.
++ *  Licensed under the MIT License. See License.txt in the project root for license information.
++ *--------------------------------------------------------------------------------------------*/
++
++import {
++	ChatInputAnswerState,
++	ChatInputAnswerValueKind,
++	ChatInputQuestionKind,
++	ChatInputResponseKind,
++	type ChatInputAnswer,
++	type ChatInputOption,
++	type ChatInputQuestion,
++	type ChatInputRequest,
++} from '../../common/state/sessionState.js';
++
++/** One choice of a `_chrys/request_input` question; iCode sends no option ids. */
++export interface IIcodeQuestionOption {
++	readonly label: string;
++	readonly description?: string;
++}
++
++/** One question of a `_chrys/request_input` request, as iCode's `ask_user` tool declares it. */
++export interface IIcodeQuestion {
++	readonly question: string;
++	readonly header?: string;
++	readonly multiSelect?: boolean;
++	readonly options?: readonly IIcodeQuestionOption[];
++}
++
++/** The `_chrys/request_input` params iCode sends when `ask_user` needs the user. */
++export interface IIcodeInputRequest {
++	readonly sessionId: string;
++	readonly requestId: string;
++	readonly callerName?: string;
++	readonly questions: readonly IIcodeQuestion[];
++}
++
++/** One answer in iCode's reply shape; free text belongs in `values`, never in `note`. */
++export interface IIcodeInputAnswer {
++	readonly values: readonly string[];
++	readonly note: string;
++}
++
++/** The `_chrys/request_input` response iCode expects. */
++export interface IIcodeInputReply {
++	readonly answers: readonly IIcodeInputAnswer[];
++	readonly cancelled: boolean;
++}
++
++/** An answer for a request that was never answered; also the reply to a malformed request. */
++export const CANCELLED_INPUT_REPLY: IIcodeInputReply = { answers: [], cancelled: true };
++
++/** The parts of an answer value this mapper reads; the protocol value types only differ in `value`. */
++interface IAnswerValue {
++	readonly kind: ChatInputAnswerValueKind;
++	readonly value: unknown;
++}
++
++/**
++ * Maps one `_chrys/request_input` request to the protocol's
++ * `ChatInputRequested` payload.
++ *
++ * iCode has no question ids, so they are derived from the ACP `requestId` and
++ * the position in the list: the host repeats them in `answers`, which is the
++ * only way a reply can be matched back to its question.
++ */
++export function toChatInputRequest(requestId: string, questions: readonly IIcodeQuestion[]): ChatInputRequest {
++	return {
++		id: requestId,
++		questions: questions.map((question, index) => toChatInputQuestion(`${requestId}:${index}`, question)),
++	};
++}
++
++function toChatInputQuestion(id: string, question: IIcodeQuestion): ChatInputQuestion {
++	const shared = { id, message: question.question, ...(question.header !== undefined ? { title: question.header } : {}) };
++	// iCode's options are label/description only; the label doubles as the id so
++	// the value the user picks round-trips unchanged.
++	const options: ChatInputOption[] = (question.options ?? []).map(option => ({
++		id: option.label,
++		label: option.label,
++		...(option.description !== undefined ? { description: option.description } : {}),
++	}));
++
++	if (options.length === 0) {
++		return { ...shared, kind: ChatInputQuestionKind.Text };
++	}
++	return question.multiSelect === true
++		? { ...shared, kind: ChatInputQuestionKind.MultiSelect, options }
++		: { ...shared, kind: ChatInputQuestionKind.SingleSelect, options };
++}
++
++/**
++ * Maps the host's answer to iCode's reply.
++ *
++ * iCode pairs the reply with the questions by position and treats a shorter
++ * array as "the user answered nothing", so there is exactly one entry per
++ * question even when the user declined or cancelled.
++ */
++export function toIcodeInputReply(
++	questions: readonly IIcodeQuestion[],
++	response: ChatInputResponseKind,
++	answers: Record<string, ChatInputAnswer> | undefined,
++): IIcodeInputReply {
++	const accepted = response === ChatInputResponseKind.Accept;
++	const byIndex = byQuestionIndex(answers);
++	return {
++		answers: questions.map((_question, index) => ({
++			values: accepted ? answerValues(byIndex.get(index)) : [],
++			note: '',
++		})),
++		cancelled: !accepted,
++	};
++}
++
++/**
++ * Re-keys the host's answers by question position. Question ids are minted as
++ * `<requestId>:<index>`, so the trailing segment is the position.
++ */
++function byQuestionIndex(answers: Record<string, ChatInputAnswer> | undefined): Map<number, ChatInputAnswer> {
++	const byIndex = new Map<number, ChatInputAnswer>();
++	for (const [questionId, answer] of Object.entries(answers ?? {})) {
++		const index = Number(questionId.slice(questionId.lastIndexOf(':') + 1));
++		if (Number.isInteger(index) && index >= 0) {
++			byIndex.set(index, answer);
++		}
++	}
++	return byIndex;
++}
++
++/** The values one answer contributes to the reply; every kind flattens to strings. */
++function answerValues(answer: ChatInputAnswer | undefined): string[] {
++	const value = answerValue(answer);
++	if (value === undefined) {
++		return [];
++	}
++	switch (value.kind) {
++		case ChatInputAnswerValueKind.Selected:
++			return typeof value.value === 'string' ? [value.value] : [];
++		case ChatInputAnswerValueKind.SelectedMany:
++			return Array.isArray(value.value) ? value.value.map(String) : [];
++		case ChatInputAnswerValueKind.Text:
++		case ChatInputAnswerValueKind.Number:
++			return [String(value.value)];
++		case ChatInputAnswerValueKind.Boolean:
++			return [value.value === true ? 'true' : 'false'];
++		default:
++			return [];
++	}
++}
++
++/**
++ * Unwraps the answer's value. The host sends the protocol's `ChatInputAnswer`,
++ * which pairs the value with its lifecycle state; a skipped question carries
++ * none, and a bare value (no state) is accepted as well.
++ */
++function answerValue(answer: ChatInputAnswer | undefined): IAnswerValue | undefined {
++	if (answer === undefined) {
++		return undefined;
++	}
++	const candidate = answer as { readonly state?: ChatInputAnswerState; readonly kind?: ChatInputAnswerValueKind; readonly value?: unknown };
++	if (candidate.state === ChatInputAnswerState.Skipped) {
++		return undefined;
++	}
++	if (candidate.state !== undefined) {
++		return candidate.value as IAnswerValue | undefined;
++	}
++	return candidate.kind === undefined ? undefined : candidate as unknown as IAnswerValue;
 +}
 diff --git a/src/vs/platform/agentHost/node/icode/icodeLaunchConfig.ts b/src/vs/platform/agentHost/node/icode/icodeLaunchConfig.ts
 new file mode 100644
@@ -2523,10 +2789,10 @@ index 00000000..d34e4c39
 +});
 diff --git a/src/vs/platform/agentHost/test/node/icode/icodeAgent.test.ts b/src/vs/platform/agentHost/test/node/icode/icodeAgent.test.ts
 new file mode 100644
-index 00000000..39d8e002
+index 00000000..9f9da7da
 --- /dev/null
 +++ b/src/vs/platform/agentHost/test/node/icode/icodeAgent.test.ts
-@@ -0,0 +1,380 @@
+@@ -0,0 +1,468 @@
 +/*---------------------------------------------------------------------------------------------
 + *  Copyright (c) Microsoft Corporation. All rights reserved.
 + *  Licensed under the MIT License. See License.txt in the project root for license information.
@@ -2542,7 +2808,7 @@ index 00000000..39d8e002
 +import { NullLogService } from '../../../../log/common/log.js';
 +import type { AgentSignal, IAgentActionSignal } from '../../../common/agent.js';
 +import { ActionType } from '../../../common/state/sessionActions.js';
-+import { ToolCallStatus } from '../../../common/state/sessionState.js';
++import { ChatInputAnswerState, ChatInputAnswerValueKind, ChatInputQuestionKind, ChatInputResponseKind, ToolCallStatus } from '../../../common/state/sessionState.js';
 +import { IIcodeAcpClient } from '../../../node/icode/icodeAcpClient.js';
 +import { IcodeAgent } from '../../../node/icode/icodeAgent.js';
 +import { decodeIcodeProviderData, encodeIcodeProviderData } from '../../../node/icode/icodeProviderData.js';
@@ -2562,6 +2828,8 @@ index 00000000..39d8e002
 +	loadError: Error | undefined;
 +	private readonly notificationHandlers = new Map<string, (params: any) => void>();
 +	private readonly requestHandlers = new Map<string, (params: any, id?: any) => unknown>();
++	/** The reply promise of the last server-to-client request, per method. */
++	private readonly replies = new Map<string, Promise<unknown>>();
 +	private resolvePrompt: ((value: any) => void) | undefined;
 +	private rejectPrompt: ((reason: Error) => void) | undefined;
 +
@@ -2601,7 +2869,15 @@ index 00000000..39d8e002
 +	emitRequest(method: string, params: unknown): Promise<unknown> {
 +		const handler = this.requestHandlers.get(method);
 +		assert.ok(handler, `no request handler registered for ${method}`);
-+		return Promise.resolve(handler(params));
++		const reply = Promise.resolve(handler(params));
++		this.replies.set(method, reply);
++		return reply;
++	}
++	/** The reply the agent sent for the last server-to-client request of that method. */
++	lastReplyFor(method: string): Promise<unknown> {
++		const reply = this.replies.get(method);
++		assert.ok(reply, `no reply captured for ${method}`);
++		return reply;
 +	}
 +	finishPrompt(result: unknown): void { this.resolvePrompt?.(result); }
 +	/** Settles the in-flight `session/prompt` with a bare stop reason. */
@@ -2906,6 +3182,84 @@ index 00000000..39d8e002
 +		assert.deepStrictEqual(activities, ['iCode 正在准备…', undefined]);
 +		agent.dispose();
 +	});
++
++	test('forwards _chrys/request_input to the host and replies with one answer per question', async () => {
++		const client = new FakeIcodeClient();
++		const agent = new IcodeAgent(new NullLogService(), () => client);
++		const signals: AgentSignal[] = [];
++		disposables.add(agent.onDidChatProgress(signal => signals.push(signal)));
++
++		const turn = agent.chats.sendMessage(chat, 'hello', [workspace], [], 'turn-1');
++		await timeout(10);
++
++		client.emitRequest('_chrys/request_input', {
++			sessionId: SESSION_ID, requestId: 'req-1', callerName: 'Code',
++			questions: [{ question: 'Which?', header: 'Pick', multiSelect: false, options: [{ label: 'a' }, { label: 'b' }] }],
++		});
++		await timeout(10);
++
++		const requested = signals.find(s => s.kind === 'action' && s.action.type === ActionType.ChatInputRequested);
++		assert.ok(requested);
++		if (requested.kind !== 'action' || requested.action.type !== ActionType.ChatInputRequested) {
++			assert.fail('expected a ChatInputRequested action');
++		}
++		assert.strictEqual(requested.action.request.id, 'req-1');
++		assert.deepStrictEqual(requested.action.request.questions?.map(q => ({ id: q.id, kind: q.kind })), [
++			{ id: 'req-1:0', kind: ChatInputQuestionKind.SingleSelect },
++		]);
++
++		agent.respondToUserInputRequest('req-1', ChatInputResponseKind.Accept, {
++			'req-1:0': { state: ChatInputAnswerState.Submitted, value: { kind: ChatInputAnswerValueKind.Selected, value: 'b' } },
++		});
++		assert.deepStrictEqual(await client.lastReplyFor('_chrys/request_input'), { answers: [{ values: ['b'], note: '' }], cancelled: false });
++
++		// Stale and duplicate answers are ignored: iCode only ever gets one reply.
++		agent.respondToUserInputRequest('req-1', ChatInputResponseKind.Cancel, undefined);
++		agent.respondToUserInputRequest('unknown', ChatInputResponseKind.Accept, undefined);
++		assert.deepStrictEqual(await client.lastReplyFor('_chrys/request_input'), { answers: [{ values: ['b'], note: '' }], cancelled: false });
++
++		// Requests the agent cannot honour are answered at once, without a signal.
++		const seen = signals.length;
++		assert.deepStrictEqual(
++			await client.emitRequest('_chrys/request_input', { sessionId: 'unknown-session', requestId: 'req-x', questions: [{ question: 'Q' }] }),
++			{ answers: [], cancelled: true },
++		);
++		assert.deepStrictEqual(
++			await client.emitRequest('_chrys/request_input', { sessionId: SESSION_ID, requestId: 'req-y', questions: 'not-an-array' }),
++			{ answers: [], cancelled: true },
++		);
++		assert.deepStrictEqual(
++			await client.emitRequest('_chrys/request_input', { sessionId: SESSION_ID, requestId: 'req-z', questions: [{}] }),
++			{ answers: [], cancelled: true },
++		);
++		assert.deepStrictEqual(
++			await client.emitRequest('_chrys/request_input', { sessionId: SESSION_ID, questions: [{ question: 'Q' }] }),
++			{ answers: [], cancelled: true },
++		);
++		assert.strictEqual(signals.length, seen, 'an unusable request must not reach the host');
++
++		client.completePrompt('end_turn');
++		await turn;
++		agent.dispose();
++	});
++
++	test('cancelling the turn answers any open input request with cancelled', async () => {
++		const client = new FakeIcodeClient();
++		const agent = new IcodeAgent(new NullLogService(), () => client);
++
++		const turn = agent.chats.sendMessage(chat, 'hello', [workspace], [], 'turn-1');
++		await timeout(10);
++
++		client.emitRequest('_chrys/request_input', { sessionId: SESSION_ID, requestId: 'req-2', questions: [{ question: 'Q', header: 'H' }] });
++		await timeout(10);
++		await agent.chats.abort(chat, chat);
++
++		assert.deepStrictEqual(await client.lastReplyFor('_chrys/request_input'), { answers: [{ values: [], note: '' }], cancelled: true });
++
++		client.completePrompt('cancelled');
++		await turn;
++		agent.dispose();
++	});
 +});
 diff --git a/src/vs/platform/agentHost/test/node/icode/icodeHistory.test.ts b/src/vs/platform/agentHost/test/node/icode/icodeHistory.test.ts
 new file mode 100644
@@ -2959,6 +3313,70 @@ index 00000000..c8d07242
 +
 +	test('drops updates that arrive before any user message instead of inventing a turn', () => {
 +		assert.deepStrictEqual(buildIcodeTurns([{ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'x' } }] as never), []);
++	});
++});
+diff --git a/src/vs/platform/agentHost/test/node/icode/icodeInputRequests.test.ts b/src/vs/platform/agentHost/test/node/icode/icodeInputRequests.test.ts
+new file mode 100644
+index 00000000..0d54281a
+--- /dev/null
++++ b/src/vs/platform/agentHost/test/node/icode/icodeInputRequests.test.ts
+@@ -0,0 +1,58 @@
++/*---------------------------------------------------------------------------------------------
++ *  Copyright (c) Microsoft Corporation. All rights reserved.
++ *  Licensed under the MIT License. See License.txt in the project root for license information.
++ *--------------------------------------------------------------------------------------------*/
++
++import assert from 'assert';
++import { ensureNoDisposablesAreLeakedInTestSuite } from '../../../../../base/test/common/utils.js';
++import { ChatInputAnswerState, ChatInputAnswerValueKind, ChatInputQuestionKind, ChatInputResponseKind } from '../../../common/state/sessionState.js';
++import { toChatInputRequest, toIcodeInputReply } from '../../../node/icode/icodeInputRequests.js';
++
++suite('icodeInputRequests', () => {
++	ensureNoDisposablesAreLeakedInTestSuite();
++
++	test('maps ACP questions onto protocol questions with stable ids', () => {
++		const request = toChatInputRequest('req-1', [
++			{ question: 'Which library?', header: 'Library', multiSelect: false, options: [{ label: 'tenacity', description: 'Existing dep' }] },
++			{ question: 'Why?', header: 'Reason' },
++		]);
++		assert.strictEqual(request.id, 'req-1');
++		const questions = request.questions ?? [];
++		assert.deepStrictEqual(questions.map(q => ({ id: q.id, kind: q.kind })), [
++			{ id: 'req-1:0', kind: ChatInputQuestionKind.SingleSelect },
++			{ id: 'req-1:1', kind: ChatInputQuestionKind.Text },
++		]);
++		assert.strictEqual(questions[0].title, 'Library');
++		assert.strictEqual(questions[0].message, 'Which library?');
++		assert.strictEqual(questions[1].message, 'Why?');
++		// ACP options carry no id of their own; the label doubles as the answer value.
++		assert.deepStrictEqual((questions[0] as { options?: unknown }).options, [{ id: 'tenacity', label: 'tenacity', description: 'Existing dep' }]);
++	});
++
++	test('multiSelect becomes MultiSelect', () => {
++		const request = toChatInputRequest('r', [{ question: 'Pick', header: 'Pick', multiSelect: true, options: [{ label: 'a' }] }]);
++		assert.strictEqual(request.questions?.[0].kind, ChatInputQuestionKind.MultiSelect);
++	});
++
++	test('answers keep free text in values and map decline/cancel to cancelled', () => {
++		const questions = [{ question: 'Q', header: 'H', options: [{ label: 'a' }] }];
++		assert.deepStrictEqual(
++			toIcodeInputReply(questions, ChatInputResponseKind.Accept, { 'req-1:0': { kind: ChatInputAnswerValueKind.Selected, value: 'a' } } as never),
++			{ answers: [{ values: ['a'], note: '' }], cancelled: false },
++		);
++
++		// The host hands back the protocol's `{ state, value }` wrapper, and iCode
++		// pairs answers with questions by position: one entry per question, always.
++		assert.deepStrictEqual(
++			toIcodeInputReply([{ question: 'Why?' }, { question: 'How?' }, { question: 'How often?' }], ChatInputResponseKind.Accept, {
++				'id:0': { state: ChatInputAnswerState.Submitted, value: { kind: ChatInputAnswerValueKind.Text, value: 'because' } },
++				'id:1': { state: ChatInputAnswerState.Submitted, value: { kind: ChatInputAnswerValueKind.SelectedMany, value: ['a', 'b'] } },
++				'id:2': { state: ChatInputAnswerState.Skipped },
++			} as never),
++			{ answers: [{ values: ['because'], note: '' }, { values: ['a', 'b'], note: '' }, { values: [], note: '' }], cancelled: false },
++		);
++
++		assert.deepStrictEqual(toIcodeInputReply(questions, ChatInputResponseKind.Decline, undefined), { answers: [{ values: [], note: '' }], cancelled: true });
++		assert.deepStrictEqual(toIcodeInputReply(questions, ChatInputResponseKind.Cancel, undefined), { answers: [{ values: [], note: '' }], cancelled: true });
 +	});
 +});
 diff --git a/src/vs/platform/agentHost/test/node/icode/icodeLaunchConfig.test.ts b/src/vs/platform/agentHost/test/node/icode/icodeLaunchConfig.test.ts
