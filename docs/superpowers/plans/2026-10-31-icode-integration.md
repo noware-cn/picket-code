@@ -1011,23 +1011,26 @@ bash build/apply-patches.sh /tmp/vscode-verify                            # 先�
 
 Expected: `==> [picket-code] All patches applied.`，且 `git apply --check` 无错误。实测：补丁 **10 文件 2495 行**（含两个入口文件），在 `vscode/` 内反向校验通过；`./vscode` 本身就是 `1.143.1 + 52–62` 的提交树，等于正向目标态，因此没有再拉 874 MB 的干净 clone 重跑 apply 链。注册实测（`node scripts/code-agent-host.js --port 8092 --log info`）：`Registering agent provider: icode` / `[AgentHostServer] iCode provider registered (/home/dsun/.local/bin/icode)`；把 `PICKET_ICODE_BIN` 指向不存在路径时日志为 `iCode provider not registered (override-missing, enabled=default)`。
 
-- [ ] **Step 4: 手动 P3 验收（离线 mock 模型）**
+- [ ] **Step 4: 手动 P3 验收（真实模型）**
+
+**原方案的离线 mock 走不通**（2026-11-02 实测）：`~/.chrys/models/*.yaml` 里写 `provider: mock` 不会被识别成脚本化 provider，而是落到 OpenAI 兼容客户端，报 `Could not resolve authentication method. Expected either api_key or admin_api_key`。因此验收改用真实模型。
+
+**另一个环境前提**：iCode 的模型请求走 Python httpx，用 certifi 自带根证书；本机 `HTTPS_PROXY=127.0.0.1:7892` 是 TLS 中间人，CA 只在系统信任库里。不设 `SSL_CERT_FILE` 时回合必然失败（iCode 侧 `[SSL: CERTIFICATE_VERIFY_FAILED] self-signed certificate in certificate chain` → `RequestError.internal_error` → 面板 `(sendFailed) Internal error`）。启动 workbench 时带上它，被 spawn 的 `icode` 会继承：
 
 ```bash
-mkdir -p /tmp/icode-home/.chrys/models
-printf 'id: mock\nname: Mock\nprovider: mock\nmodel_id: m1\nmax_context_tokens: 100000\nstream: false\n' > /tmp/icode-home/.chrys/models/mock.yaml
-printf 'model:\n  profile:\n    active: mock\n' > /tmp/icode-home/.chrys/settings.yaml
-
 cd /home/dsun/workspace/picket-code/vscode
-HOME=/tmp/icode-home PICKET_ICODE_BIN=/home/dsun/.local/bin/icode \
-  node scripts/code-agent-host.js --port 8082 --without-connection-token --log trace
+SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt ./scripts/code.sh --agents
 ```
 
-另开终端启动 workbench（同 Task 1 Step 4），把 `chat.remoteAgentHosts` 改为 `{ "name": "icode", "address": "127.0.0.1:8082" }`。Expected:
-- 日志出现 `Registering agent provider: icode`（`agenthost-server.log`）。
-- 面板 agent 选择器出现 `iCode`。
-- 发 `hello`，回复 `[No more scripted responses]`，turn 正常结束（无错误横幅）。
-- 再点一次发送并在运行中点停止：turn 以取消结束，面板不卡在“运行中”（对应 Task 6 的 `session/cancel` 路径）。
+（首次启动若卡在 `Synchronizing built-in extensions` 并从 GH 403，是 api.github.com 未认证配额用尽；用 `HTTPS_PROXY=http://127.0.0.1:7892 NODE_USE_ENV_PROXY=1` 预拉一次即可，产物缓存在 `.build/builtInExtensions/`。）
+
+**不需要远程 host**：Agents Window 的聊天面板用的是进程内 agent host（日志 `[AgentHostProcessManager] agent host started` + `providerId="local-agent-host"`），它同样会执行注册逻辑，所以 `chat.remoteAgentHosts` 保持空数组即可；计划早先写的 8082 远程 host 只是 Task 1 验证 P2.5 用的手段。
+
+Expected:
+- `agenthost.log` 出现 `Registering agent provider: icode`（本地 host 的日志目录是 `~/.config/code-oss-dev/logs/<ts>/agenthost.log`，不是 `Code - OSS Dev`——后者是独立跑 `code-agent-host.js` 时的目录）。
+- 面板 agent 选择器出现 `iCode`，模型落到 `agent-host-icode:default`。
+- 发 `hello`，真实模型正常回复，回合结束无错误横幅。
+- 运行中点停止：turn 以取消结束，面板不卡在“运行中”（对应 Task 6 的 `session/cancel` 路径）。
 
 - [x] **Step 5: 更新文档**
 
