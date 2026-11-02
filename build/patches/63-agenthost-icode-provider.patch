@@ -1010,10 +1010,10 @@ index 00000000..669f7a52
 +}
 diff --git a/src/vs/platform/agentHost/node/icode/icodeLaunchConfig.ts b/src/vs/platform/agentHost/node/icode/icodeLaunchConfig.ts
 new file mode 100644
-index 00000000..89074c9c
+index 00000000..9f60e33f
 --- /dev/null
 +++ b/src/vs/platform/agentHost/node/icode/icodeLaunchConfig.ts
-@@ -0,0 +1,258 @@
+@@ -0,0 +1,266 @@
 +/*---------------------------------------------------------------------------------------------
 + *  Copyright (c) Microsoft Corporation. All rights reserved.
 + *  Licensed under the MIT License. See License.txt in the project root for license information.
@@ -1132,6 +1132,14 @@ index 00000000..89074c9c
 +	const spawnProcess = options.spawnProcess ?? spawn;
 +	const gracePeriodMs = options.gracePeriodMs ?? DEFAULT_GRACE_PERIOD;
 +	const agent = env[ICODE_AGENT_ENV] || DEFAULT_ICODE_AGENT;
++
++	// The CLI reaches its model endpoint over HTTPS from Python, so a proxy in our
++	// environment turns into that process's proxy too. Name it in the log: a
++	// corporate MITM proxy otherwise surfaces only as an opaque TLS failure.
++	const proxyVars = ['HTTPS_PROXY', 'HTTP_PROXY', 'ALL_PROXY', 'https_proxy', 'http_proxy', 'all_proxy'].filter(name => !!env[name]);
++	if (proxyVars.length > 0) {
++		log?.(`[icode] inheriting proxy env: ${proxyVars.join(', ')}`);
++	}
 +
 +	const spawnCommand = formatIcodeSpawnCommand(command, buildIcodeArgs(agent), platform);
 +	const child = spawnProcess(spawnCommand.executable, [...spawnCommand.args], {
