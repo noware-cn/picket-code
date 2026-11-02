@@ -1015,11 +1015,19 @@ Expected: `==> [picket-code] All patches applied.`，且 `git apply --check` 无
 
 **原方案的离线 mock 走不通**（2026-11-02 实测）：`~/.chrys/models/*.yaml` 里写 `provider: mock` 不会被识别成脚本化 provider，而是落到 OpenAI 兼容客户端，报 `Could not resolve authentication method. Expected either api_key or admin_api_key`。因此验收改用真实模型。
 
-**另一个环境前提**：iCode 的模型请求走 Python httpx，用 certifi 自带根证书；本机 `HTTPS_PROXY=127.0.0.1:7892` 是 TLS 中间人，CA 只在系统信任库里。不设 `SSL_CERT_FILE` 时回合必然失败（iCode 侧 `[SSL: CERTIFICATE_VERIFY_FAILED] self-signed certificate in certificate chain` → `RequestError.internal_error` → 面板 `(sendFailed) Internal error`）。启动 workbench 时带上它，被 spawn 的 `icode` 会继承：
+**另一个环境前提（2026-11-02 实测，两种代理症状都遇过）**：iCode 的模型请求走 Python httpx，环境里的 `HTTPS_PROXY` 会让它出问题，症状取决于链路：
+
+| 启动环境 | iCode 症状 | 结论 |
+|---|---|---|
+| 带 `HTTPS_PROXY=http://127.0.0.1:7892`，无 CA | `[SSL: CERTIFICATE_VERIFY_FAILED] self-signed certificate in certificate chain` | 中间人证书不在 certifi 里 |
+| 带 `HTTPS_PROXY=http://127.0.0.1:7892` + `SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt` | `Chat Completions API returned an invalid response (HTTP 200, Content-Type '<missing>'): streaming response body starts with '<'`，body 是 `HIS Proxy Notification` 的 HTML | 代理把 `https://opencode.ai/...` 换成了公司代理的登录页 |
+| 不带任何 proxy 变量 | 正常（`pong`，6–7s） | 直连可达 |
+
+所以验收启动时**把 proxy 变量去掉**即可，不需要 `SSL_CERT_FILE`：
 
 ```bash
 cd /home/dsun/workspace/picket-code/vscode
-SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt ./scripts/code.sh --agents
+env -u HTTPS_PROXY -u HTTP_PROXY -u https_proxy -u http_proxy ./scripts/code.sh --agents
 ```
 
 （首次启动若卡在 `Synchronizing built-in extensions` 并从 GH 403，是 api.github.com 未认证配额用尽；用 `HTTPS_PROXY=http://127.0.0.1:7892 NODE_USE_ENV_PROXY=1` 预拉一次即可，产物缓存在 `.build/builtInExtensions/`。）
