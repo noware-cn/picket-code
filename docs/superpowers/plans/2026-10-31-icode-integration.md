@@ -1021,13 +1021,15 @@ Expected: `==> [picket-code] All patches applied.`，且 `git apply --check` 无
 |---|---|---|
 | 带 `HTTPS_PROXY=http://127.0.0.1:7892`，无 CA | `[SSL: CERTIFICATE_VERIFY_FAILED] self-signed certificate in certificate chain` | 中间人证书不在 certifi 里 |
 | 带 `HTTPS_PROXY=http://127.0.0.1:7892` + `SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt` | `Chat Completions API returned an invalid response (HTTP 200, Content-Type '<missing>'): streaming response body starts with '<'`，body 是 `HIS Proxy Notification` 的 HTML | 代理把 `https://opencode.ai/...` 换成了公司代理的登录页 |
-| 不带任何 proxy 变量 | 正常（`pong`，6–7s） | 直连可达 |
+| 只带 `ALL_PROXY=http://127.0.0.1:7892`（无 HTTP(S)_PROXY） | 同样 `CERTIFICATE_VERIFY_FAILED` | httpx 也读 `ALL_PROXY`，只 unset HTTP(S)_PROXY 不够 |
+| 不带任何 proxy 变量 | 正常（`pong`，5–7s） | 直连可达 |
 
 所以验收启动时**把 proxy 变量去掉**即可，不需要 `SSL_CERT_FILE`：
 
 ```bash
 cd /home/dsun/workspace/picket-code/vscode
-env -u HTTPS_PROXY -u HTTP_PROXY -u https_proxy -u http_proxy ./scripts/code.sh --agents
+env -u HTTPS_PROXY -u HTTP_PROXY -u ALL_PROXY -u https_proxy -u http_proxy -u all_proxy \
+	./scripts/code.sh --agents
 ```
 
 （首次启动若卡在 `Synchronizing built-in extensions` 并从 GH 403，是 api.github.com 未认证配额用尽；用 `HTTPS_PROXY=http://127.0.0.1:7892 NODE_USE_ENV_PROXY=1` 预拉一次即可，产物缓存在 `.build/builtInExtensions/`。）
