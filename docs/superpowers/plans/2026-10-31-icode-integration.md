@@ -23,8 +23,8 @@
 - 同一 chat 同一时刻只允许一个 turn：上一个 `session/prompt` 未返回时再次 `sendMessage` 立即抛错，不排队、不覆盖 turn state（iCode 后端同样是单 turn 语义，并发请求会以 `invalid_params` 失败）。
 - P3 只在 POSIX 真机验收。Windows 走 `.cmd` shim：`findExecutable` 靠 `PATHEXT` 解析到 `icode.cmd`，`formatIcodeSpawnCommand` 按上游 `extHostMcpNode.ts:199-226` 的 CVE-2024-27980 配方转义后以 `shell: true` 启动（每个 token 加引号、`"` 加倍），**没有真机验证**，属于已知风险而非拒绝启动。
 - 新代码只放 `src/vs/platform/agentHost/node/icode/`，测试只放 `src/vs/platform/agentHost/test/node/icode/`。
-- 测试命令固定为：先 `cd vscode && ./node_modules/.bin/tsc -p src/tsconfig.json --noCheck --outDir out --rootDir src`（**不要**用 `npm run build-fast`：`build/next/build-fast.ts` 硬读已删除的 `extensions/copilot/package.json`；也不要用 `npm run compile`，它会连带 `compile-copilot` 失败），再 `npm run test-node -- --run <源文件路径>`。
-- 类型检查：这棵打过 52–61 的树有 219 个既有类型错误（`src/vs/platform/agentHost/node/copilot/**` 仍引用已删除的 `@github/copilot-sdk`），`npm run typecheck-client` 永远非 0。门禁是「错误列表里没有 `agentHost/node/icode` 或 `agentHost/test/node/icode` 的行」。
+- 测试命令固定为：先 `cd vscode && npm run transpile-client`（**不要**用 `npm run build-fast`：`build/next/build-fast.ts` 硬读已删除的 `extensions/copilot/package.json`；也不要用 `npm run compile`，它会连带 `compile-copilot` 失败；**也不要**用 `tsc -p src/tsconfig.json --outDir out`：全量程序峰值约 8 GB，这台机器的 swap 已满，内核 OOM killer 会直接杀进程，现象是命令无输出并以 `-15` 结束），再 `npm run test-node -- --run <源文件路径>`。
+- 类型检查：这棵打过 52–61 的树有 219 个既有类型错误（`src/vs/platform/agentHost/node/copilot/**` 仍引用已删除的 `@github/copilot-sdk`），`npm run typecheck-client` 永远非 0，且它本身也会撞上面那条 OOM。门禁改为窄范围：`./node_modules/.bin/tsc -p src/tsconfig.icode.json`（本地辅助配置，只 include `typings` + 两个 icode 目录，并显式 `types` 加上 `node`，200 MB 内存跑完），判据是「错误列表里没有 `agentHost/node/icode` 或 `agentHost/test/node/icode` 的行」。该文件已写进 `vscode/.git/info/exclude`，不进补丁。
 - 依赖安装需要代理：`HTTPS_PROXY=http://127.0.0.1:7892 NODE_USE_ENV_PROXY=1 npm ci`（`build/npm/postinstall.ts` 的 fetch 直连会 10s 超时）。
 - 提交信息用 Conventional Commits（英文、祈使式）：`feat(agenthost): …`、`docs: …`、`build: …`。
 
@@ -80,7 +80,7 @@ HTTPS_PROXY=http://127.0.0.1:7892 NODE_USE_ENV_PROXY=1 npm ci --no-audit --no-fu
 # 1) gulp transpile-client 复制静态资源（css/json/html/js）到 out/
 # 2) tsc 把 .ts 重新编译成 ESM（gulp 走 esbuild，产物是 CJS 混 import.meta，node 加载即失败）
 npm run gulp transpile-client
-./node_modules/.bin/tsc -p src/tsconfig.json --noCheck --outDir out --rootDir src
+npm run transpile-client
 ```
 
 Expected: `npm ci` exit 0；两条编译命令 exit 0；`out/vs/platform/agentHost/node/agentHostServerMain.js` 存在且是 ES 模块（文件里是 `import ... from`，没有 `Object.defineProperty(exports`）；`out/vs/**/*.css` 存在（`find out -name '*.css' | wc -l` ≈ 489）。
@@ -273,7 +273,7 @@ test('handles a message split across two chunks, and a CJK string split mid-code
 
 ```bash
 cd /home/dsun/workspace/picket-code/vscode
-./node_modules/.bin/tsc -p src/tsconfig.json --noCheck --outDir out --rootDir src && npm run test-node -- --run src/vs/platform/agentHost/test/node/icode/icodeAcpClient.test.ts
+npm run transpile-client && npm run test-node -- --run src/vs/platform/agentHost/test/node/icode/icodeAcpClient.test.ts
 ```
 
 Expected: FAIL，`Cannot find module .../icode/icodeAcpClient.js`。
@@ -292,7 +292,7 @@ Expected: FAIL，`Cannot find module .../icode/icodeAcpClient.js`。
 
 - [x] **Step 4: 运行测试确认通过**
 
-Run: `./node_modules/.bin/tsc -p src/tsconfig.json --noCheck --outDir out --rootDir src && npm run test-node -- --run src/vs/platform/agentHost/test/node/icode/icodeAcpClient.test.ts`
+Run: `npm run transpile-client && npm run test-node -- --run src/vs/platform/agentHost/test/node/icode/icodeAcpClient.test.ts`
 Expected: PASS（19 passing）。
 
 - [x] **Step 5: 导出补丁并提交**
@@ -380,7 +380,7 @@ test('a .cmd shim on Windows goes through the shell with every token quoted', ()
 
 - [x] **Step 2: 运行测试确认失败**
 
-Run: `./node_modules/.bin/tsc -p src/tsconfig.json --noCheck --outDir out --rootDir src && npm run test-node -- --run src/vs/platform/agentHost/test/node/icode/icodeLaunchConfig.test.ts`
+Run: `npm run transpile-client && npm run test-node -- --run src/vs/platform/agentHost/test/node/icode/icodeLaunchConfig.test.ts`
 Expected: FAIL，模块不存在。
 
 - [x] **Step 3: 实现**
@@ -585,7 +585,7 @@ suite('icodeMapEvents', () => {
 
 - [x] **Step 2: 运行测试确认失败**
 
-Run: `./node_modules/.bin/tsc -p src/tsconfig.json --noCheck --outDir out --rootDir src && npm run test-node -- --run src/vs/platform/agentHost/test/node/icode/icodeMapEvents.test.ts`
+Run: `npm run transpile-client && npm run test-node -- --run src/vs/platform/agentHost/test/node/icode/icodeMapEvents.test.ts`
 Expected: FAIL，模块不存在。
 
 - [x] **Step 3: 实现映射**
@@ -638,7 +638,7 @@ export class IcodeAgent extends Disposable implements IAgent {
 }
 ```
 
-- [ ] **Step 1: 写失败测试（一轮往返）**
+- [x] **Step 1: 写失败测试（一轮往返）**
 
 ```ts
 import assert from 'assert';
@@ -735,12 +735,12 @@ suite('IcodeAgent (one turn)', () => {
 });
 ```
 
-- [ ] **Step 2: 运行测试确认失败**
+- [x] **Step 2: 运行测试确认失败**
 
-Run: `./node_modules/.bin/tsc -p src/tsconfig.json --noCheck --outDir out --rootDir src && npm run test-node -- --run src/vs/platform/agentHost/test/node/icode/icodeAgent.test.ts`
+Run: `npm run transpile-client && npm run test-node -- --run src/vs/platform/agentHost/test/node/icode/icodeAgent.test.ts`
 Expected: FAIL，模块不存在。
 
-- [ ] **Step 3: 实现 `IcodeAgent`**
+- [x] **Step 3: 实现 `IcodeAgent`**
 
 必需成员（`IAgent` 非可选项）一个都不能少；无行为的用最小实现：
 - 身份与目录：`id`、`agentHostCapabilities`、`getDescriptor()` 返回 `{ provider: 'icode', displayName: 'iCode', description: 'iCode agent over the Agent Client Protocol' }`；`models = observableValue('icode.models', [{ provider: 'icode', id: 'default', name: 'iCode (BYOK)', supportsVision: false }])`。
@@ -767,16 +767,16 @@ Expected: FAIL，模块不存在。
 
 `_ensureSession(chat, cwd)`：命中缓存且 `cwd` 相同直接返回；否则 `await client.request('session/new', { cwd, mcpServers: [] })`，缓存 `{ sessionId, cwd }` 与反向表，返回 `sessionId`。
 
-- [ ] **Step 4: 运行测试确认通过**
+- [x] **Step 4: 运行测试确认通过**
 
 Expected: PASS（3 passing）。
 
-- [ ] **Step 5: 类型检查**
+- [x] **Step 5: 类型检查**
 
 Run: `npm run typecheck-client 2>&1 | grep -E "agentHost/(test/)?node/icode" | head`
 Expected: 无输出。整棵树有 219 个既有错误（`agentHost/node/copilot/**` 等，与本次改动无关），整条命令退出码非 0 属正常，只看有没有本计划目录的行。
 
-- [ ] **Step 6: 导出补丁并提交**
+- [x] **Step 6: 导出补丁并提交**
 
 ```bash
 cd /home/dsun/workspace/picket-code/vscode
@@ -887,7 +887,7 @@ test('a process exit fails the live turn and respawns on the next send', async (
 
 - [ ] **Step 2: 运行测试确认失败**
 
-Run: `./node_modules/.bin/tsc -p src/tsconfig.json --noCheck --outDir out --rootDir src && npm run test-node -- --run src/vs/platform/agentHost/test/node/icode/icodeAgent.test.ts`
+Run: `npm run transpile-client && npm run test-node -- --run src/vs/platform/agentHost/test/node/icode/icodeAgent.test.ts`
 Expected: FAIL（`notifications` 为空 / 无 pending_confirmation / 无 ChatError / 并发发送未被拒绝）。
 
 - [ ] **Step 3: 实现**
@@ -964,7 +964,7 @@ if (icodeCommand && isAgentEnabled(process.env['PICKET_ICODE_AGENT_ENABLED'], tr
 
 ```bash
 cd /home/dsun/workspace/picket-code/vscode
-./node_modules/.bin/tsc -p src/tsconfig.json --noCheck --outDir out --rootDir src
+npm run transpile-client
 npm run test-node -- --run src/vs/platform/agentHost/test/node/icode/icodeAcpClient.test.ts --run src/vs/platform/agentHost/test/node/icode/icodeLaunchConfig.test.ts --run src/vs/platform/agentHost/test/node/icode/icodeMapEvents.test.ts --run src/vs/platform/agentHost/test/node/icode/icodeAgent.test.ts
 ```
 

@@ -331,6 +331,467 @@ index 00000000..4393d9d2
 +	}
 +	return typeof value === 'object' && value !== null;
 +}
+diff --git a/src/vs/platform/agentHost/node/icode/icodeAgent.ts b/src/vs/platform/agentHost/node/icode/icodeAgent.ts
+new file mode 100644
+index 00000000..4e7ca670
+--- /dev/null
++++ b/src/vs/platform/agentHost/node/icode/icodeAgent.ts
+@@ -0,0 +1,455 @@
++/*---------------------------------------------------------------------------------------------
++ *  Copyright (c) Microsoft Corporation. All rights reserved.
++ *  Licensed under the MIT License. See License.txt in the project root for license information.
++ *--------------------------------------------------------------------------------------------*/
++
++import { existsSync, statSync } from 'fs';
++import { homedir } from 'os';
++import { Emitter } from '../../../../base/common/event.js';
++import { Disposable, DisposableStore } from '../../../../base/common/lifecycle.js';
++import { observableValue } from '../../../../base/common/observable.js';
++import { isAbsolute } from '../../../../base/common/path.js';
++import { URI } from '../../../../base/common/uri.js';
++import { ILogService } from '../../../log/common/log.js';
++import type { AgentHostClientType } from '../../common/agentHostClientInfo.js';
++import {
++	type AgentChatMigrationResult,
++	type AgentChatOperationContext,
++	type AgentProvider,
++	type AgentSignal,
++	type IActiveClient,
++	type IAgent,
++	type IAgentActionSignal,
++	type IAgentChatConfigCompletionsParams,
++	type IAgentChatContext,
++	type IAgentChatDataChange,
++	type IAgentChatMetadata,
++	type IAgentChats,
++	type IAgentCreateChatOptions,
++	type IAgentCreateChatResult,
++	type IAgentDiscoveredChat,
++	type IAgentDescriptor,
++	type IAgentMaterializeChatEvent,
++	type IAgentModelInfo,
++	type IAgentResolveChatConfigParams,
++	type IAgentSpawnChatEvent,
++} from '../../common/agent.js';
++import type { ResolveSessionConfigResult, SessionConfigCompletionsResult } from '../../common/state/protocol/commands.js';
++import { ProtectedResourceMetadata, type AgentSelection, type MessageAttachment, type ModelSelection, type ToolDefinition } from '../../common/state/protocol/state.js';
++import { ActionType } from '../../common/state/sessionActions.js';
++import type { ChatInputAnswer, ChatInputResponseKind, ClientPluginCustomization, Customization, ToolCallResult, Turn } from '../../common/state/sessionState.js';
++import { IcodeAcpClient, type IIcodeAcpClient } from './icodeAcpClient.js';
++import { createIcodeTransport, resolveIcodeCommand } from './icodeLaunchConfig.js';
++import { createIcodeTurnState, mapAcpSessionUpdate, type IcodeSessionUpdate, type IIcodeTurnState } from './icodeMapEvents.js';
++
++/** Creates the ACP client; async because resolving the executable touches the file system. */
++export type IcodeClientFactory = () => IIcodeAcpClient | undefined | Promise<IIcodeAcpClient | undefined>;
++
++/** The subset of `session/prompt`'s result this agent reads. */
++interface IIcodePromptResult {
++	readonly stopReason?: string;
++	readonly usage?: {
++		readonly inputTokens?: unknown;
++		readonly outputTokens?: unknown;
++	};
++}
++
++interface IIcodeSession {
++	readonly sessionId: string;
++	readonly cwd: string;
++}
++
++/** A chat this agent has been told about; recorded for diagnostics only. */
++interface IIcodeChatRecord {
++	readonly cwd: string | undefined;
++}
++
++/**
++ * Agent host provider backed by iCode's Agent Client Protocol server.
++ *
++ * One ACP subprocess serves every chat; sessions are created lazily per chat
++ * and reused while the chat's working directory stays the same.
++ */
++export class IcodeAgent extends Disposable implements IAgent {
++
++	readonly id: AgentProvider = 'icode';
++	readonly agentHostCapabilities: IAgent['agentHostCapabilities'] = { workspaceConversion: false };
++
++	private readonly _onDidChatProgress = this._register(new Emitter<AgentSignal>());
++	readonly onDidChatProgress = this._onDidChatProgress.event;
++	readonly onDidMaterializeChat: IAgent['onDidMaterializeChat'] = this._register(new Emitter<IAgentMaterializeChatEvent>()).event;
++	readonly onDidChangeChatData: IAgent['onDidChangeChatData'] = this._register(new Emitter<IAgentChatDataChange>()).event;
++	readonly onDidSpawnChat: IAgent['onDidSpawnChat'] = this._register(new Emitter<IAgentSpawnChatEvent>()).event;
++	readonly onDidDiscoverChats: IAgent['onDidDiscoverChats'] = this._register(new Emitter<readonly IAgentDiscoveredChat[]>()).event;
++
++	readonly models = observableValue<readonly IAgentModelInfo[]>('icode.models', [
++		{ provider: 'icode', id: 'default', name: 'iCode (BYOK)', supportsVision: false },
++	]);
++
++	private readonly _chats = new Map<string, IIcodeChatRecord>();
++	private readonly _sessions = new Map<string, IIcodeSession>();
++	/** ACP session id back to the chat it belongs to, for `session/update` routing. */
++	private readonly _chatsBySessionId = new Map<string, URI>();
++	private readonly _turns = new Map<string, IIcodeTurnState>();
++	/** One in-flight turn per chat; the value is the running `sendMessage`. */
++	private readonly _activePrompts = new Map<string, Promise<void>>();
++
++	private readonly _clientStore = this._register(new DisposableStore());
++	private readonly _clientFactory: IcodeClientFactory;
++	private _client: IIcodeAcpClient | undefined;
++	private _clientCreation: Promise<IIcodeAcpClient> | undefined;
++
++	constructor(
++		private readonly _logService: ILogService,
++		clientFactory?: IcodeClientFactory,
++	) {
++		super();
++		this._clientFactory = clientFactory ?? (() => this._createDefaultClient());
++	}
++
++	// ---- Identity and catalog -----------------------------------------------
++
++	getDescriptor(): IAgentDescriptor {
++		return { provider: this.id, displayName: 'iCode', description: 'iCode agent over the Agent Client Protocol' };
++	}
++
++	getProtectedResources(): ProtectedResourceMetadata[] {
++		return [];
++	}
++
++	async authenticate(_resource: string, _token: string, _expiresIn?: number): Promise<boolean> {
++		return false;
++	}
++
++	// ---- Chats ---------------------------------------------------------------
++
++	readonly chats: IAgentChats = {
++		createChat: (chat: URI, context: AgentChatOperationContext, options?: IAgentCreateChatOptions): Promise<IAgentCreateChatResult | void> => {
++			const workingDirectory = options?.workingDirectories?.[0] ?? (URI.isUri(context) ? undefined : context.launchWorkingDirectories?.[0]);
++			this._chats.set(chat.toString(), { cwd: workingDirectory?.fsPath });
++			return Promise.resolve({});
++		},
++		disposeChat: async (chat: URI, _context: AgentChatOperationContext): Promise<void> => {
++			const chatKey = chat.toString();
++			this._turns.delete(chatKey);
++			this._chats.delete(chatKey);
++
++			const session = this._sessions.get(chatKey);
++			if (!session) {
++				return;
++			}
++			this._sessions.delete(chatKey);
++			this._chatsBySessionId.delete(session.sessionId);
++			if (!this._client) {
++				return;
++			}
++			try {
++				await this._client.request('session/close', { sessionId: session.sessionId });
++			} catch (error) {
++				this._logService.warn(`[icode] failed to close session ${session.sessionId}: ${error instanceof Error ? error.message : String(error)}`);
++			}
++		},
++		releaseChat: (_chat: URI, _context: AgentChatOperationContext): Promise<void> => {
++			return Promise.resolve();
++		},
++		sendMessage: (
++			chat: URI,
++			prompt: string,
++			workingDirectoriesOrDirectory: readonly URI[] | URI | undefined,
++			_attachments?: readonly MessageAttachment[],
++			turnId?: string,
++			_senderClientId?: string,
++			_clientTypeOrContext?: AgentHostClientType | URI | IAgentChatContext,
++			_context?: URI | IAgentChatContext,
++		): Promise<void> => {
++			return this._sendMessage(chat, prompt, workingDirectoriesOrDirectory, turnId);
++		},
++		abort: (chat: URI, _context: AgentChatOperationContext): Promise<void> => {
++			const session = this._sessions.get(chat.toString());
++			if (!session || !this._client) {
++				this._logService.trace(`[icode] abort ignored: no live session for ${chat.toString()}`);
++				return Promise.resolve();
++			}
++			// The host already marked the turn cancelled and told the reducer, so
++			// firing a completion event here would complete the same turn twice.
++			this._client.notify('session/cancel', { sessionId: session.sessionId });
++			return Promise.resolve();
++		},
++		changeModel: (_chat: URI, _model: ModelSelection, _context: AgentChatOperationContext): Promise<void> => {
++			return Promise.resolve();
++		},
++		changeAgent: (_chat: URI, _agent: AgentSelection | undefined, _context: AgentChatOperationContext): Promise<void> => {
++			return Promise.resolve();
++		},
++		getMessages: (_chat: URI, _context: AgentChatOperationContext): Promise<readonly Turn[]> => {
++			return Promise.resolve([]);
++		},
++	};
++
++	async materializeChat(_chat: URI, _context: URI | IAgentChatContext, _providerData: string | undefined): Promise<IAgentCreateChatResult | void> {
++		// iCode keeps no resumable provider data, so there is nothing to re-attach.
++	}
++
++	async setWorkingDirectory(_chat: URI, _context: URI | IAgentChatContext, _workingDirectory: URI): Promise<void> {
++		throw new Error('iCode does not support changing the working directory of an existing chat');
++	}
++
++	// ---- Metadata and configuration -----------------------------------------
++
++	async listChatsToMigrate(): Promise<AgentChatMigrationResult> {
++		return [];
++	}
++
++	async getChatMetadata(_chat: URI, _context: URI | IAgentChatContext, _providerData?: string): Promise<IAgentChatMetadata | undefined> {
++		return undefined;
++	}
++
++	async resolveChatConfig(params: IAgentResolveChatConfigParams): Promise<ResolveSessionConfigResult> {
++		return { schema: { type: 'object', properties: {} }, values: params.config ?? {} };
++	}
++
++	getInheritedChatConfig(): Record<string, unknown> | undefined {
++		return undefined;
++	}
++
++	async chatConfigCompletions(_params: IAgentChatConfigCompletionsParams): Promise<SessionConfigCompletionsResult> {
++		return { items: [] };
++	}
++
++	async getChatCustomizations(_chat: URI, _context: URI | IAgentChatContext): Promise<readonly Customization[]> {
++		return [];
++	}
++
++	// ---- Active clients and interaction -------------------------------------
++
++	getOrCreateActiveClient(_chat: URI, _context: URI | IAgentChatContext, client: { readonly clientId: string; readonly displayName?: string }): IActiveClient {
++		let tools: readonly ToolDefinition[] = [];
++		let customizations: readonly ClientPluginCustomization[] = [];
++		return {
++			clientId: client.clientId,
++			displayName: client.displayName,
++			get tools() { return tools; },
++			set tools(value: readonly ToolDefinition[]) { tools = value; },
++			get customizations() { return customizations; },
++			set customizations(value: readonly ClientPluginCustomization[]) { customizations = value; },
++		};
++	}
++
++	removeActiveClient(_chat: URI, _context: URI | IAgentChatContext, _clientId: string): void {
++		// iCode has no host-client tool contribution surface yet.
++	}
++
++	onClientToolCallComplete(_chat: URI, _toolCallId: string, _result: ToolCallResult, _context?: IAgentChatContext): void {
++		// iCode runs every tool call in its own process.
++	}
++
++	respondToPermissionRequest(_requestId: string, _approved: boolean): void {
++		// Task 6: settle the pending `session/request_permission` request.
++	}
++
++	respondToUserInputRequest(_requestId: string, _response: ChatInputResponseKind, _answers?: Record<string, ChatInputAnswer>): void {
++		// iCode's ask-user path (`_chrys/request_input`) is out of scope.
++	}
++
++	// ---- Provider lifecycle --------------------------------------------------
++
++	async shutdown(): Promise<void> {
++		this._disposeClient();
++	}
++
++	override dispose(): void {
++		this._disposeClient();
++		super.dispose();
++	}
++
++	// ---- Turn execution ------------------------------------------------------
++
++	private async _sendMessage(chat: URI, prompt: string, workingDirectoriesOrDirectory: readonly URI[] | URI | undefined, turnId: string | undefined): Promise<void> {
++		if (!turnId) {
++			throw new Error('iCode requires a turn id');
++		}
++
++		const workingDirectory = (Array.isArray(workingDirectoriesOrDirectory) ? workingDirectoriesOrDirectory[0] : workingDirectoriesOrDirectory)?.fsPath;
++		const cwd = workingDirectory ?? homedir();
++		// Validate before touching the client: iCode requires an existing absolute
++		// directory for `session/new`, and spawning a process for a doomed turn is a
++		// real cost.
++		if (!isAbsolute(cwd) || statSync(cwd, { throwIfNoEntry: false })?.isDirectory() !== true) {
++			throw new Error(`iCode requires an existing absolute working directory: ${cwd}`);
++		}
++
++		const chatKey = chat.toString();
++		if (this._activePrompts.has(chatKey)) {
++			throw new Error('iCode is already running a turn for this chat');
++		}
++
++		const turn = this._runTurn(chat, chatKey, prompt, cwd, turnId);
++		this._activePrompts.set(chatKey, turn);
++		try {
++			await turn;
++		} finally {
++			if (this._activePrompts.get(chatKey) === turn) {
++				this._activePrompts.delete(chatKey);
++			}
++		}
++	}
++
++	private async _runTurn(chat: URI, chatKey: string, prompt: string, cwd: string, turnId: string): Promise<void> {
++		const client = await this._ensureClient();
++		const sessionId = await this._ensureSession(client, chat, chatKey, cwd);
++		const state = createIcodeTurnState(turnId);
++		this._turns.set(chatKey, state);
++
++		const startedAt = Date.now();
++		try {
++			const result = await client.request<IIcodePromptResult>('session/prompt', {
++				sessionId,
++				prompt: [{ type: 'text', text: prompt }],
++			});
++
++			const usage = result?.usage;
++			if (typeof usage?.inputTokens === 'number' && typeof usage.outputTokens === 'number') {
++				this._fireAction(chat, {
++					type: ActionType.ChatUsage,
++					turnId,
++					usage: { inputTokens: usage.inputTokens, outputTokens: usage.outputTokens },
++				});
++			}
++
++			switch (result?.stopReason) {
++				case 'cancelled':
++					this._fireAction(chat, { type: ActionType.ChatTurnCancelled, turnId, duration: Date.now() - startedAt });
++					break;
++				case 'refusal':
++					// Never let a refusal look like a normal completion.
++					throw new Error('iCode refused this turn (stopReason: refusal)');
++				default:
++					this._fireAction(chat, { type: ActionType.ChatTurnComplete, turnId, duration: Date.now() - startedAt });
++					break;
++			}
++		} finally {
++			this._turns.delete(chatKey);
++		}
++	}
++
++	private _fireAction(chat: URI, action: IAgentActionSignal['action']): void {
++		this._onDidChatProgress.fire({ kind: 'action', resource: chat, action });
++	}
++
++	private async _ensureSession(client: IIcodeAcpClient, chat: URI, chatKey: string, cwd: string): Promise<string> {
++		const cached = this._sessions.get(chatKey);
++		if (cached && cached.cwd === cwd) {
++			this._chatsBySessionId.set(cached.sessionId, chat);
++			return cached.sessionId;
++		}
++
++		if (cached) {
++			this._chatsBySessionId.delete(cached.sessionId);
++			this._sessions.delete(chatKey);
++		}
++
++		const result = await client.request<{ sessionId?: unknown }>('session/new', { cwd, mcpServers: [] });
++		const sessionId = typeof result?.sessionId === 'string' ? result.sessionId : undefined;
++		if (!sessionId) {
++			throw new Error('iCode did not return a session id from session/new');
++		}
++
++		this._sessions.set(chatKey, { sessionId, cwd });
++		this._chatsBySessionId.set(sessionId, chat);
++		return sessionId;
++	}
++
++	// ---- ACP client lifecycle and routing ------------------------------------
++
++	private _ensureClient(): Promise<IIcodeAcpClient> {
++		if (this._client) {
++			return Promise.resolve(this._client);
++		}
++		if (!this._clientCreation) {
++			this._clientCreation = this._createAndWireClient().finally(() => {
++				this._clientCreation = undefined;
++			});
++		}
++		return this._clientCreation;
++	}
++
++	private async _createAndWireClient(): Promise<IIcodeAcpClient> {
++		const client = await this._clientFactory();
++		if (!client) {
++			throw new Error('iCode executable not found: set PICKET_ICODE_BIN or put icode on PATH');
++		}
++
++		this._clientStore.clear();
++		this._clientStore.add(client.onNotification('session/update', params => this._handleSessionUpdate(params)));
++		// Task 6 replaces this stub with the host approval round-trip; until then a
++		// request must not be dropped silently, and cancelling keeps the tool from
++		// running without inventing an approval policy.
++		this._clientStore.add(client.onRequest('session/request_permission', params => {
++			this._logService.info(`[icode] session/request_permission has no host round-trip yet; cancelling: ${JSON.stringify(params).slice(0, 512)}`);
++			return { outcome: { outcome: 'cancelled' } };
++		}));
++		this._clientStore.add(client.onExit(code => this._handleClientExit(client, code)));
++
++		this._client = client;
++		return client;
++	}
++
++	private async _createDefaultClient(): Promise<IIcodeAcpClient | undefined> {
++		const resolution = await resolveIcodeCommand(process.env, path => existsSync(path));
++		if (!('command' in resolution)) {
++			this._logService.warn(`[icode] could not resolve the icode executable (${resolution.reason})`);
++			return undefined;
++		}
++		const transport = createIcodeTransport(resolution.command, {
++			log: message => this._logService.info(message),
++		});
++		return new IcodeAcpClient(transport, message => this._logService.trace(message));
++	}
++
++	private _handleClientExit(client: IIcodeAcpClient, code: number | null): void {
++		this._logService.info(`[icode] icode exited (${code === null ? 'no exit code' : `code ${code}`})`);
++		if (this._client !== client) {
++			return;
++		}
++		// Forget the dead process so the next turn spawns a fresh one.
++		this._client = undefined;
++		this._sessions.clear();
++		this._chatsBySessionId.clear();
++		this._turns.clear();
++	}
++
++	private _handleSessionUpdate(params: any): void {
++		const sessionId: unknown = params?.sessionId;
++		const update: unknown = params?.update;
++		if (typeof sessionId !== 'string' || typeof update !== 'object' || update === null) {
++			this._logService.trace(`[icode] ignoring malformed session/update: ${JSON.stringify(params).slice(0, 512)}`);
++			return;
++		}
++
++		const chat = this._chatsBySessionId.get(sessionId);
++		if (!chat) {
++			this._logService.trace(`[icode] ignoring session/update for unknown session '${sessionId}'`);
++			return;
++		}
++		const state = this._turns.get(chat.toString());
++		if (!state) {
++			this._logService.trace(`[icode] ignoring session/update outside a turn for '${sessionId}'`);
++			return;
++		}
++
++		for (const signal of mapAcpSessionUpdate(chat, state, update as IcodeSessionUpdate)) {
++			this._onDidChatProgress.fire(signal);
++		}
++	}
++
++	private _disposeClient(): void {
++		this._clientStore.clear();
++		const client = this._client;
++		this._client = undefined;
++		this._clientCreation = undefined;
++		this._sessions.clear();
++		this._chatsBySessionId.clear();
++		this._turns.clear();
++		client?.dispose();
++	}
++}
 diff --git a/src/vs/platform/agentHost/node/icode/icodeLaunchConfig.ts b/src/vs/platform/agentHost/node/icode/icodeLaunchConfig.ts
 new file mode 100644
 index 00000000..89074c9c
@@ -1330,6 +1791,113 @@ index 00000000..d34e4c39
 +		assert.deepStrictEqual(await sink.next(), {
 +			jsonrpc: '2.0', method: '$/cancel_request', params: { requestId: 1 },
 +		});
++	});
++});
+diff --git a/src/vs/platform/agentHost/test/node/icode/icodeAgent.test.ts b/src/vs/platform/agentHost/test/node/icode/icodeAgent.test.ts
+new file mode 100644
+index 00000000..4d9ded62
+--- /dev/null
++++ b/src/vs/platform/agentHost/test/node/icode/icodeAgent.test.ts
+@@ -0,0 +1,101 @@
++/*---------------------------------------------------------------------------------------------
++ *  Copyright (c) Microsoft Corporation. All rights reserved.
++ *  Licensed under the MIT License. See License.txt in the project root for license information.
++ *--------------------------------------------------------------------------------------------*/
++
++import assert from 'assert';
++import { tmpdir } from 'os';
++import { timeout } from '../../../../../base/common/async.js';
++import { Event } from '../../../../../base/common/event.js';
++import { IDisposable } from '../../../../../base/common/lifecycle.js';
++import { URI } from '../../../../../base/common/uri.js';
++import { ensureNoDisposablesAreLeakedInTestSuite } from '../../../../../base/test/common/utils.js';
++import { NullLogService } from '../../../../log/common/log.js';
++import type { AgentSignal, IAgentActionSignal } from '../../../common/agent.js';
++import { ActionType } from '../../../common/state/sessionActions.js';
++import { IIcodeAcpClient } from '../../../node/icode/icodeAcpClient.js';
++import { IcodeAgent } from '../../../node/icode/icodeAgent.js';
++
++class FakeIcodeClient implements IIcodeAcpClient {
++	readonly onExit = Event.None;
++	readonly exited = false;
++	readonly exitCode = null;
++	readonly requests: { method: string; params: any }[] = [];
++	readonly notifications: { method: string; params: any }[] = [];
++	private readonly notificationHandlers = new Map<string, (params: any) => void>();
++	private resolvePrompt: ((value: any) => void) | undefined;
++
++	request<R>(method: string, params?: unknown): Promise<R> {
++		this.requests.push({ method, params });
++		if (method === 'session/new') {
++			return Promise.resolve({ sessionId: 's1', modes: { availableModes: [], currentModeId: 'manual' }, models: { availableModels: [], currentModelId: 'mock' } } as R);
++		}
++		if (method === 'session/prompt') {
++			return new Promise<R>(resolve => { this.resolvePrompt = resolve as (value: any) => void; });
++		}
++		return Promise.resolve({} as R);
++	}
++	notify(method: string, params?: unknown): void { this.notifications.push({ method, params }); }
++	onNotification(method: string, handler: (params: any) => void): IDisposable {
++		this.notificationHandlers.set(method, handler);
++		return { dispose: () => this.notificationHandlers.delete(method) };
++	}
++	onRequest(): IDisposable { return { dispose: () => { } }; }
++	emitNotification(method: string, params: unknown): void { this.notificationHandlers.get(method)?.(params); }
++	finishPrompt(result: unknown): void { this.resolvePrompt?.(result); }
++	dispose(): void { }
++}
++
++const chat = URI.parse('ahp-chat://test/chat');
++const workspace = URI.file(tmpdir());	// must really exist: sendMessage validates that cwd is an existing absolute directory
++
++suite('IcodeAgent (one turn)', () => {
++	const disposables = ensureNoDisposablesAreLeakedInTestSuite();
++
++	test('creates a session and completes a prompt round-trip', async () => {
++		const client = new FakeIcodeClient();
++		const agent = new IcodeAgent(new NullLogService(), () => client);
++		const signals: AgentSignal[] = [];
++		disposables.add(agent.onDidChatProgress(signal => signals.push(signal)));
++
++		const sending = agent.chats.sendMessage(chat, 'hello', [workspace], undefined, 'turn-1');
++		await timeout(10);
++		assert.deepStrictEqual(client.requests[0], { method: 'session/new', params: { cwd: workspace.fsPath, mcpServers: [] } });
++
++		client.emitNotification('session/update', {
++			sessionId: 's1',
++			update: { sessionUpdate: 'agent_message_chunk', messageId: 'm1', content: { type: 'text', text: 'hello' } },
++		});
++		client.finishPrompt({ stopReason: 'end_turn', usage: { inputTokens: 1, outputTokens: 2, totalTokens: 3 } });
++		await sending;
++
++		assert.deepStrictEqual(client.requests.map(r => r.method), ['session/new', 'session/prompt']);
++		assert.deepStrictEqual(signals.map(s => (s as IAgentActionSignal).action.type), [
++			ActionType.ChatResponsePart, ActionType.ChatDelta, ActionType.ChatUsage, ActionType.ChatTurnComplete,
++		]);
++		agent.dispose();
++	});
++
++	test('rejects a turn whose working directory is not an existing directory', async () => {
++		const client = new FakeIcodeClient();
++		const agent = new IcodeAgent(new NullLogService(), () => client);
++
++		await assert.rejects(
++			agent.chats.sendMessage(chat, 'hello', [URI.file('/definitely/missing-icode-workspace')], undefined, 'turn-1'),
++			/working directory/,
++		);
++		assert.deepStrictEqual(client.requests, []);
++		agent.dispose();
++	});
++
++	test('surfaces a refusal stop reason as a failure', async () => {
++		const client = new FakeIcodeClient();
++		const agent = new IcodeAgent(new NullLogService(), () => client);
++
++		const sending = agent.chats.sendMessage(chat, 'hello', [workspace], undefined, 'turn-1');
++		await timeout(10);
++		client.finishPrompt({ stopReason: 'refusal' });
++		await assert.rejects(sending, /refus/i);
++		agent.dispose();
 +	});
 +});
 diff --git a/src/vs/platform/agentHost/test/node/icode/icodeLaunchConfig.test.ts b/src/vs/platform/agentHost/test/node/icode/icodeLaunchConfig.test.ts
