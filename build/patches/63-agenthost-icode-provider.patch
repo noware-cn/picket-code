@@ -438,10 +438,10 @@ index 00000000..4393d9d2
 +}
 diff --git a/src/vs/platform/agentHost/node/icode/icodeAgent.ts b/src/vs/platform/agentHost/node/icode/icodeAgent.ts
 new file mode 100644
-index 00000000..aeae6b19
+index 00000000..c3d4ad16
 --- /dev/null
 +++ b/src/vs/platform/agentHost/node/icode/icodeAgent.ts
-@@ -0,0 +1,803 @@
+@@ -0,0 +1,861 @@
 +/*---------------------------------------------------------------------------------------------
 + *  Copyright (c) Microsoft Corporation. All rights reserved.
 + *  Licensed under the MIT License. See License.txt in the project root for license information.
@@ -500,6 +500,18 @@ index 00000000..aeae6b19
 +		readonly inputTokens?: unknown;
 +		readonly outputTokens?: unknown;
 +	};
++}
++
++/** The model catalog iCode reports alongside a new session. */
++interface IIcodeModelsCatalog {
++	readonly availableModels?: readonly { readonly modelId: string; readonly name: string; readonly description?: string }[];
++	readonly currentModelId?: string;
++}
++
++/** The subset of `session/new`'s result this agent reads. */
++interface IIcodeSessionNewResult {
++	readonly sessionId?: unknown;
++	readonly models?: IIcodeModelsCatalog;
 +}
 +
 +interface IIcodeSession {
@@ -636,6 +648,16 @@ index 00000000..aeae6b19
 +		return false;
 +	}
 +
++	/**
++	 * ACP has no model-enumeration RPC: iCode reports its catalog with
++	 * `session/new`, so there is nothing to re-ask for. Republishing the cached
++	 * list keeps the scheduler from skipping this provider without spawning a
++	 * process or creating a session just to answer.
++	 */
++	async refreshModels(): Promise<void> {
++		this.models.set(this.models.get(), undefined);
++	}
++
 +	// ---- Chats ---------------------------------------------------------------
 +
 +	readonly chats: IAgentChats = {
@@ -701,8 +723,23 @@ index 00000000..aeae6b19
 +			this._client.notify('session/cancel', { sessionId: session.sessionId });
 +			return Promise.resolve();
 +		},
-+		changeModel: (_chat: URI, _model: ModelSelection, _context: AgentChatOperationContext): Promise<void> => {
-+			return Promise.resolve();
++		changeModel: async (chat: URI, model: ModelSelection, _context: AgentChatOperationContext): Promise<void> => {
++			const chatKey = chat.toString();
++			const session = this._sessions.get(chatKey);
++			const client = this._client;
++			if (!session || !client) {
++				// The picker is reachable before the chat's first turn, and iCode
++				// binds a model per session: there is nothing to switch yet.
++				this._logService.warn(`[icode] iCode needs an active session before switching models (chat: ${chatKey})`);
++				return;
++			}
++			try {
++				await client.request('session/set_model', { sessionId: session.sessionId, modelId: model.id });
++			} catch (error) {
++				// Switching models is a picker affordance: a rejected switch is
++				// logged and swallowed so it can never break the chat.
++				this._logService.warn(`[icode] failed to switch models for ${chatKey}: ${error instanceof Error ? error.message : String(error)}`);
++			}
 +		},
 +		changeAgent: (_chat: URI, _agent: AgentSelection | undefined, _context: AgentChatOperationContext): Promise<void> => {
 +			return Promise.resolve();
@@ -960,15 +997,36 @@ index 00000000..aeae6b19
 +			this._sessions.delete(chatKey);
 +		}
 +
-+		const result = await client.request<{ sessionId?: unknown }>('session/new', { cwd, mcpServers: [] });
++		const result = await client.request<IIcodeSessionNewResult>('session/new', { cwd, mcpServers: [] });
 +		const sessionId = typeof result?.sessionId === 'string' ? result.sessionId : undefined;
 +		if (!sessionId) {
 +			throw new Error('iCode did not return a session id from session/new');
 +		}
 +
++		this._publishModels(result?.models);
 +		this._sessions.set(chatKey, { sessionId, cwd });
 +		this._chatsBySessionId.set(sessionId, chat);
 +		return sessionId;
++	}
++
++	/**
++	 * Replaces the placeholder catalog with the models iCode reported for a new
++	 * session. A reply without a usable catalog leaves the current list alone:
++	 * iCode only advertises models it can serve, and an empty list must not wipe
++	 * what an earlier session published.
++	 */
++	private _publishModels(catalog: IIcodeModelsCatalog | undefined): void {
++		const available = catalog?.availableModels;
++		if (!Array.isArray(available)) {
++			return;
++		}
++		const models = available
++			.filter(model => typeof model?.modelId === 'string' && typeof model?.name === 'string')
++			// iCode's ACP capabilities declare no image input, so no model claims vision.
++			.map(model => ({ provider: this.id, id: model.modelId, name: model.name, supportsVision: false }));
++		if (models.length > 0) {
++			this.models.set(models, undefined);
++		}
 +	}
 +
 +	// ---- ACP client lifecycle and routing ------------------------------------
@@ -2789,10 +2847,10 @@ index 00000000..d34e4c39
 +});
 diff --git a/src/vs/platform/agentHost/test/node/icode/icodeAgent.test.ts b/src/vs/platform/agentHost/test/node/icode/icodeAgent.test.ts
 new file mode 100644
-index 00000000..9f9da7da
+index 00000000..3dc0161c
 --- /dev/null
 +++ b/src/vs/platform/agentHost/test/node/icode/icodeAgent.test.ts
-@@ -0,0 +1,468 @@
+@@ -0,0 +1,563 @@
 +/*---------------------------------------------------------------------------------------------
 + *  Copyright (c) Microsoft Corporation. All rights reserved.
 + *  Licensed under the MIT License. See License.txt in the project root for license information.
@@ -2826,6 +2884,13 @@ index 00000000..9f9da7da
 +	respondToLoad: readonly any[] = [];
 +	/** When set, `session/load` rejects with it, mimicking a session iCode already dropped. */
 +	loadError: Error | undefined;
++	/** The reply to `session/new`; tests swap it in to inject a model catalog. */
++	newSessionResult: { readonly sessionId: string; readonly models?: { readonly availableModels?: readonly { readonly modelId: string; readonly name: string; readonly description?: string }[]; readonly currentModelId?: string } } = {
++		sessionId: SESSION_ID,
++		models: { availableModels: [], currentModelId: 'mock' },
++	};
++	/** When set, `session/set_model` rejects with it. */
++	setModelError: Error | undefined;
 +	private readonly notificationHandlers = new Map<string, (params: any) => void>();
 +	private readonly requestHandlers = new Map<string, (params: any, id?: any) => unknown>();
 +	/** The reply promise of the last server-to-client request, per method. */
@@ -2836,7 +2901,10 @@ index 00000000..9f9da7da
 +	request<R>(method: string, params?: unknown): Promise<R> {
 +		this.requests.push({ method, params });
 +		if (method === 'session/new') {
-+			return Promise.resolve({ sessionId: SESSION_ID, modes: { availableModes: [], currentModeId: 'manual' }, models: { availableModels: [], currentModelId: 'mock' } } as R);
++			return Promise.resolve(this.newSessionResult as unknown as R);
++		}
++		if (method === 'session/set_model') {
++			return this.setModelError ? Promise.reject(this.setModelError) : Promise.resolve({} as R);
 +		}
 +		if (method === 'session/load') {
 +			if (this.loadError) {
@@ -2904,6 +2972,9 @@ index 00000000..9f9da7da
 +
 +suite('IcodeAgent', () => {
 +	const disposables = ensureNoDisposablesAreLeakedInTestSuite();
++
++	/** An agent wired to the injected client, disposed with the suite. */
++	const createAgent = (client: IIcodeAcpClient): IcodeAgent => disposables.add(new IcodeAgent(new NullLogService(), () => client));
 +
 +	test('creates a session and completes a prompt round-trip', async () => {
 +		const client = new FakeIcodeClient();
@@ -3259,6 +3330,88 @@ index 00000000..9f9da7da
 +		client.completePrompt('cancelled');
 +		await turn;
 +		agent.dispose();
++	});
++
++	test('publishes the models reported by session/new instead of the placeholder', async () => {
++		const client = new FakeIcodeClient();
++		const agent = createAgent(client);
++
++		// Before the first session the picker works off a placeholder, and a
++		// refresh neither asks iCode nor creates anything.
++		assert.deepStrictEqual(agent.models.get(), [{ provider: 'icode', id: 'default', name: 'iCode (BYOK)', supportsVision: false }]);
++		await agent.refreshModels();
++		assert.deepStrictEqual(client.requests, []);
++		assert.deepStrictEqual(agent.models.get(), [{ provider: 'icode', id: 'default', name: 'iCode (BYOK)', supportsVision: false }]);
++
++		client.newSessionResult = {
++			sessionId: SESSION_ID,
++			models: {
++				availableModels: [
++					{ modelId: 'ebb51bebc1c2', name: 'DeepSeek v4.1 Flash', description: 'deepseek-openai · deepseek-v4.1-flash' },
++					{ modelId: 'c0ffee', name: 'Claude Sonnet' },
++				],
++				currentModelId: 'ebb51bebc1c2',
++			},
++		};
++		const turn = agent.chats.sendMessage(chat, 'hello', [workspace], [], 'turn-1');
++		await timeout(10);
++
++		// The catalog replaces the placeholder whole, in the order iCode listed it.
++		const published = [
++			{ provider: 'icode', id: 'ebb51bebc1c2', name: 'DeepSeek v4.1 Flash', supportsVision: false },
++			{ provider: 'icode', id: 'c0ffee', name: 'Claude Sonnet', supportsVision: false },
++		];
++		assert.deepStrictEqual(agent.models.get(), published);
++
++		// With a live session a refresh republishes the cached list, again without a request.
++		const requestsBeforeRefresh = client.requests.length;
++		await agent.refreshModels();
++		assert.deepStrictEqual(agent.models.get(), published);
++		assert.strictEqual(client.requests.length, requestsBeforeRefresh);
++
++		client.completePrompt('end_turn');
++		await turn;
++
++		// A later `session/new` without a catalog must not wipe what is published.
++		const otherChat = URI.parse('ahp-chat://test/other-chat');
++		client.newSessionResult = { sessionId: 'sess-other' };
++		const other = agent.chats.sendMessage(otherChat, 'hi', [workspace], [], 'turn-2');
++		await timeout(10);
++		assert.deepStrictEqual(agent.models.get(), published);
++
++		client.completePrompt('end_turn');
++		await other;
++	});
++
++	test('changeModel asks iCode to switch, warns without a session, and swallows failures', async () => {
++		const client = new FakeIcodeClient();
++		const agent = createAgent(client);
++
++		// No client and no session: nothing is sent, nothing throws.
++		await agent.chats.changeModel(chat, { id: 'm-2' }, chat);
++		await agent.refreshModels();
++		assert.strictEqual(client.requests.length, 0);
++
++		// A failed `session/new` leaves a client but no session; both calls still resolve.
++		client.newSessionResult = { sessionId: '' };
++		await assert.rejects(agent.chats.sendMessage(chat, 'hello', [workspace], [], 'turn-1'), /session id/);
++		await agent.chats.changeModel(chat, { id: 'm-2' }, chat);
++		await agent.refreshModels();
++		assert.deepStrictEqual(client.requests.map(r => r.method), ['session/new']);
++
++		// With a session the switch reaches iCode.
++		client.newSessionResult = { sessionId: SESSION_ID };
++		const turn = agent.chats.sendMessage(chat, 'hello', [workspace], [], 'turn-2');
++		await timeout(10);
++		await agent.chats.changeModel(chat, { id: 'm-2' }, chat);
++		assert.deepStrictEqual(client.requests.at(-1), { method: 'session/set_model', params: { sessionId: SESSION_ID, modelId: 'm-2' } });
++
++		// A rejected switch is logged rather than thrown: the chat stays usable.
++		client.setModelError = new Error('unknown model m-3');
++		await agent.chats.changeModel(chat, { id: 'm-3' }, chat);
++
++		client.completePrompt('end_turn');
++		await turn;
 +	});
 +});
 diff --git a/src/vs/platform/agentHost/test/node/icode/icodeHistory.test.ts b/src/vs/platform/agentHost/test/node/icode/icodeHistory.test.ts
