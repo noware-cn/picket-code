@@ -1070,7 +1070,7 @@ git commit -m "feat(agenthost): register iCode as the only agent provider"
 
 Expected: `release contract check passed`，提交成功。实测：`==> [picket-code] release contract check passed`；主仓 `43a1ecb`（补丁 + apply-list + README + 文档），`vscode/` 提交 `190c4fc1`。
 
-> 还剩 Step 4（Agents Window 人工验收），需要在 GUI 里点。
+Step 4 已于 2026-11-02 21:05/21:08 在 Agents Window 实测通过（`hello` → `outcome=success` 9.7s；打断 → `outcome=cancelled`）。收尾复跑：4 个套件 13/19/7/8 = 47 passing，`tsc` 对 icode 文件 0 错误，63 号补丁 `git apply -R --check` 通过，`build/check-contract.sh` → `release contract check passed`。**本计划全部完成。**
 
 ---
 
