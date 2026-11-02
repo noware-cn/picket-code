@@ -801,9 +801,9 @@ git commit -m "feat(agenthost): implement the iCode agent provider"
   - `respondToPermissionRequest(requestId: string, approved: boolean, context?: IAgentPermissionResponseContext): void` —— 签名照抄 `IAgent`（`agent.ts` 的 `respondToPermissionRequest`），`requestId` 就是 ACP 的 `toolCallId`。实现通过挂起的 `onRequest('session/request_permission')` Promise 回复 `{ outcome: { outcome: 'selected', optionId: approved ? 'allow' : 'reject' } }`。宿主会用 `context.decisionSource`（`'unattended_fallback'` / `'host_policy'`）主动兜底拒绝，且可能在 turn 结束后再调用一次，因此**未知或已结算的 `requestId` 必须静默忽略**，不能抛错。
   - 进程退出后 `_client` 与所有 session 缓存清空，下一次 `sendMessage` 重新 spawn。
 
-- [ ] **Step 1: 写失败测试（中断 / 审批 / 退出 / 并发）**
+- [x] **Step 1: 写失败测试（中断 / 审批 / 退出 / 并发）**
 
-在同一个测试文件的 `FakeIcodeClient` 上补充：`onRequest` 存入 handler 表、`emitRequest(id, method, params)` 调用并返回其 Promise、`onExit` 改为 `Emitter<number | null>` 加 `emitExit(code)`。新增四个测试（复用 Task 5 已定义的 `chat` 与 `workspace`，`workspace` 是 `tmpdir()`，保证 cwd 校验通过）：
+在同一个测试文件的 `FakeIcodeClient` 上补充：`onRequest` 存入 handler 表、`emitRequest(method, params)` 调用并返回其 Promise、`onExit` 改为 `Emitter<number | null>` 加 `emitExit(code)`（**同时 reject 挂起的 `session/prompt`**，模拟真实客户端的 `cancelAllRequests`）。新增四个测试（复用 Task 5 已定义的 `chat` 与 `workspace`，`workspace` 是 `tmpdir()`，保证 cwd 校验通过）：
 
 ```ts
 test('abort sends session/cancel and does not complete the turn', async () => {
@@ -843,7 +843,7 @@ test('a permission request becomes a pending confirmation and a rejection is for
 		},
 		permissionKind: 'shell',
 	});
-	agent.respondToPermissionRequest('t1', false, { decisionSource: 'user' });
+	agent.respondToPermissionRequest('t1', false, { decisionSource: 'human_response' });
 	assert.deepStrictEqual(await pending, { outcome: { outcome: 'selected', optionId: 'reject' } });
 	// 迟到/重复的回复必须被静默忽略
 	agent.respondToPermissionRequest('t1', true, { decisionSource: 'unattended_fallback' });
@@ -879,35 +879,50 @@ test('a process exit fails the live turn and respawns on the next send', async (
 	const sending = agent.chats.sendMessage(chat, 'hello', [workspace], undefined, 'turn-1');
 	await timeout(10);
 	clients[0].emitExit(1);
+	// 退出已由 agent 侧报成 ChatError，挂起请求的连带 reject 不能再冒泡成第二个错误
 	await sending;
-	assert.strictEqual((signals.at(-1) as IAgentActionSignal).action.type, ActionType.ChatError);
+	const action = (signals[signals.length - 1] as IAgentActionSignal).action;
+	assert.strictEqual(action.type, ActionType.ChatError);
+	assert.strictEqual((action as { part: { error: { errorType: string } } }).part.error.errorType, 'icodeExited');
+	// 下一次发送必须拉起全新进程和全新 session
+	const second = agent.chats.sendMessage(chat, 'again', [workspace], undefined, 'turn-2');
+	await timeout(10);
+	assert.strictEqual(clients.length, 2);
+	assert.deepStrictEqual(clients[1].requests.map(r => r.method), ['session/new', 'session/prompt']);
+	clients[1].finishPrompt({ stopReason: 'end_turn' });
+	await second;
 	agent.dispose();
 });
 ```
 
-- [ ] **Step 2: 运行测试确认失败**
+- [x] **Step 2: 运行测试确认失败**
 
 Run: `npm run transpile-client && npm run test-node -- --run src/vs/platform/agentHost/test/node/icode/icodeAgent.test.ts`
-Expected: FAIL（`notifications` 为空 / 无 pending_confirmation / 无 ChatError / 并发发送未被拒绝）。
+Expected: FAIL（无 pending_confirmation；退出用例超时 —— 挂起的 `session/prompt` 无人结算，agent 也没 fire `ChatError`）。
+实测：2 failing（审批、退出），4 passing（Task 5 的三条 + abort，后者在 Task 5 已实现）。
 
-- [ ] **Step 3: 实现**
+- [x] **Step 3: 实现**
 
-- 注册 `client.onRequest('session/request_permission', (params, id) => this._onPermissionRequest(params as IcodePermissionRequest, id))`。`_onPermissionRequest` 找到 chat 与 turn state，fire `mapAcpPermissionRequest(...)` 的 signals；若已有同一 `toolCallId` 的挂起项，先以 `{ outcome: { outcome: 'cancelled' } }` 结算旧的；返回 `new Promise(resolve => this._pendingPermissions.set(toolCallId, resolve))`。
-- `respondToPermissionRequest(requestId, approved, context)`：取挂起 resolve；不存在就记一条 trace 日志（带上 `context?.decisionSource`）直接返回，**不抛错**；存在则删除并 `resolve({ outcome: { outcome: 'selected', optionId: approved ? 'allow' : 'reject' } })`。
-- `client.onExit(() => …)`：若存在活动 turn，fire `ChatError`（`errorType: 'icodeExited'`，message 含退出码）——这是唯一由 agent 侧主动 fire `ChatError` 的场景（prompt 的 Promise 不会因进程退出而 reject，宿主无从兜底）；然后清空 `_turns`/`_activePrompts`/`_sessions`/`_chatBySession`/`_client`，并以 `{ outcome: { outcome: 'cancelled' } }` 结算全部挂起审批。
+- 注册 `client.onRequest('session/request_permission', params => this._onPermissionRequest(params))`。`_onPermissionRequest` 校验 `sessionId` 与 `toolCall.toolCallId`，按 `_chatsBySessionId` + `_turns` 找 chat 与 turn state（找不到立刻回 `{ outcome: { outcome: 'cancelled' } }`，绝不悬挂）；先用 `_settlePermission(toolCallId, CANCELLED_PERMISSION)` 结算同一 `toolCallId` 的旧挂起项（保证只有一个应答写回子进程），再 fire `mapAcpPermissionRequest(...)` 的 signals，最后返回 `new Promise(resolve => this._pendingPermissions.set(toolCallId, { chatKey, options, resolve }))`。
+- `respondToPermissionRequest(requestId, approved, context)`：取挂起项；不存在就记一条 trace 日志（带上 `context?.decisionSource`）直接返回，**不抛错**；存在则删除并 resolve `{ outcome: { outcome: 'selected', optionId } }`。`optionId` 优先取 `context.selectedOptionId`，否则按 option `kind` 前缀（`allow`/`reject`）挑，最后退回字面量 —— iCode 的 optionId 不保证就叫这两个词。
+- `client.onExit(() => …)`：先 `_cancelPendingPermissions()` 结算全部挂起审批，再对 `_liveTurns`（`Map<turnId, { chat, startedAt }>`，`_runTurn` 登记、`finally` 删除）里的每个 turn fire `ChatError`（`errorType: 'icodeExited'`，`part: createErrorResponsePart({ errorType, message })`，`duration` 用真实起始时间）；随后清空 `_client`/`_sessions`/`_chatsBySessionId`/`_turns`，下一次发送重新 spawn。
+- **修正**：真实客户端在退出时会 `cancelAllRequests()`，挂起的 `session/prompt` 会以取消错误 reject。若不处理就会「agent 报 ChatError + 宿主再兜底报一次」，因此 `_runTurn` 在 `catch` 里检查 `client.exited`：为真则直接 `return`（退出已上报），否则照常 throw。
+- `disposeChat` 与 `_disposeClient` 同样调用 `_cancelPendingPermissions(chatKey?)`，避免审批 Promise 永久悬挂。
 - `_ensureClient` 在 `this._client` 为空时通过工厂重建。
 - 不做事件去重以外的排队：并发 `sendMessage` 在 Task 5 第 3 步就已 fail-fast，这里只需保证退出后清理干净，让下一次发送走全新 client + 全新 session。
 
-- [ ] **Step 4: 运行测试确认通过**
+- [x] **Step 4: 运行测试确认通过**
 
-Expected: PASS（7 passing，其中 Task 5 的 3 个仍然通过）。
+Expected: PASS —— `icodeAgent.test.ts` **8 passing**（Task 5 的 3 条 + 本任务 4 条 + abort 1 条），四个 icode 套件合计 **47 passing**（8 + 19 + 13 + 7）。注意 harness 自带的 `should not have unexpected errors in tests` 每个进程只注册一次，所以四个文件合并跑时会显示 44。
 
-- [ ] **Step 5: 导出补丁并提交**
+- [x] **Step 5: 导出补丁并提交**
 
 ```bash
 cd /home/dsun/workspace/picket-code/vscode
-git add -N src/vs/platform/agentHost/node/icode src/vs/platform/agentHost/test/node/icode
-git diff HEAD > ../build/patches/63-agenthost-icode-provider.patch
+# 63 号补丁必须从 62 号提交起算：HEAD 已经包含前几个 icode 提交，git diff HEAD 只会得到增量
+git diff bc6f5043 -- src/vs/platform/agentHost/node/icode src/vs/platform/agentHost/test/node/icode > ../build/patches/63-agenthost-icode-provider.patch
+git apply -R --check ../build/patches/63-agenthost-icode-provider.patch
+git commit -am "picket: patch 63 wire iCode approvals, cancellation and process exit"
 cd ..
 git add build/patches/63-agenthost-icode-provider.patch
 git commit -m "feat(agenthost): wire iCode approvals, cancellation and process exit"

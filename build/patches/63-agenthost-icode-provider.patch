@@ -333,10 +333,10 @@ index 00000000..4393d9d2
 +}
 diff --git a/src/vs/platform/agentHost/node/icode/icodeAgent.ts b/src/vs/platform/agentHost/node/icode/icodeAgent.ts
 new file mode 100644
-index 00000000..4e7ca670
+index 00000000..669f7a52
 --- /dev/null
 +++ b/src/vs/platform/agentHost/node/icode/icodeAgent.ts
-@@ -0,0 +1,455 @@
+@@ -0,0 +1,566 @@
 +/*---------------------------------------------------------------------------------------------
 + *  Copyright (c) Microsoft Corporation. All rights reserved.
 + *  Licensed under the MIT License. See License.txt in the project root for license information.
@@ -370,16 +370,17 @@ index 00000000..4e7ca670
 +	type IAgentDescriptor,
 +	type IAgentMaterializeChatEvent,
 +	type IAgentModelInfo,
++	type IAgentPermissionResponseContext,
 +	type IAgentResolveChatConfigParams,
 +	type IAgentSpawnChatEvent,
 +} from '../../common/agent.js';
 +import type { ResolveSessionConfigResult, SessionConfigCompletionsResult } from '../../common/state/protocol/commands.js';
 +import { ProtectedResourceMetadata, type AgentSelection, type MessageAttachment, type ModelSelection, type ToolDefinition } from '../../common/state/protocol/state.js';
 +import { ActionType } from '../../common/state/sessionActions.js';
-+import type { ChatInputAnswer, ChatInputResponseKind, ClientPluginCustomization, Customization, ToolCallResult, Turn } from '../../common/state/sessionState.js';
++import { createErrorResponsePart, type ChatInputAnswer, type ChatInputResponseKind, type ClientPluginCustomization, type Customization, type ToolCallResult, type Turn } from '../../common/state/sessionState.js';
 +import { IcodeAcpClient, type IIcodeAcpClient } from './icodeAcpClient.js';
 +import { createIcodeTransport, resolveIcodeCommand } from './icodeLaunchConfig.js';
-+import { createIcodeTurnState, mapAcpSessionUpdate, type IcodeSessionUpdate, type IIcodeTurnState } from './icodeMapEvents.js';
++import { createIcodeTurnState, mapAcpPermissionRequest, mapAcpSessionUpdate, type IcodePermissionRequest, type IcodeSessionUpdate, type IIcodeTurnState } from './icodeMapEvents.js';
 +
 +/** Creates the ACP client; async because resolving the executable touches the file system. */
 +export type IcodeClientFactory = () => IIcodeAcpClient | undefined | Promise<IIcodeAcpClient | undefined>;
@@ -401,6 +402,26 @@ index 00000000..4e7ca670
 +/** A chat this agent has been told about; recorded for diagnostics only. */
 +interface IIcodeChatRecord {
 +	readonly cwd: string | undefined;
++}
++
++/** The `session/request_permission` response, narrowed to what this agent sends. */
++interface IcodePermissionResponse {
++	readonly outcome: { readonly outcome: 'selected'; readonly optionId: string } | { readonly outcome: 'cancelled' };
++}
++
++/** A permission request waiting for the host's answer. */
++interface IIcodePendingPermission {
++	readonly chatKey: string;
++	readonly options: IcodePermissionRequest['options'];
++	readonly resolve: (response: IcodePermissionResponse) => void;
++}
++
++const CANCELLED_PERMISSION: IcodePermissionResponse = { outcome: { outcome: 'cancelled' } };
++
++/** ACP option ids are arbitrary; pick by option kind and fall back to the protocol's names. */
++function permissionOptionId(options: IcodePermissionRequest['options'], approved: boolean): string {
++	const kindPrefix = approved ? 'allow' : 'reject';
++	return options.find(option => option.kind.startsWith(kindPrefix))?.optionId ?? kindPrefix;
 +}
 +
 +/**
@@ -432,6 +453,10 @@ index 00000000..4e7ca670
 +	private readonly _turns = new Map<string, IIcodeTurnState>();
 +	/** One in-flight turn per chat; the value is the running `sendMessage`. */
 +	private readonly _activePrompts = new Map<string, Promise<void>>();
++	/** Live turns by turn id, so a process exit can report each one with its duration. */
++	private readonly _liveTurns = new Map<string, { readonly chat: URI; readonly startedAt: number }>();
++	/** Permission requests waiting for the host's answer, keyed by ACP tool call id. */
++	private readonly _pendingPermissions = new Map<string, IIcodePendingPermission>();
 +
 +	private readonly _clientStore = this._register(new DisposableStore());
 +	private readonly _clientFactory: IcodeClientFactory;
@@ -472,6 +497,8 @@ index 00000000..4e7ca670
 +			const chatKey = chat.toString();
 +			this._turns.delete(chatKey);
 +			this._chats.delete(chatKey);
++			// A pending approval can never be answered once its chat is gone.
++			this._cancelPendingPermissions(chatKey);
 +
 +			const session = this._sessions.get(chatKey);
 +			if (!session) {
@@ -582,8 +609,18 @@ index 00000000..4e7ca670
 +		// iCode runs every tool call in its own process.
 +	}
 +
-+	respondToPermissionRequest(_requestId: string, _approved: boolean): void {
-+		// Task 6: settle the pending `session/request_permission` request.
++	respondToPermissionRequest(requestId: string, approved: boolean, context?: IAgentPermissionResponseContext): void {
++		const pending = this._pendingPermissions.get(requestId);
++		if (!pending) {
++			// The host also decides on its own (`unattended_fallback`, `host_policy`)
++			// and may answer a request the turn already abandoned.
++			this._logService.trace(`[icode] ignoring permission response for '${requestId}' (source: ${context?.decisionSource ?? 'unknown'})`);
++			return;
++		}
++		this._pendingPermissions.delete(requestId);
++		pending.resolve({
++			outcome: { outcome: 'selected', optionId: context?.selectedOptionId ?? permissionOptionId(pending.options, approved) },
++		});
 +	}
 +
 +	respondToUserInputRequest(_requestId: string, _response: ChatInputResponseKind, _answers?: Record<string, ChatInputAnswer>): void {
@@ -640,11 +677,22 @@ index 00000000..4e7ca670
 +		this._turns.set(chatKey, state);
 +
 +		const startedAt = Date.now();
++		this._liveTurns.set(turnId, { chat, startedAt });
 +		try {
-+			const result = await client.request<IIcodePromptResult>('session/prompt', {
-+				sessionId,
-+				prompt: [{ type: 'text', text: prompt }],
-+			});
++			let result: IIcodePromptResult | undefined;
++			try {
++				result = await client.request<IIcodePromptResult>('session/prompt', {
++					sessionId,
++					prompt: [{ type: 'text', text: prompt }],
++				});
++			} catch (error) {
++				// A process exit already reported `ChatError` for this turn; the pending
++				// request only rejects as a side effect of the exit.
++				if (client.exited) {
++					return;
++				}
++				throw error;
++			}
 +
 +			const usage = result?.usage;
 +			if (typeof usage?.inputTokens === 'number' && typeof usage.outputTokens === 'number') {
@@ -668,6 +716,7 @@ index 00000000..4e7ca670
 +			}
 +		} finally {
 +			this._turns.delete(chatKey);
++			this._liveTurns.delete(turnId);
 +		}
 +	}
 +
@@ -720,13 +769,7 @@ index 00000000..4e7ca670
 +
 +		this._clientStore.clear();
 +		this._clientStore.add(client.onNotification('session/update', params => this._handleSessionUpdate(params)));
-+		// Task 6 replaces this stub with the host approval round-trip; until then a
-+		// request must not be dropped silently, and cancelling keeps the tool from
-+		// running without inventing an approval policy.
-+		this._clientStore.add(client.onRequest('session/request_permission', params => {
-+			this._logService.info(`[icode] session/request_permission has no host round-trip yet; cancelling: ${JSON.stringify(params).slice(0, 512)}`);
-+			return { outcome: { outcome: 'cancelled' } };
-+		}));
++		this._clientStore.add(client.onRequest('session/request_permission', params => this._onPermissionRequest(params)));
 +		this._clientStore.add(client.onExit(code => this._handleClientExit(client, code)));
 +
 +		this._client = client;
@@ -745,6 +788,57 @@ index 00000000..4e7ca670
 +		return new IcodeAcpClient(transport, message => this._logService.trace(message));
 +	}
 +
++	/**
++	 * Turns one ACP permission request into a pending confirmation and parks a
++	 * promise that `respondToPermissionRequest` settles.
++	 */
++	private _onPermissionRequest(params: unknown): Promise<IcodePermissionResponse> {
++		const request = params as Partial<IcodePermissionRequest> | undefined;
++		const sessionId = request?.sessionId;
++		const toolCallId = request?.toolCall?.toolCallId;
++		if (typeof sessionId !== 'string' || typeof toolCallId !== 'string') {
++			this._logService.warn(`[icode] ignoring malformed session/request_permission: ${JSON.stringify(params).slice(0, 512)}`);
++			return Promise.resolve(CANCELLED_PERMISSION);
++		}
++
++		const chat = this._chatsBySessionId.get(sessionId);
++		const state = chat && this._turns.get(chat.toString());
++		if (!chat || !state) {
++			this._logService.trace(`[icode] auto-cancelling permission request for '${toolCallId}': no live turn for session '${sessionId}'`);
++			return Promise.resolve(CANCELLED_PERMISSION);
++		}
++
++		// iCode rarely repeats a request, but a second one for the same tool call
++		// supersedes the first: exactly one answer must reach the subprocess.
++		this._settlePermission(toolCallId, CANCELLED_PERMISSION);
++
++		for (const signal of mapAcpPermissionRequest(chat, state, request as IcodePermissionRequest)) {
++			this._onDidChatProgress.fire(signal);
++		}
++
++		return new Promise<IcodePermissionResponse>(resolve => {
++			this._pendingPermissions.set(toolCallId, { chatKey: chat.toString(), options: request?.options ?? [], resolve });
++		});
++	}
++
++	private _settlePermission(toolCallId: string, response: IcodePermissionResponse): void {
++		const pending = this._pendingPermissions.get(toolCallId);
++		if (!pending) {
++			return;
++		}
++		this._pendingPermissions.delete(toolCallId);
++		pending.resolve(response);
++	}
++
++	/** Cancel every pending approval, or only those of one chat. */
++	private _cancelPendingPermissions(chatKey?: string): void {
++		for (const toolCallId of [...this._pendingPermissions.keys()]) {
++			if (chatKey === undefined || this._pendingPermissions.get(toolCallId)?.chatKey === chatKey) {
++				this._settlePermission(toolCallId, CANCELLED_PERMISSION);
++			}
++		}
++	}
++
 +	private _handleClientExit(client: IIcodeAcpClient, code: number | null): void {
 +		this._logService.info(`[icode] icode exited (${code === null ? 'no exit code' : `code ${code}`})`);
 +		if (this._client !== client) {
@@ -755,6 +849,22 @@ index 00000000..4e7ca670
 +		this._sessions.clear();
 +		this._chatsBySessionId.clear();
 +		this._turns.clear();
++		this._cancelPendingPermissions();
++
++		// A dead process rejects the in-flight `session/prompt` with a plain
++		// cancellation, which the host would read as a user abort, so the exit has
++		// to be reported here. `_runTurn` swallows the matching rejection.
++		const liveTurns = [...this._liveTurns.entries()];
++		this._liveTurns.clear();
++		for (const [turnId, { chat, startedAt }] of liveTurns) {
++			const message = `iCode exited (${code === null ? 'no exit code' : `code ${code}`}) before the turn finished`;
++			this._fireAction(chat, {
++				type: ActionType.ChatError,
++				turnId,
++				duration: Date.now() - startedAt,
++				part: createErrorResponsePart({ errorType: 'icodeExited', message }),
++			});
++		}
 +	}
 +
 +	private _handleSessionUpdate(params: any): void {
@@ -783,6 +893,7 @@ index 00000000..4e7ca670
 +
 +	private _disposeClient(): void {
 +		this._clientStore.clear();
++		this._cancelPendingPermissions();
 +		const client = this._client;
 +		this._client = undefined;
 +		this._clientCreation = undefined;
@@ -1795,10 +1906,10 @@ index 00000000..d34e4c39
 +});
 diff --git a/src/vs/platform/agentHost/test/node/icode/icodeAgent.test.ts b/src/vs/platform/agentHost/test/node/icode/icodeAgent.test.ts
 new file mode 100644
-index 00000000..4d9ded62
+index 00000000..658f0aac
 --- /dev/null
 +++ b/src/vs/platform/agentHost/test/node/icode/icodeAgent.test.ts
-@@ -0,0 +1,101 @@
+@@ -0,0 +1,225 @@
 +/*---------------------------------------------------------------------------------------------
 + *  Copyright (c) Microsoft Corporation. All rights reserved.
 + *  Licensed under the MIT License. See License.txt in the project root for license information.
@@ -1807,24 +1918,28 @@ index 00000000..4d9ded62
 +import assert from 'assert';
 +import { tmpdir } from 'os';
 +import { timeout } from '../../../../../base/common/async.js';
-+import { Event } from '../../../../../base/common/event.js';
++import { Emitter } from '../../../../../base/common/event.js';
 +import { IDisposable } from '../../../../../base/common/lifecycle.js';
 +import { URI } from '../../../../../base/common/uri.js';
 +import { ensureNoDisposablesAreLeakedInTestSuite } from '../../../../../base/test/common/utils.js';
 +import { NullLogService } from '../../../../log/common/log.js';
 +import type { AgentSignal, IAgentActionSignal } from '../../../common/agent.js';
 +import { ActionType } from '../../../common/state/sessionActions.js';
++import { ToolCallStatus } from '../../../common/state/sessionState.js';
 +import { IIcodeAcpClient } from '../../../node/icode/icodeAcpClient.js';
 +import { IcodeAgent } from '../../../node/icode/icodeAgent.js';
 +
 +class FakeIcodeClient implements IIcodeAcpClient {
-+	readonly onExit = Event.None;
-+	readonly exited = false;
-+	readonly exitCode = null;
++	private readonly exitEmitter = new Emitter<number | null>();
++	readonly onExit = this.exitEmitter.event;
++	exited = false;
++	exitCode: number | null = null;
 +	readonly requests: { method: string; params: any }[] = [];
 +	readonly notifications: { method: string; params: any }[] = [];
 +	private readonly notificationHandlers = new Map<string, (params: any) => void>();
++	private readonly requestHandlers = new Map<string, (params: any, id?: any) => unknown>();
 +	private resolvePrompt: ((value: any) => void) | undefined;
++	private rejectPrompt: ((reason: Error) => void) | undefined;
 +
 +	request<R>(method: string, params?: unknown): Promise<R> {
 +		this.requests.push({ method, params });
@@ -1832,7 +1947,10 @@ index 00000000..4d9ded62
 +			return Promise.resolve({ sessionId: 's1', modes: { availableModes: [], currentModeId: 'manual' }, models: { availableModels: [], currentModelId: 'mock' } } as R);
 +		}
 +		if (method === 'session/prompt') {
-+			return new Promise<R>(resolve => { this.resolvePrompt = resolve as (value: any) => void; });
++			return new Promise<R>((resolve, reject) => {
++				this.resolvePrompt = resolve as (value: any) => void;
++				this.rejectPrompt = reject;
++			});
 +		}
 +		return Promise.resolve({} as R);
 +	}
@@ -1841,16 +1959,31 @@ index 00000000..4d9ded62
 +		this.notificationHandlers.set(method, handler);
 +		return { dispose: () => this.notificationHandlers.delete(method) };
 +	}
-+	onRequest(): IDisposable { return { dispose: () => { } }; }
++	onRequest<R = unknown>(method: string, handler: (params: any, _id: any) => R | Promise<R>): IDisposable {
++		this.requestHandlers.set(method, handler);
++		return { dispose: () => this.requestHandlers.delete(method) };
++	}
 +	emitNotification(method: string, params: unknown): void { this.notificationHandlers.get(method)?.(params); }
++	emitRequest(method: string, params: unknown): Promise<unknown> {
++		const handler = this.requestHandlers.get(method);
++		assert.ok(handler, `no request handler registered for ${method}`);
++		return Promise.resolve(handler(params));
++	}
 +	finishPrompt(result: unknown): void { this.resolvePrompt?.(result); }
-+	dispose(): void { }
++	emitExit(code: number | null): void {
++		this.exited = true;
++		this.exitCode = code;
++		this.exitEmitter.fire(code);
++		// The real client cancels every in-flight request when the process exits.
++		this.rejectPrompt?.(new Error('icode exited'));
++	}
++	dispose(): void { this.exitEmitter.dispose(); }
 +}
 +
 +const chat = URI.parse('ahp-chat://test/chat');
 +const workspace = URI.file(tmpdir());	// must really exist: sendMessage validates that cwd is an existing absolute directory
 +
-+suite('IcodeAgent (one turn)', () => {
++suite('IcodeAgent', () => {
 +	const disposables = ensureNoDisposablesAreLeakedInTestSuite();
 +
 +	test('creates a session and completes a prompt round-trip', async () => {
@@ -1897,6 +2030,108 @@ index 00000000..4d9ded62
 +		await timeout(10);
 +		client.finishPrompt({ stopReason: 'refusal' });
 +		await assert.rejects(sending, /refus/i);
++		agent.dispose();
++	});
++
++	test('abort sends session/cancel and does not complete the turn', async () => {
++		const client = new FakeIcodeClient();
++		const agent = new IcodeAgent(new NullLogService(), () => client);
++		const signals: AgentSignal[] = [];
++		disposables.add(agent.onDidChatProgress(signal => signals.push(signal)));
++
++		const sending = agent.chats.sendMessage(chat, 'hello', [workspace], undefined, 'turn-1');
++		await timeout(10);
++
++		await agent.chats.abort(chat, chat);
++		// The host already marked the turn cancelled; firing a completion here
++		// would complete the same turn twice.
++		assert.deepStrictEqual(client.notifications, [{ method: 'session/cancel', params: { sessionId: 's1' } }]);
++		assert.deepStrictEqual(signals, []);
++
++		client.finishPrompt({ stopReason: 'cancelled' });
++		await sending;
++		assert.strictEqual((signals[signals.length - 1] as IAgentActionSignal).action.type, ActionType.ChatTurnCancelled);
++		agent.dispose();
++	});
++
++	test('a permission request becomes a pending confirmation and a rejection is forwarded', async () => {
++		const client = new FakeIcodeClient();
++		const agent = new IcodeAgent(new NullLogService(), () => client);
++		const signals: AgentSignal[] = [];
++		disposables.add(agent.onDidChatProgress(signal => signals.push(signal)));
++
++		const sending = agent.chats.sendMessage(chat, 'hello', [workspace], undefined, 'turn-1');
++		await timeout(10);
++
++		const pending = client.emitRequest('session/request_permission', {
++			sessionId: 's1',
++			toolCall: { toolCallId: 't1', title: 'Run ls', kind: 'execute', status: 'pending', rawInput: { command: 'ls' } },
++			options: [{ optionId: 'allow', name: 'Allow once', kind: 'allow_once' }, { optionId: 'reject', name: 'Reject once', kind: 'reject_once' }],
++		});
++		assert.deepStrictEqual(signals.at(-1), {
++			kind: 'pending_confirmation',
++			chat,
++			state: {
++				status: ToolCallStatus.PendingConfirmation, toolCallId: 't1', toolName: 'shell', displayName: 'Run ls',
++				invocationMessage: 'Run ls', toolInput: '{"command":"ls"}', confirmationTitle: 'Run ls',
++			},
++			permissionKind: 'shell',
++		});
++
++		agent.respondToPermissionRequest('t1', false, { decisionSource: 'human_response' });
++		assert.deepStrictEqual(await pending, { outcome: { outcome: 'selected', optionId: 'reject' } });
++
++		// Late and duplicate answers (unattended fallbacks, stale clicks) are ignored.
++		agent.respondToPermissionRequest('t1', true, { decisionSource: 'unattended_fallback' });
++		agent.respondToPermissionRequest('unknown', true);
++
++		client.finishPrompt({ stopReason: 'cancelled' });
++		await sending;
++		agent.dispose();
++	});
++
++	test('a second send while a turn is live fails fast', async () => {
++		const client = new FakeIcodeClient();
++		const agent = new IcodeAgent(new NullLogService(), () => client);
++
++		const sending = agent.chats.sendMessage(chat, 'hello', [workspace], undefined, 'turn-1');
++		await timeout(10);
++		await assert.rejects(
++			agent.chats.sendMessage(chat, 'again', [workspace], undefined, 'turn-2'),
++			/already running/,
++		);
++
++		client.finishPrompt({ stopReason: 'end_turn' });
++		await sending;
++		agent.dispose();
++	});
++
++	test('a process exit fails the live turn and respawns on the next send', async () => {
++		const clients: FakeIcodeClient[] = [];
++		const agent = new IcodeAgent(new NullLogService(), () => {
++			const client = new FakeIcodeClient();
++			clients.push(client);
++			return client;
++		});
++		const signals: AgentSignal[] = [];
++		disposables.add(agent.onDidChatProgress(signal => signals.push(signal)));
++
++		const sending = agent.chats.sendMessage(chat, 'hello', [workspace], undefined, 'turn-1');
++		await timeout(10);
++
++		clients[0].emitExit(1);
++		await sending;
++		const failure = (signals[signals.length - 1] as IAgentActionSignal).action;
++		assert.strictEqual(failure.type, ActionType.ChatError);
++		assert.strictEqual((failure as { part: { error: { errorType: string } } }).part.error.errorType, 'icodeExited');
++
++		const second = agent.chats.sendMessage(chat, 'again', [workspace], undefined, 'turn-2');
++		await timeout(10);
++		assert.strictEqual(clients.length, 2);
++		assert.deepStrictEqual(clients[1].requests.map(r => r.method), ['session/new', 'session/prompt']);
++
++		clients[1].finishPrompt({ stopReason: 'end_turn' });
++		await second;
 +		agent.dispose();
 +	});
 +});
