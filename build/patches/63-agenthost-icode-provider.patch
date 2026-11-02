@@ -438,10 +438,10 @@ index 00000000..4393d9d2
 +}
 diff --git a/src/vs/platform/agentHost/node/icode/icodeAgent.ts b/src/vs/platform/agentHost/node/icode/icodeAgent.ts
 new file mode 100644
-index 00000000..02e66e95
+index 00000000..6a791977
 --- /dev/null
 +++ b/src/vs/platform/agentHost/node/icode/icodeAgent.ts
-@@ -0,0 +1,647 @@
+@@ -0,0 +1,712 @@
 +/*---------------------------------------------------------------------------------------------
 + *  Copyright (c) Microsoft Corporation. All rights reserved.
 + *  Licensed under the MIT License. See License.txt in the project root for license information.
@@ -486,7 +486,7 @@ index 00000000..02e66e95
 +import { IcodeAcpClient, type IIcodeAcpClient } from './icodeAcpClient.js';
 +import { buildIcodeTurns } from './icodeHistory.js';
 +import { createIcodeTransport, resolveIcodeCommand } from './icodeLaunchConfig.js';
-+import { createIcodeTurnState, mapAcpPermissionRequest, mapAcpSessionUpdate, type IcodePermissionRequest, type IcodeSessionUpdate, type IIcodeTurnState } from './icodeMapEvents.js';
++import { createIcodeTurnState, mapAcpNotification, mapAcpPermissionRequest, mapAcpSessionUpdate, type IcodePermissionRequest, type IcodeSessionUpdate, type IIcodeTurnState } from './icodeMapEvents.js';
 +import { decodeIcodeProviderData, encodeIcodeProviderData } from './icodeProviderData.js';
 +
 +/** Creates the ACP client; async because resolving the executable touches the file system. */
@@ -525,10 +525,31 @@ index 00000000..02e66e95
 +
 +const CANCELLED_PERMISSION: IcodePermissionResponse = { outcome: { outcome: 'cancelled' } };
 +
++/**
++ * iCode's pre-token progress notifications. Each one only carries an activity
++ * line, so they are wired in bulk and mapped by name.
++ */
++const ICODE_ACTIVITY_NOTIFICATIONS = [
++	'_chrys/turn_started',
++	'_chrys/agent_load_started',
++	'_chrys/agent_load_progress',
++	'_chrys/retry_attempt',
++] as const;
++
 +/** ACP option ids are arbitrary; pick by option kind and fall back to the protocol's names. */
 +function permissionOptionId(options: IcodePermissionRequest['options'], approved: boolean): string {
 +	const kindPrefix = approved ? 'allow' : 'reject';
 +	return options.find(option => option.kind.startsWith(kindPrefix))?.optionId ?? kindPrefix;
++}
++
++/** True for the signals that put real content into the transcript. */
++function isTurnContentSignal(signal: AgentSignal): boolean {
++	return signal.kind === 'action' && (signal.action.type === ActionType.ChatDelta || signal.action.type === ActionType.ChatReasoning);
++}
++
++/** True for an activity-line update; the `_chrys/...` hints produce nothing else. */
++function isActivitySignal(signal: AgentSignal): boolean {
++	return signal.kind === 'action' && signal.action.type === ActionType.ChatActivityChanged;
 +}
 +
 +/**
@@ -944,6 +965,9 @@ index 00000000..02e66e95
 +
 +		this._clientStore.clear();
 +		this._clientStore.add(client.onNotification('session/update', params => this._handleSessionUpdate(params)));
++		for (const name of ICODE_ACTIVITY_NOTIFICATIONS) {
++			this._clientStore.add(client.onNotification(name, params => this._handleActivityNotification(name, params)));
++		}
 +		this._clientStore.add(client.onRequest('session/request_permission', params => this._onPermissionRequest(params)));
 +		this._clientStore.add(client.onExit(code => this._handleClientExit(client, code)));
 +
@@ -1071,7 +1095,48 @@ index 00000000..02e66e95
 +			return;
 +		}
 +
-+		for (const signal of mapAcpSessionUpdate(chat, state, update as IcodeSessionUpdate)) {
++		const signals = mapAcpSessionUpdate(chat, state, update as IcodeSessionUpdate);
++		for (const signal of signals) {
++			this._onDidChatProgress.fire(signal);
++		}
++
++		// The shimmer gives way to the turn's first content exactly once: later
++		// chunks must not re-clear, and the activity hints stay dropped afterwards.
++		if (!state.activityCleared && signals.some(isTurnContentSignal)) {
++			state.activityCleared = true;
++			this._fireAction(chat, { type: ActionType.ChatActivityChanged, activity: undefined });
++		}
++	}
++
++	/**
++	 * Routes one of iCode's `_chrys/...` progress notifications to the chat of
++	 * its ACP session. These are best-effort hints: an unknown session or a turn
++	 * that already ended only leaves a trace, never an error or a signal.
++	 */
++	private _handleActivityNotification(name: string, params: unknown): void {
++		const sessionId = (params as { readonly sessionId?: unknown } | undefined)?.sessionId;
++		if (typeof sessionId !== 'string') {
++			this._logService.trace(`[icode] ignoring ${name} without a session id: ${JSON.stringify(params ?? null).slice(0, 512)}`);
++			return;
++		}
++
++		const chat = this._chatsBySessionId.get(sessionId);
++		if (!chat) {
++			this._logService.trace(`[icode] ignoring ${name} for unknown session '${sessionId}'`);
++			return;
++		}
++		const state = this._turns.get(chat.toString());
++		if (!state) {
++			this._logService.trace(`[icode] ignoring ${name} outside a turn for '${sessionId}'`);
++			return;
++		}
++
++		for (const signal of mapAcpNotification(name, params, chat, state)) {
++			// iCode re-sends `_chrys/turn_started` on every retry of the same turn,
++			// and a cleared activity line must not come back.
++			if (state.activityCleared && isActivitySignal(signal)) {
++				continue;
++			}
 +			this._onDidChatProgress.fire(signal);
 +		}
 +	}
@@ -1593,10 +1658,10 @@ index 00000000..9f60e33f
 +}
 diff --git a/src/vs/platform/agentHost/node/icode/icodeMapEvents.ts b/src/vs/platform/agentHost/node/icode/icodeMapEvents.ts
 new file mode 100644
-index 00000000..5821218e
+index 00000000..0933ee4e
 --- /dev/null
 +++ b/src/vs/platform/agentHost/node/icode/icodeMapEvents.ts
-@@ -0,0 +1,345 @@
+@@ -0,0 +1,406 @@
 +/*---------------------------------------------------------------------------------------------
 + *  Copyright (c) Microsoft Corporation. All rights reserved.
 + *  Licensed under the MIT License. See License.txt in the project root for license information.
@@ -1635,6 +1700,19 @@ index 00000000..5821218e
 +	readonly options: readonly { readonly optionId: string; readonly name: string; readonly kind: string }[];
 +}
 +
++/** The `_chrys/agent_load_progress` payload, narrowed to what the activity text needs. */
++interface IcodeAgentLoadProgress {
++	readonly serverName?: string;
++	readonly current?: number;
++	readonly total?: number;
++}
++
++/** The `_chrys/retry_attempt` payload, narrowed to what the activity text needs. */
++interface IcodeRetryAttempt {
++	readonly attempt?: number;
++	readonly maxAttempts?: number;
++}
++
 +/**
 + * Per-turn mapping state.
 + *
@@ -1652,6 +1730,13 @@ index 00000000..5821218e
 +	/** Tool calls that already emitted `ChatToolCallReady`. */
 +	readonly readyToolCalls: Set<string>;
 +	nextPartSequence: number;
++	/**
++	 * Set once the first content chunk of this turn reached the transcript.
++	 *
++	 * iCode re-sends `_chrys/turn_started` on every retry of the same turn, so
++	 * the agent uses this flag to keep a cleared activity line from coming back.
++	 */
++	activityCleared: boolean;
 +}
 +
 +const THOUGHT_PART_KEY = '__thought__';
@@ -1666,6 +1751,7 @@ index 00000000..5821218e
 +		toolInputs: new Map(),
 +		readyToolCalls: new Set(),
 +		nextPartSequence: 0,
++		activityCleared: false,
 +	};
 +}
 +
@@ -1687,6 +1773,46 @@ index 00000000..5821218e
 +			// `plan`, `usage_update`, `session_info_update`, `current_mode_update`
 +			// and anything iCode adds later carry no transcript content here.
 +			return [];
++	}
++}
++
++/**
++ * Maps one of iCode's `_chrys/...` progress notifications to the activity line
++ * the panel shows as a shimmer before the first token arrives.
++ *
++ * Only `ChatActivityChanged` actions are produced: the panel hides the shimmer
++ * as soon as any response part or tool call exists, so there is nothing to
++ * model beyond a human-readable status string. Formatting only — whether the
++ * text is still wanted is the caller's call (see
++ * {@link IIcodeTurnState.activityCleared}).
++ */
++export function mapAcpNotification(name: string, params: unknown, chat: URI, state: IIcodeTurnState | undefined): AgentSignal[] {
++	const activity = activityText(name, params);
++	if (activity === undefined) {
++		return [];
++	}
++	return [{ kind: 'action', resource: chat, action: { type: ActionType.ChatActivityChanged, activity } }];
++}
++
++function activityText(name: string, params: unknown): string | undefined {
++	switch (name) {
++		case '_chrys/turn_started':
++			return 'iCode 正在准备…';
++		case '_chrys/agent_load_started':
++			return '准备 iCode 运行时…';
++		case '_chrys/agent_load_progress': {
++			const progress = params as IcodeAgentLoadProgress | undefined;
++			if (typeof progress?.serverName !== 'string') {
++				return '准备 iCode 运行时…';
++			}
++			return `加载 ${progress.serverName} (${progress.current}/${progress.total})…`;
++		}
++		case '_chrys/retry_attempt': {
++			const retry = params as IcodeRetryAttempt | undefined;
++			return `重试 ${retry?.attempt}/${retry?.maxAttempts}…`;
++		}
++		default:
++			return undefined;
 +	}
 +}
 +
@@ -2397,10 +2523,10 @@ index 00000000..d34e4c39
 +});
 diff --git a/src/vs/platform/agentHost/test/node/icode/icodeAgent.test.ts b/src/vs/platform/agentHost/test/node/icode/icodeAgent.test.ts
 new file mode 100644
-index 00000000..aca09584
+index 00000000..39d8e002
 --- /dev/null
 +++ b/src/vs/platform/agentHost/test/node/icode/icodeAgent.test.ts
-@@ -0,0 +1,328 @@
+@@ -0,0 +1,380 @@
 +/*---------------------------------------------------------------------------------------------
 + *  Copyright (c) Microsoft Corporation. All rights reserved.
 + *  Licensed under the MIT License. See License.txt in the project root for license information.
@@ -2522,7 +2648,10 @@ index 00000000..aca09584
 +
 +		assert.deepStrictEqual(client.requests.map(r => r.method), ['session/new', 'session/prompt']);
 +		assert.deepStrictEqual(signals.map(s => (s as IAgentActionSignal).action.type), [
-+			ActionType.ChatResponsePart, ActionType.ChatDelta, ActionType.ChatUsage, ActionType.ChatTurnComplete,
++			ActionType.ChatResponsePart, ActionType.ChatDelta,
++			// The first content chunk retires the pre-token activity line.
++			ActionType.ChatActivityChanged,
++			ActionType.ChatUsage, ActionType.ChatTurnComplete,
 +		]);
 +		agent.dispose();
 +	});
@@ -2726,6 +2855,55 @@ index 00000000..aca09584
 +
 +		assert.strictEqual(seen.length, 1);
 +		assert.strictEqual(decodeIcodeProviderData(seen[0])?.sessionId, SESSION_ID);
++		agent.dispose();
++	});
++
++	test('surfaces activity until the first content chunk, then clears it', async () => {
++		const client = new FakeIcodeClient();
++		const agent = new IcodeAgent(new NullLogService(), () => client);
++		const activities: (string | undefined)[] = [];
++		disposables.add(agent.onDidChatProgress(signal => {
++			if (signal.kind === 'action' && signal.action.type === ActionType.ChatActivityChanged) {
++				activities.push(signal.action.activity);
++			}
++		}));
++
++		const turn = agent.chats.sendMessage(chat, 'hello', [workspace], [], 'turn-1');
++		await timeout(10);
++
++		client.emitNotification('_chrys/turn_started', { sessionId: SESSION_ID, turnId: 'turn-1' });
++		assert.deepStrictEqual(activities, ['iCode 正在准备…']);
++
++		client.emitNotification('session/update', { sessionId: SESSION_ID, update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'hi' }, messageId: 'm1' } });
++		assert.deepStrictEqual(activities, ['iCode 正在准备…', undefined]);
++
++		client.completePrompt('end_turn');
++		await turn;
++		assert.deepStrictEqual(activities, ['iCode 正在准备…', undefined]);
++		agent.dispose();
++	});
++
++	test('a retried turn_started does not bring the activity text back', async () => {
++		const client = new FakeIcodeClient();
++		const agent = new IcodeAgent(new NullLogService(), () => client);
++		const activities: (string | undefined)[] = [];
++		disposables.add(agent.onDidChatProgress(signal => {
++			if (signal.kind === 'action' && signal.action.type === ActionType.ChatActivityChanged) {
++				activities.push(signal.action.activity);
++			}
++		}));
++
++		const turn = agent.chats.sendMessage(chat, 'hello', [workspace], [], 'turn-1');
++		await timeout(10);
++
++		client.emitNotification('_chrys/turn_started', { sessionId: SESSION_ID, turnId: 'turn-1' });
++		client.emitNotification('session/update', { sessionId: SESSION_ID, update: { sessionUpdate: 'agent_thought_chunk', content: { type: 'text', text: 'hmm' } } });
++		client.emitNotification('_chrys/turn_started', { sessionId: SESSION_ID, turnId: 'turn-1', isRetry: true });
++		assert.deepStrictEqual(activities, ['iCode 正在准备…', undefined]);
++
++		client.completePrompt('end_turn');
++		await turn;
++		assert.deepStrictEqual(activities, ['iCode 正在准备…', undefined]);
 +		agent.dispose();
 +	});
 +});
@@ -3013,10 +3191,10 @@ index 00000000..448debe9
 +});
 diff --git a/src/vs/platform/agentHost/test/node/icode/icodeMapEvents.test.ts b/src/vs/platform/agentHost/test/node/icode/icodeMapEvents.test.ts
 new file mode 100644
-index 00000000..a9af5454
+index 00000000..21a60175
 --- /dev/null
 +++ b/src/vs/platform/agentHost/test/node/icode/icodeMapEvents.test.ts
-@@ -0,0 +1,127 @@
+@@ -0,0 +1,162 @@
 +/*---------------------------------------------------------------------------------------------
 + *  Copyright (c) Microsoft Corporation. All rights reserved.
 + *  Licensed under the MIT License. See License.txt in the project root for license information.
@@ -3025,11 +3203,22 @@ index 00000000..a9af5454
 +import assert from 'assert';
 +import { URI } from '../../../../../base/common/uri.js';
 +import { ensureNoDisposablesAreLeakedInTestSuite } from '../../../../../base/test/common/utils.js';
++import type { AgentSignal } from '../../../common/agent.js';
 +import { ActionType } from '../../../common/state/sessionActions.js';
 +import { ResponsePartKind, ToolCallConfirmationReason, ToolCallStatus, ToolResultContentType } from '../../../common/state/sessionState.js';
-+import { createIcodeTurnState, mapAcpPermissionRequest, mapAcpSessionUpdate } from '../../../node/icode/icodeMapEvents.js';
++import { createIcodeTurnState, mapAcpNotification, mapAcpPermissionRequest, mapAcpSessionUpdate } from '../../../node/icode/icodeMapEvents.js';
 +
 +const chat = URI.parse('ahp-chat://test/chat');
++
++/** Asserts a single activity signal came back and returns its text. */
++function activityOf(signals: AgentSignal[]): string | undefined {
++	assert.strictEqual(signals.length, 1, `expected one signal, got ${JSON.stringify(signals)}`);
++	const signal = signals[0];
++	if (signal.kind !== 'action' || signal.action.type !== ActionType.ChatActivityChanged) {
++		assert.fail(`expected an activity signal, got ${JSON.stringify(signals)}`);
++	}
++	return signal.action.activity;
++}
 +
 +suite('icodeMapEvents', () => {
 +	ensureNoDisposablesAreLeakedInTestSuite();
@@ -3142,6 +3331,30 @@ index 00000000..a9af5454
 +		assert.deepStrictEqual(mapAcpSessionUpdate(chat, state, { sessionUpdate: 'session_info_update' }), []);
 +		assert.deepStrictEqual(mapAcpSessionUpdate(chat, state, { sessionUpdate: 'current_mode_update' }), []);
 +		assert.deepStrictEqual(mapAcpSessionUpdate(chat, state, { sessionUpdate: 'branch_snapshot' }), []);
++	});
++
++	test('turn_started announces preparation before the first token', () => {
++		const state = createIcodeTurnState('turn-1');
++		const signals = mapAcpNotification('_chrys/turn_started', { sessionId: 's', turnId: 'turn-1' }, chat, state);
++		assert.deepStrictEqual(signals, [{
++			kind: 'action',
++			resource: chat,
++			action: { type: ActionType.ChatActivityChanged, activity: 'iCode 正在准备…' },
++		}]);
++	});
++
++	test('retry attempts and agent loading update the activity text', () => {
++		const state = createIcodeTurnState('turn-1');
++		assert.strictEqual(activityOf(mapAcpNotification('_chrys/retry_attempt', { sessionId: 's', turnId: 'turn-1', attempt: 2, maxAttempts: 3 }, chat, state)), '重试 2/3…');
++		assert.strictEqual(activityOf(mapAcpNotification('_chrys/agent_load_progress', { sessionId: 's', phase: 'mcp', serverName: 'firecrawl', current: 1, total: 2, failed: 0 }, chat, state)), '加载 firecrawl (1/2)…');
++		assert.strictEqual(activityOf(mapAcpNotification('_chrys/agent_load_started', { sessionId: 's' }, chat, state)), '准备 iCode 运行时…');
++		// A load without a server name has nothing to count, so it falls back.
++		assert.strictEqual(activityOf(mapAcpNotification('_chrys/agent_load_progress', { sessionId: 's', phase: 'start' }, chat, state)), '准备 iCode 运行时…');
++	});
++
++	test('unknown notifications produce no signals', () => {
++		assert.deepStrictEqual(mapAcpNotification('_chrys/mystery', {}, chat, createIcodeTurnState('t')), []);
++		assert.deepStrictEqual(mapAcpNotification('_chrys/mystery', undefined, chat, undefined), []);
 +	});
 +});
 diff --git a/src/vs/platform/agentHost/test/node/icode/icodeProviderData.test.ts b/src/vs/platform/agentHost/test/node/icode/icodeProviderData.test.ts
