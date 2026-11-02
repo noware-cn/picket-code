@@ -1091,10 +1091,10 @@ index 00000000..02e66e95
 +}
 diff --git a/src/vs/platform/agentHost/node/icode/icodeHistory.ts b/src/vs/platform/agentHost/node/icode/icodeHistory.ts
 new file mode 100644
-index 00000000..9ec0e9b7
+index 00000000..c7603b7c
 --- /dev/null
 +++ b/src/vs/platform/agentHost/node/icode/icodeHistory.ts
-@@ -0,0 +1,222 @@
+@@ -0,0 +1,224 @@
 +/*---------------------------------------------------------------------------------------------
 + *  Copyright (c) Microsoft Corporation. All rights reserved.
 + *  Licensed under the MIT License. See License.txt in the project root for license information.
@@ -1102,7 +1102,7 @@ index 00000000..9ec0e9b7
 +
 +import { generateUuid } from '../../../../base/common/uuid.js';
 +import { MessageKind, ResponsePartKind, ToolCallCancellationReason, ToolCallConfirmationReason, ToolCallStatus, ToolResultContentType, TurnState, type MarkdownResponsePart, type ReasoningResponsePart, type ToolCallResponsePart, type ToolCallState, type ToolResultTextContent, type Turn } from '../../common/state/sessionState.js';
-+import type { IcodeSessionUpdate } from './icodeMapEvents.js';
++import { acpToolName, type IcodeSessionUpdate } from './icodeMapEvents.js';
 +
 +/** Reasoning is a single stream per turn, so one key is enough. */
 +const THOUGHT_PART_KEY = '__thought__';
@@ -1217,7 +1217,9 @@ index 00000000..9ec0e9b7
 +
 +	const existing = builder.toolParts.get(toolCallId);
 +	const displayName = update.title ?? existing?.toolCall.displayName ?? toolCallId;
-+	const state = createToolCallState(toolCallId, displayName, update);
++	// ACP completes a call with a `tool_call_update` that does not repeat the
++	// call's `kind`, so keep the name the announcement produced.
++	const state = createToolCallState(toolCallId, displayName, update, existing?.toolCall.toolName);
 +	if (existing) {
 +		existing.toolCall = state;
 +	} else {
@@ -1232,14 +1234,14 @@ index 00000000..9ec0e9b7
 +	builder.turn.responseParts.push(part);
 +}
 +
-+function createToolCallState(toolCallId: string, displayName: string, update: IcodeSessionUpdate): ToolCallState {
++function createToolCallState(toolCallId: string, displayName: string, update: IcodeSessionUpdate, previousToolName?: string): ToolCallState {
 +	const invocationMessage = displayName;
 +	const toolInput = update.rawInput !== undefined ? JSON.stringify(update.rawInput) : undefined;
 +	const content = extractResultContent(update);
 +	const base = {
 +		toolCallId,
-+		// The replayed title is the most specific name a finished call still carries.
-+		toolName: displayName,
++		// Match the live mapper so a restored chat renders exactly like a live one.
++		toolName: update.kind !== undefined ? acpToolName(update.kind) : previousToolName ?? acpToolName(undefined),
 +		displayName,
 +		invocationMessage,
 +		...(toolInput !== undefined ? { toolInput } : {}),
@@ -1591,7 +1593,7 @@ index 00000000..9f60e33f
 +}
 diff --git a/src/vs/platform/agentHost/node/icode/icodeMapEvents.ts b/src/vs/platform/agentHost/node/icode/icodeMapEvents.ts
 new file mode 100644
-index 00000000..e9520162
+index 00000000..5821218e
 --- /dev/null
 +++ b/src/vs/platform/agentHost/node/icode/icodeMapEvents.ts
 @@ -0,0 +1,345 @@
@@ -1920,7 +1922,7 @@ index 00000000..e9520162
 +}
 +
 +/** Maps an ACP tool-call `kind` to the internal tool name shown in the transcript. */
-+function acpToolName(kind: string | undefined): string {
++export function acpToolName(kind: string | undefined): string {
 +	switch (kind) {
 +		case 'execute': return 'shell';
 +		case 'edit': return 'edit';
@@ -2729,10 +2731,10 @@ index 00000000..aca09584
 +});
 diff --git a/src/vs/platform/agentHost/test/node/icode/icodeHistory.test.ts b/src/vs/platform/agentHost/test/node/icode/icodeHistory.test.ts
 new file mode 100644
-index 00000000..1be9ba5a
+index 00000000..c8d07242
 --- /dev/null
 +++ b/src/vs/platform/agentHost/test/node/icode/icodeHistory.test.ts
-@@ -0,0 +1,47 @@
+@@ -0,0 +1,48 @@
 +/*---------------------------------------------------------------------------------------------
 + *  Copyright (c) Microsoft Corporation. All rights reserved.
 + *  Licensed under the MIT License. See License.txt in the project root for license information.
@@ -2770,10 +2772,11 @@ index 00000000..1be9ba5a
 +		] as never);
 +		const parts = turns[0].responseParts;
 +		assert.deepStrictEqual(parts.map(p => p.kind), [ResponsePartKind.Reasoning, ResponsePartKind.ToolCall]);
-+		const tool = parts[1] as { toolCall: { status: string; success: boolean; toolName: string } };
++		const tool = parts[1] as { toolCall: { status: string; success: boolean; toolName: string; displayName: string } };
 +		assert.strictEqual(tool.toolCall.status, ToolCallStatus.Completed);
 +		assert.strictEqual(tool.toolCall.success, true);
-+		assert.strictEqual(tool.toolCall.toolName, 'zsh');
++		assert.strictEqual(tool.toolCall.toolName, 'shell');
++	assert.strictEqual(tool.toolCall.displayName, 'zsh');
 +	});
 +
 +	test('drops updates that arrive before any user message instead of inventing a turn', () => {
