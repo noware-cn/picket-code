@@ -82,11 +82,41 @@ wsl.exe -d <distro> --cd <posixCwd> -- bash -lc 'exec icode acp --approval manua
 
 超时与 `gracePeriodMs` 沿用现有实现（`icodeAgent.ts` 的 `_shutdown` 阶梯）。
 
-### 2.6 已知风险与缓解
+### 2.6 git 必须跑在 WSL 里（正确性问题，不是优化项）
+
+`AgentHostGitService` 现在用**宿主机的 git** 对工作区执行命令：`cp.execFile('git', …)` 只有三处调用点（`agentHostGitService.ts:983` 读 blob、`:1095` 的 `update-ref --stdin`、`:1380` 的 `_runGit` 主入口），所以改造面很小；但**不能不做**：iCode 在 WSL 里自己也会跑 git（checkpoint、diff、提交），如果宿主侧用 Windows 的 git 去读同一批文件，两边看到的世界不一样：
+
+| 分歧点 | 表现 |
+|---|---|
+| `core.autocrlf` / `.gitattributes` 的 eol | Git for Windows 默认 `autocrlf=true`，WSL 里是 `false` → 每个文件都被判为改动，或改动全部消失 |
+| `core.filemode` | Windows git 置 `false`，WSL git 置 `true` → 只改了权限的变更一边可见一边不可见 |
+| hooks | 仓库里的 `pre-commit` / `pre-push` 按 Linux 写（`#!/usr/bin/env bash`），Windows 侧执行会直接失败或跳过 |
+| symlink / 大小写 | 9p 上 symlink 退化成文件；WSL 文件系统大小写敏感，Windows git 可能把小写相等当成同一个路径 |
+| 性能 | 9p 上的 `git status` 慢一个数量级，既有 5 s 超时（`_runGit` 默认 `timeout: 5000`）会被打穿 |
+
+**设计**：把 git 的进程执行抽成一个执行器，按工作区身份选实现。
+
+```
+interface IGitExecutor {
+  execFile(cwd: URI, args: readonly string[], opts): Promise<{ stdout, stderr }>;
+}
+LocalGitExecutor  → cp.execFile('git', args, { cwd: fsPath, … })        // 现状
+WslGitExecutor    → cp.execFile('wsl.exe', ['-d', distro, '--cd', posix(cwd), '--', 'git', ...args])
+```
+
+三条规则：
+
+1. **输出翻译按命令白名单，不做启发式**。只有 `rev-parse --show-toplevel`、`worktree list --porcelain`、`config --get core.worktree` 这类会吐绝对路径的命令才把 POSIX 转回 UNC；`status --porcelain`、`diff --numstat`、`ls-files` 吐的是相对路径，原样通过；`git show <rev>:<path>` 吐的是**文件内容**，绝不能碰（一个以 `/` 开头的注释行会被误翻译成路径）。
+2. **超时要按传输加余量**。`wsl.exe` 冷启动 1–3 s，`_runGit` 的 5 s 默认超时对第一个 `status` 不够；改成 `timeout + wslOverheadMs`，并在会话创建时预热一次（`wsl.exe -d <distro> -- true`）。
+3. **`GIT_OPTIONAL_LOCKS=0` 保留**（`_runGitStatus` 已经在用），避免后台探针与 iCode 的写操作抢 `index.lock`。
+
+改造后 `AgentHostGitStateService`（分支状态、`ahead/behind`）与 `gitDiffContent`（diff 内容）都自动跟随，不需要各自加分支。
+
+### 2.7 已知风险与缓解
 
 | 风险 | 说明 | 缓解 |
 |---|---|---|
-| 9p 慢 | `AgentHostGitService` 在 Windows 侧对 UNC 路径跑 `git status/diff`；大仓库会慢（可能触发既有超时分支） | M3 里给 git 调用加"工作区是 WSL 路径时改走 `wsl.exe -d … -- git …`"的旁路；短期先测 5k 文件仓库 |
+| 9p 读写 | 除 git 之外，宿主仍会通过 UNC 读文件（diff 内容、搜索、文件监视）。9p 比原生慢，大仓库的文件监视也可能丢事件 | 会话级接受；文件内容读取加缓存不做（先测再定） |
 | `wsl.exe` 行尾转换 | 若 `wsl.exe` 在管道上做 CRLF 转换，NDJSON 会带 `\r` | 读取侧已按 `\n` 切行，补一条 `\r` 剥除 + 一条集成用例 |
 | 首次冷启动 | 未启动的 distro 首个 `wsl.exe` 调用要 1–3 s | 会话创建时预热一次 `wsl.exe -d d -- true` |
 | 权限 | `/mnt` 上的写权限与 NTFS ACL 交叉 | 文档明确推荐把工作区放在 distro 原生文件系统（`/home/...`），不要放在 `/mnt/d` |
@@ -109,9 +139,8 @@ wsl.exe -d <distro> --cd <posixCwd> -- bash -lc 'exec icode acp --approval manua
 |---|---|---|
 | M1（0.5–1 天） | `icodeWslPaths.ts`（检测 + 双向映射 + `shQuote`）+ 单测；`icodeLaunchConfig` 增加 `wsl` 传输策略 | 纯单元，fixture 用假 `wsl.exe`（node 脚本记录 argv 并回显 NDJSON） |
 | M2（1 天） | 注册门禁改造 + `icodeAgent` 按工作区选策略 + 启动失败的可读错误 | 单元：UNC 工作区 → 断言 spawn 的是 `wsl.exe` 且 argv 正确；非 UNC → 仍是本机 |
-| M3（1 天） | 路径回译（`icodeMapEvents` 之前）+ 杀进程三级阶梯 + 预热 | 单元：POSIX 路径的 `rawInput` 回译成 UNC；`pkill` 命令行被调用 |
+| M3（1.5 天） | `IGitExecutor` + `WslGitExecutor`（含命令白名单翻译、超时余量）；路径回译（`icodeMapEvents` 之前）；杀进程三级阶梯 + 预热 | 单元：假 `wsl.exe` 断言 git 调用被改道；POSIX 的 `rawInput` 回译成 UNC；`pkill` 被调用 |
 | M4（0.5 天） | 文档（`docs/design.md` 一节 + `website/docs/guide/wsl.md` 排障）+ 手动验收清单 | 手工 |
-| 可选 M5 | git 旁路（走 WSL） | 大仓库实测 |
 
 CI 可自动化的部分：M1–M3 全部单元测试（`windows-2022` runner 上 `wsl.exe` 存在，假 distro 用假可执行文件替代；真实 distro 不进 CI）。真机验收项见下。
 
@@ -123,8 +152,10 @@ CI 可自动化的部分：M1–M3 全部单元测试（`windows-2022` runner �
 4. 审批允许/拒绝各一次；`ask_user` 一次。
 5. 中断（Stop）后 `wsl.exe -d Ubuntu -- pgrep -f PICKET_ACP_SESSION` 为空。
 6. 关闭会话/退出应用后没有遗留 `wsl.exe` 进程。
-7. 打开 `D:\…` 工作区时行为不变（本机传输），且日志里能看到策略判定。
-8. 未安装 iCode 的 distro 上打开 UNC 工作区：得到可读错误，而不是静默无响应。
+7. 同一工作区里 `git status` 由 **WSL 的 git** 执行（日志出现 `wsl.exe … -- git status`），且改动列表与 WSL 里 `git status` 完全一致，没有"全仓库都是改动"的假象。
+8. 在会话里跑一次"提交"类操作（PR 流程的 `commitAll` / `push`），hooks 能正常执行。
+9. 打开 `D:\…` 工作区时行为不变（本机传输），且日志里能看到策略判定。
+10. 未安装 iCode 的 distro 上打开 UNC 工作区：得到可读错误，而不是静默无响应。
 
 ## 6. 需要拍板
 
