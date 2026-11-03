@@ -2880,7 +2880,7 @@ index 00000000..d34e4c39
 +});
 diff --git a/src/vs/platform/agentHost/test/node/icode/icodeAgent.test.ts b/src/vs/platform/agentHost/test/node/icode/icodeAgent.test.ts
 new file mode 100644
-index 00000000..a8a0c9a3
+index 00000000..878c7c66
 --- /dev/null
 +++ b/src/vs/platform/agentHost/test/node/icode/icodeAgent.test.ts
 @@ -0,0 +1,596 @@
@@ -3215,7 +3215,7 @@ index 00000000..a8a0c9a3
 +		const client = new FakeIcodeClient();
 +		const agent = new IcodeAgent(new NullLogService(), () => client);
 +
-+		await agent.chats.createChat(chat, { session: chat }, { workingDirectories: [workspace] });
++		await agent.chats.createChat(chat, chat, { workingDirectories: [workspace] });
 +		const sending = agent.chats.sendMessage(chat, 'hello', undefined, undefined, 'turn-1');
 +		await timeout(0);
 +		const sessionNew = client.requests.find(r => r.method === 'session/new');
@@ -3231,7 +3231,7 @@ index 00000000..a8a0c9a3
 +
 +		const sending = agent.chats.sendMessage(chat, 'hello', [workspace], undefined, 'turn-1');
 +		await timeout(0);
-+		await agent.chats.changeModel(chat, { id: 'default' }, { session: chat });
++		await agent.chats.changeModel(chat, { id: 'default' }, chat);
 +		assert.ok(!client.requests.some(r => r.method === 'session/set_model'), 'no set_model request for an unknown id');
 +		client.completePrompt('end_turn');
 +		await sending;
