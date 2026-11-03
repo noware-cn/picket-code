@@ -75,22 +75,20 @@ jobs:
           echo "vscode=$tag" >> "$GITHUB_OUTPUT"
           echo "node=$node_version" >> "$GITHUB_OUTPUT"
 
-      # Fail in seconds, not after a 40-minute compile: the L4 suite is our test asset and
-      # arrives with the patches. A missing suite would make `-f icode` an empty run.
-      - name: Assert the L4 suite is in the patched tree
+      # Fail in seconds, not after a 40-minute compile: the L4 suite arrives with the
+      # patches, so check that the patch is in the list before spending an hour on it.
+      # The suite itself is checked after prepare-vscode.sh (step "Assert the L4 suite").
+      - name: Assert the L4 patch is enabled
         shell: bash
         run: |
-          suite=vscode/test/smoke/src/areas/agentsWindow/icode.test.ts
-          if [ ! -f "$suite" ]; then
-            echo "FAIL: $suite is missing; the L4 suite and its fixture must ship with the"
-            echo "      patches in build/patches/apply-list.txt."
+          patch_name=65-icode-smoke-tests.patch
+          if ! grep -qx "$patch_name" build/patches/apply-list.txt; then
+            echo "FAIL: $patch_name is not enabled in build/patches/apply-list.txt;"
+            echo "      '-f icode' would match nothing and the gate would pass vacuously."
             exit 1
           fi
-          echo "ok: $suite"
-          if ! grep -q 'icode.test' vscode/test/smoke/src/main.ts; then
-            echo "WARN: $suite exists but test/smoke/src/main.ts does not reference it;"
-            echo "      the suite will not be registered and '-f icode' will match nothing."
-          fi
+          test -f "build/patches/$patch_name"
+          echo "ok: $patch_name is enabled"
 
       - uses: actions/setup-node@v7
         with:
@@ -125,6 +123,22 @@ jobs:
         run: |
           echo "==> bash build/test/prepare-vscode.sh $VSCODE_TAG --no-transpile"
           bash build/test/prepare-vscode.sh "$VSCODE_TAG" --no-transpile
+
+      # The patched tree is where the suite actually lives: the repository only
+      # carries the patch. Fail here rather than let `-f icode` match nothing.
+      - name: Assert the L4 suite is in the patched tree
+        shell: bash
+        run: |
+          suite=vscode/test/smoke/src/areas/agentsWindow/icode.test.ts
+          if [ ! -f "$suite" ]; then
+            echo "FAIL: $suite is missing after applying the patches."
+            exit 1
+          fi
+          grep -q 'icode.test' vscode/test/smoke/src/main.ts || {
+            echo "FAIL: $suite exists but test/smoke/src/main.ts does not register it."
+            exit 1
+          }
+          echo "ok: $suite is registered"
 
       # Electron is a ~120 MB download per run; it only changes when upstream's
       # `.build/electron` version does, so cache it per tag.
