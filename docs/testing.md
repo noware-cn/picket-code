@@ -75,9 +75,9 @@
 |---|---|
 | 会话类型出现 | 选 `iCode` 后 `waitForActiveSessionView()` |
 | 一轮对话渲染 | `waitForAssistantText(<脚本文本>)` |
-| per-turn diff | 假服务器先改工作区文件（场景 `diff`），响应下方出现文件名 + 点开有红绿 |
+| per-turn diff | 假服务器在本会话目录里写文件（场景 `diff`），响应下方出现文件名 + 点开有红绿 |
 | ask_user 表单 | 出现表单、选第一项、回合继续 |
-| 审批横幅 | 出现审批、点允许、工具结果出现 |
+| 审批横幅 | 出现审批横幅（`Allow Once` / `Allow in this Session`）、点允许后回合结束；工具输出按 `HiddenAfterComplete` 不进转录 |
 | 重启后历史回填 | 关窗重开同会话 → 历史文本仍在 |
 
 > 前提：假 ACP CLI 需要真实改动工作区（`diff` 场景写文件），且会话工作目录必须由 workspace pill 指定为临时 git 仓库——该步骤本身就是被测行为。

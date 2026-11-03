@@ -157,12 +157,41 @@ index f3486874..a415183f 100644
  	/**
  	 * Open the model picker in the active session input and select the model
  	 * whose displayed name contains `modelName`. Clicks the model-picker name
+diff --git a/test/automation/src/chat.ts b/test/automation/src/chat.ts
+index bf06aae8..7f542446 100644
+--- a/test/automation/src/chat.ts
++++ b/test/automation/src/chat.ts
+@@ -528,9 +528,12 @@ export async function acceptToolConfirmationIfPresent(code: Code): Promise<void>
+ 	const allowButtonSelector = '.chat-confirmation-widget2 .monaco-button.monaco-text-button';
+ 	try {
+ 		const buttons = await code.driver.getElements(allowButtonSelector, /* recursive */ true);
+-		// The first text button in the widget is "Allow"; only proceed when
+-		// that holds so we never accidentally hit "Skip".
+-		if (!buttons || buttons.length === 0 || (buttons[0].textContent ?? '').trim() !== 'Allow') {
++		// The first text button in the widget is an allow label; only proceed
++		// when that holds so we never accidentally hit "Skip". Providers may
++		// offer several nuances of approval ("Allow Once", "Allow in this
++		// Session"), so match the label family rather than one exact string.
++		const isAllowLabel = (text: string | undefined) => /^Allow( Once| in this Session| Always)?$/.test((text ?? '').trim());
++		if (!buttons || buttons.length === 0 || !isAllowLabel(buttons[0].textContent)) {
+ 			return;
+ 		}
+ 		// Filter to only visible "Allow" buttons: the DOM can contain multiple
+@@ -540,7 +543,7 @@ export async function acceptToolConfirmationIfPresent(code: Code): Promise<void>
+ 		// element order and often pick a hidden one.
+ 		const allowButtons = code.driver.currentPage
+ 			.locator('.chat-confirmation-widget2 .monaco-button.monaco-text-button')
+-			.filter({ hasText: /^Allow$/ });
++			.filter({ hasText: /^Allow( Once| in this Session| Always)?$/ });
+ 		const total = await allowButtons.count();
+ 		for (let i = 0; i < total; i++) {
+ 			const b = allowButtons.nth(i);
 diff --git a/test/smoke/src/areas/agentsWindow/icode.test.ts b/test/smoke/src/areas/agentsWindow/icode.test.ts
 new file mode 100644
-index 00000000..0f924da1
+index 00000000..c986803d
 --- /dev/null
 +++ b/test/smoke/src/areas/agentsWindow/icode.test.ts
-@@ -0,0 +1,435 @@
+@@ -0,0 +1,432 @@
 +/*---------------------------------------------------------------------------------------------
 + *  Copyright (c) Microsoft Corporation. All rights reserved.
 + *  Licensed under the MIT License. See License.txt in the project root for license information.
@@ -542,19 +571,16 @@ index 00000000..0f924da1
 +
 +				await agentsWindow.acceptToolConfirmation();
 +
-+				// Allowing resumes the parked request: the host clears the input
-+				// request and the turn ends. The approved call's result text is
-+				// deliberately not asserted — a call that enters the transcript while
++				// Allowing resumes the parked request and the turn ends. The approved
++				// call's result text is deliberately not asserted: a call admitted while
 +				// pending confirmation is created with
 +				// `ToolInvocationPresentation.HiddenAfterComplete`
-+				// (`stateToProgressAdapter.toolCallStateToInvocation`), and the chat's
-+				// `allow-session`/`allow-once` option ids are forwarded to ACP verbatim
-+				// (`icodeAgent.respondToPermissionRequest`), so the fake CLI's
-+				// `optionId === 'allow'` branch — the one that reports the result text —
-+				// is not reachable through a UI click. The visible contract this test
-+				// pins is that the approval affordance appears and that allowing it
-+				// lets the turn finish.
-+				await agentsWindow.waitForToolConfirmationGone(120_000);
++				// (`stateToProgressAdapter.toolCallStateToInvocation`), so its output
++				// never enters the transcript. The confirmation card itself stays
++				// rendered as the record of the decision, so the contract pinned here is
++				// "the approval affordance appears, and allowing it lets the turn
++				// finish" — waiting for the card to vanish would assert a UI detail that
++				// is not what this test is about.
 +				await agentsWindow.waitForActiveResponseSettled(120_000);
 +			} catch (error) {
 +				await reportFailure(app, logger, 'Agents Window [icode] permission scenario', error);
