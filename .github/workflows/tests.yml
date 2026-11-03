@@ -4,6 +4,7 @@ name: tests
 #   contract      build/check-contract.sh (tag/archive/downloader contract)
 #   unit          L1 — the seven iCode suites + the agentHostChangeset suites
 #   acp-process   L2 — the real `icode acp` protocol boundary against a fake CLI
+#   host-e2e      L3 — the whole agent host over AHP/WebSocket with the fake CLI
 #
 # This repository does not vendor the VS Code tree: `vscode/` is cloned at build time
 # (build/build.sh, and `.gitignore` only tracks the folder name). Every job therefore
@@ -11,8 +12,6 @@ name: tests
 # npm ci + transpile half of build/build.sh — and the expensive halves are shared
 # through actions/cache instead of being repeated per job.
 #
-# L3 (agent host over WebSocket) will ride in this file as one more job of the same shape
-# as `acp-process` once vscode/test/node/e2e/icodeAgentHostE2E.integrationTest.ts exists;
 # L4 (Electron UI smoke) is tests-ui.yml because a single run costs ~40 minutes.
 on:
   pull_request:
@@ -200,16 +199,18 @@ jobs:
           echo "==> bash build/test/prepare-vscode.sh $VSCODE_TAG"
           bash build/test/prepare-vscode.sh "$VSCODE_TAG"
 
-      # The seven iCode suites. icodeAcpProcess is the L2 suite and runs in its own job,
-      # so it is excluded here — one suite must not appear twice in the report.
+      # The seven iCode suites. icodeAcpProcess is the L2 suite and icodeAgentHostE2E is
+      # the L3 suite: each runs in its own job, so both are excluded here — one suite must
+      # not appear twice in the report.
       - name: iCode unit suites (L1)
         shell: bash
         run: |
-          echo "==> node build/test/run-unit-junit.mjs --name icode --glob 'out/vs/platform/agentHost/test/node/icode/*.test.js' --exclude '**/icodeAcpProcess.test.js'"
+          echo "==> node build/test/run-unit-junit.mjs --name icode --glob 'out/vs/platform/agentHost/test/node/icode/*.test.js' --exclude '**/icodeAcpProcess.test.js' --exclude '**/icodeAgentHostE2E.test.js'"
           node build/test/run-unit-junit.mjs \
             --name icode \
             --glob 'out/vs/platform/agentHost/test/node/icode/*.test.js' \
-            --exclude '**/icodeAcpProcess.test.js'
+            --exclude '**/icodeAcpProcess.test.js' \
+            --exclude '**/icodeAgentHostE2E.test.js'
 
       - name: agentHostChangeset suites (L1)
         shell: bash
@@ -322,6 +323,101 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: test-results-acp-process
+          path: test-results
+          if-no-files-found: warn
+          retention-days: 30
+
+  # L3 needs no display and no Electron: the suite spawns the compiled agent host
+  # (out/vs/platform/agentHost/node/agentHostServerMain.js) as a plain Node child and
+  # speaks AHP to it over a WebSocket. It costs ~15s of test time, so the timeout only
+  # covers a stuck host process.
+  host-e2e:
+    name: "Host e2e (L3: agent host over AHP/WebSocket)"
+    needs: [resolve, build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      VSCODE_TAG: ${{ needs.resolve.outputs.vscode }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: ${{ needs.resolve.outputs.node }}
+
+      - name: Clone the pinned tree and apply the patches
+        shell: bash
+        run: |
+          echo "==> bash build/test/prepare-vscode.sh $VSCODE_TAG --no-install --no-transpile"
+          bash build/test/prepare-vscode.sh "$VSCODE_TAG" --no-install --no-transpile
+
+      # The suite and the fake CLI are our test assets and arrive with the patches; if
+      # they do not, this job would match zero files and must not look green.
+      - name: Assert the L3 assets are in the patched tree
+        shell: bash
+        run: |
+          missing=0
+          for f in \
+            vscode/src/vs/platform/agentHost/test/node/icode/icodeAgentHostE2E.test.ts \
+            vscode/test/fixtures/fake-icode-acp.mjs; do
+            if [ -f "$f" ]; then
+              echo "ok: $f"
+            else
+              echo "MISSING: $f"
+              missing=1
+            fi
+          done
+          if [ "$missing" -ne 0 ]; then
+            echo "FAIL: the L3 suite and its fake ACP CLI must ship with the patches in"
+            echo "      build/patches/apply-list.txt; without them there is nothing to test."
+            exit 1
+          fi
+
+      - name: Restore node_modules + out from the build job
+        id: cache
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            vscode/node_modules
+            vscode/out
+          key: ${{ needs.build.outputs.cache-key }}
+
+      - name: Install Linux build dependencies (cache miss only)
+        if: steps.cache.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          echo "==> sudo apt-get install -y libkrb5-dev libx11-dev libxkbfile-dev libsecret-1-dev libxext-dev libxrender-dev libxrandr-dev"
+          sudo apt-get update
+          sudo apt-get install -y libkrb5-dev libx11-dev libxkbfile-dev \
+            libsecret-1-dev libxext-dev libxrender-dev libxrandr-dev
+
+      - name: npm ci and transpile (cache miss only)
+        if: steps.cache.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          echo "==> bash build/test/prepare-vscode.sh $VSCODE_TAG"
+          bash build/test/prepare-vscode.sh "$VSCODE_TAG"
+
+      - name: Agent host e2e suite (L3)
+        shell: bash
+        run: |
+          echo "==> node build/test/run-unit-junit.mjs --name host-e2e --glob 'out/vs/platform/agentHost/test/node/icode/icodeAgentHostE2E.test.js'"
+          node build/test/run-unit-junit.mjs \
+            --name host-e2e \
+            --glob 'out/vs/platform/agentHost/test/node/icode/icodeAgentHostE2E.test.js'
+
+      - name: Summarize the JUnit reports
+        if: always()
+        shell: bash
+        run: |
+          echo "==> node build/test/summarize.mjs --dir test-results"
+          node build/test/summarize.mjs --dir test-results
+
+      - name: Upload the JUnit reports
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: test-results-host-e2e
           path: test-results
           if-no-files-found: warn
           retention-days: 30

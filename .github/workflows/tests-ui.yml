@@ -158,6 +158,27 @@ jobs:
           cd vscode
           node build/lib/preLaunch.ts
 
+      # Electron's chrome-sandbox needs unprivileged user namespaces; Ubuntu 24.04
+      # blocks them by default, and without this the app dies at startup with
+      # "The SUID sandbox helper binary was found, but is not configured correctly".
+      # Upstream does the same in pr-linux-test.yml.
+      - name: Allow unprivileged user namespaces (Electron sandbox)
+        shell: bash
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+
+      # `test/automation` and `test/smoke` are separate packages with their own
+      # locks; the root `npm ci` does not install them, and the harness imports
+      # `ncp`, `tmp` and `axe-core` at runtime.
+      - name: Install the smoke harness dependencies
+        shell: bash
+        run: |
+          echo "==> cd vscode/test/automation && npm ci"
+          cd vscode/test/automation
+          npm ci --no-audit --no-fund
+          echo "==> cd vscode/test/smoke && npm ci"
+          cd ../smoke
+          npm ci --no-audit --no-fund
+
       - name: Compile the smoke harness
         shell: bash
         run: |

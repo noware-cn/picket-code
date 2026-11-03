@@ -66,7 +66,7 @@ jobs:
   # ---- release gate ---------------------------------------------------------------------
   # Both jobs reuse the standalone workflows, so a release runs exactly what a PR runs.
   tests:
-    name: "Tests (contract + L1 + L2)"
+    name: "Tests (contract + L1 + L2 + L3)"
     needs: versions
     uses: ./.github/workflows/tests.yml
     with:
@@ -331,8 +331,9 @@ jobs:
           cat artifacts/SHA256SUMS-* > "artifacts/picket-code-${{ github.ref_name }}-SHA256SUMS"
           cat "artifacts/picket-code-${{ github.ref_name }}-SHA256SUMS"
 
-      # The JUnit XML from the gate jobs, merged into one directory: L1/L2 from
-      # tests.yml (test-results-unit, test-results-acp-process), L4 from tests-ui.yml.
+      # The JUnit XML from the gate jobs, merged into one directory: L1/L2/L3 from
+      # tests.yml (test-results-unit, test-results-acp-process, test-results-host-e2e),
+      # L4 from tests-ui.yml.
       - name: Download the test reports (L1–L4)
         uses: actions/download-artifact@v8
         with:
