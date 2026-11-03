@@ -438,10 +438,10 @@ index 00000000..4393d9d2
 +}
 diff --git a/src/vs/platform/agentHost/node/icode/icodeAgent.ts b/src/vs/platform/agentHost/node/icode/icodeAgent.ts
 new file mode 100644
-index 00000000..44221402
+index 00000000..14f98c19
 --- /dev/null
 +++ b/src/vs/platform/agentHost/node/icode/icodeAgent.ts
-@@ -0,0 +1,862 @@
+@@ -0,0 +1,869 @@
 +/*---------------------------------------------------------------------------------------------
 + *  Copyright (c) Microsoft Corporation. All rights reserved.
 + *  Licensed under the MIT License. See License.txt in the project root for license information.
@@ -468,6 +468,7 @@ index 00000000..44221402
 +	type IAgentChatContext,
 +	type IAgentChatDataChange,
 +	type IAgentChatMetadata,
++	type IAgentChatMetadataOptions,
 +	type IAgentChats,
 +	type IAgentCreateChatOptions,
 +	type IAgentCreateChatResult,
@@ -795,10 +796,16 @@ index 00000000..44221402
 +		return [];
 +	}
 +
-+	async getChatMetadata(chat: URI, _context: URI | IAgentChatContext, providerData?: string): Promise<IAgentChatMetadata | undefined> {
++	async getChatMetadata(chat: URI, _context: URI | IAgentChatContext, providerData?: string, options?: IAgentChatMetadataOptions): Promise<IAgentChatMetadata | undefined> {
 +		const data = decodeIcodeProviderData(providerData);
++		// A chat without provider data either predates it or lost it; answering
++		// with a miss would make the host report the session as unavailable, so
++		// describe it from the host's own timestamps and let `materializeChat`
++		// start from an empty history instead.
 +		if (!data) {
-+			return undefined;
++			const fallback = options?.registryFallback;
++			const timestamp = fallback?.startTime ?? Date.now();
++			return { chat, startTime: timestamp, modifiedTime: fallback?.modifiedTime ?? timestamp };
 +		}
 +		return {
 +			chat,
@@ -2848,10 +2855,10 @@ index 00000000..d34e4c39
 +});
 diff --git a/src/vs/platform/agentHost/test/node/icode/icodeAgent.test.ts b/src/vs/platform/agentHost/test/node/icode/icodeAgent.test.ts
 new file mode 100644
-index 00000000..3dc0161c
+index 00000000..8841fb00
 --- /dev/null
 +++ b/src/vs/platform/agentHost/test/node/icode/icodeAgent.test.ts
-@@ -0,0 +1,563 @@
+@@ -0,0 +1,568 @@
 +/*---------------------------------------------------------------------------------------------
 + *  Copyright (c) Microsoft Corporation. All rights reserved.
 + *  Licensed under the MIT License. See License.txt in the project root for license information.
@@ -3163,11 +3170,16 @@ index 00000000..3dc0161c
 +		agent.dispose();
 +	});
 +
-+	test('getChatMetadata returns undefined without providerData and reports the persisted cwd otherwise', async () => {
++	test('getChatMetadata describes a chat without providerData and reports the persisted cwd otherwise', async () => {
 +		const client = new FakeIcodeClient();
 +		const agent = new IcodeAgent(new NullLogService(), () => client);
 +
-+		assert.strictEqual(await agent.getChatMetadata(restoredChat, chat, undefined), undefined);
++		// Without provider data the chat must still open: a miss would make the
++		// host report the session as unavailable.
++		const withoutData = await agent.getChatMetadata(restoredChat, chat, undefined, { registryFallback: { startTime: 42, modifiedTime: 43 } });
++		assert.strictEqual(withoutData?.startTime, 42);
++		assert.strictEqual(withoutData?.modifiedTime, 43);
++		assert.strictEqual(withoutData?.workingDirectories, undefined);
 +		const metadata = await agent.getChatMetadata(restoredChat, chat, providerData('sess-1'));
 +		assert.strictEqual(metadata?.startTime, 1);
 +		assert.deepStrictEqual(metadata?.workingDirectories?.map(u => u.fsPath), [RESTORED_CWD]);
