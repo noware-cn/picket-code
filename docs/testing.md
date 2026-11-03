@@ -10,7 +10,7 @@
 |---|---|---|---|---|
 | L1 单元 | 纯函数、reducer、映射、配置解析（现有 74 个 iCode 用例 + changeset 332 个） | `out/`（transpile 即可），无显示 | ✅ 完全 | 2–4 min（含 build scripts） |
 | L2 进程集成 | **真实 `icode acp` 协议边界**：我们的 `createIcodeTransport`/`IcodeAcpClient` 与一个**假 ACP CLI**（真进程、真 stdio、真 NDJSON） | 同上 + Node | ✅ 完全 | 1–2 min |
-| L3 宿主端到端 | 真实 agent host 进程（`agentHostServerMain.js`）+ 真实 provider + 假 ACP CLI，**AHP over WebSocket**：建会话、发消息、收到 `ChatDelta`/工具调用、恢复、审批、取消 | 同上 + `ws` | ✅ 完全（不需要 Electron/X） | 3–6 min |
+| L3 宿主端到端 | 真实 agent host 进程（`agentHostServerMain.js`）+ 真实 provider + 假 ACP CLI，**AHP over WebSocket**：建会话、发消息、收到 `ChatDelta`/工具调用、恢复、审批、取消 | 同上 + `ws` | ✅ 完全（不需要 Electron/X） | 8 个用例 ~13s + 复用 build 缓存 |
 | L4 UI 冒烟 | 真实 Electron 窗口 + Agents Window + 聊天面板：文本渲染、diff 视图、ask_user 表单、审批横幅、重启后历史回填 | 完整编译（gulp 全套 + 扩展）+ Electron 二进制 + **Xvfb** | ✅ 可以做，代价 ~35–45 min | 见 §4.3 |
 | L5 打包产物 | 安装包启动、asar 布局、无 Copilot 残留、真实窗口在 Xvfb 下启动 | 打包产物 | ✅ 已存在（`verify-release.yml`） | 8–15 min |
 | L6 真实模型质量 | iCode 回复内容是否合理、真实模型调用、Windows 真机 `.cmd` 启动 | 真模型、真 Windows | ❌ 不能自动化（无凭据、非确定性、成本不可控） | 人工 |
@@ -41,6 +41,7 @@
 | `cancel` | 收到 `session/cancel` 后回 `stopReason: cancelled` | 打断不被当成错误 |
 | `slow` | 每 200ms 一条 chunk，共 50 条 | 流式不丢、背压 |
 | `restore` | `session/load` 回放 3 条历史 update 后回 result | 历史回填顺序 |
+| `restore-user` | 同 `restore`，但在回放前先发一条 `user_message_chunk` | provider 历史能拼出完整回合（L3 恢复用例） |
 | `restore-fail` | `session/load` 回 JSON-RPC error `-32000` | 恢复失败降级（丢弃种子、下次重建） |
 | `crash` | prompt 中途 `process.exit(1)`（不写 result） | turn 以错误结束、不挂起、`_activePrompts` 释放 |
 | `garbage` | 先打印一行非 JSON、再打印一行 5MB 超长 JSON | 解析健壮、`MAX_LINE_LENGTH` 守卫 |
@@ -48,18 +49,23 @@
 
 **用例（新增 `icodeAcpProcess.test.ts`）**：spawn 真进程 → 断言 id 分配、`session/cancel` 后 `stopReason`、进程被杀后 pending 请求全部 reject、stderr 进日志、`crash` 后 `exited=true` 且后续请求立即失败。
 
-### L3 宿主端到端：AHP over WebSocket（新增）
+### L3 宿主端到端：AHP over WebSocket（已实现）
 
-`vscode/test/node/e2e/icodeAgentHostE2E.integrationTest.ts`（同 `test-node` 运行，无需 Electron）：
+`vscode/src/vs/platform/agentHost/test/node/icode/icodeAgentHostE2E.test.ts`（`npm run test-node` / `run-unit-junit.mjs` 直跑，**8 个用例**，无需 Electron/X；Windows 上整层 `skip` 并打印原因——假 CLI 是直接 spawn 的 `.mjs`，不是 Windows 真实的 `.cmd` 启动路径）：
 
-1. `startHost({ PICKET_ICODE_BIN: <fake>, PICKET_ICODE_AGENT_ENABLED: '1' })` → `READY:<port>`；
-2. `session/new` → 断言出现的 provider 列表含 `icode`，模型目录 = 假服务器上报的两个；
-3. **一轮对话**：`createSession`/`sendMessage` → 断言 `ChatDelta` 文本、`ChatToolCallStart/Ready/Complete`、`ChatTurnComplete`；
-4. **审批**：`permission` 场景 → 断言 `pending_confirmation` → `respondToPermissionRequest(approve)` → 回合继续；
-5. **ask_user**：`ask` 场景 → 断言 `ChatInputRequested` → 回答 → 回合继续；
-6. **取消**：`slow` + `cancel` → 断言 `ChatTurnCancelled`；
-7. **恢复**：`providerData` 落库后重启 host → `session/load` 被调用，历史条数与 `restore` 场景一致；
-8. **崩溃**：`crash` → 断言收到错误信号、host 不挂、下一轮能重新起进程。
+- **驱动方式**：`before each` spawn `node out/vs/platform/agentHost/node/agentHostServerMain.js --port 0 --without-connection-token --quiet --user-data-dir <tmp>`，env 带 `PICKET_ICODE_BIN=<fake>`、`PICKET_ICODE_AGENT_ENABLED=1`、`FAKE_ICODE_SCENARIO=<按用例>`，从 stdout 读 `READY:<port>` 后连一个手写的 `ws` AHP 客户端（`TestProtocolClient` 会拖进 Electron 依赖，故不用）。场景是子进程启动时读的，所以每个用例起一个 host（~1s）。收尾先关 stdin 让 host 优雅退出，再 `kill(-pid)` 收掉进程组，并断言子进程确实消失。
+- **断言对象全是 AHP 报文**：`action` 通知里的 `root/agentsChanged`、`session/ready`、`chat/turnStarted|delta|responsePart|toolCallStart|toolCallReady|toolCallComplete|turnComplete|turnCancelled|error|inputRequested`，以及 `subscribe` 回来的会话/聊天快照。权限、ask_user、取消都是客户端动作：`chat/toolCallConfirmed`、`chat/inputCompleted`、`chat/turnCancelled`（AHP 没有 `respondToPermissionRequest` 这类 RPC）。
+
+8 个用例：
+
+1. `--port 0` 启动后 root 快照的 `agents` 含 `provider: 'icode'`，有默认模型；
+2. 首个 `session/new` 后 `root/agentsChanged` 带出假服务器上报的两个模型（`fake-model-a/b`）；
+3. **一轮对话**：文本 chunk → 1 个 `chat/responsePart` + 3 个 `chat/delta`（`fake-fake-fake-`），工具调用 `chat/toolCallStart`（`tc-1`/`shell`）→ `chat/toolCallReady`（`confirmed: not-needed`）→ `chat/toolCallComplete`（`success: true`），最后 `chat/turnComplete`，快照里 1 个 `complete` 回合、无 `activeTurn`；
+4. **审批**：`permission` 场景 → `chat/toolCallReady`（无 `confirmed`、有 `confirmationTitle`）→ 客户端发 `chat/toolCallConfirmed(approved)` → `chat/toolCallComplete(success)`；
+5. **ask_user**：`ask` 场景 → `chat/inputRequested`（`req-1`、问题 id `req-1:0`、选项 `A/B`）→ 客户端发 `chat/inputCompleted` → 回合继续并 `chat/turnComplete`；
+6. **取消**：`cancel` 场景 → 出现首个 chunk 后发 `chat/turnCancelled` → `chat/turnCancelled`，500ms 内不再有 `turnComplete`/`error`，快照里 `activeTurn` 消失、回合为 `cancelled`；
+7. **恢复**：临时目录同时作为 `--user-data-dir` 与工作目录，跑一轮后重启 host，仅凭会话 URI `subscribe` 就能恢复；`provider: 'icode'`、`defaultChat` 不变，假 CLI 在**持久化的 cwd** 里被重新拉起并收到 `session/load`（`FAKE_ICODE_CWD_FILE` 作证），聊天快照回放出 `restore-user` 场景的历史（用户消息 + 文本 + `tc-history` 工具调用）；
+8. **崩溃**：`crash` 场景 → `chat/error`（`errorType: sendFailed|icodeExited`）结束回合，host 仍在（`listSessions` 照常回答），下一轮重新拉起 CLI 再流式输出 `partial` 后同样报错。
 
 ### L4 UI 冒烟（新增 `test/smoke/src/areas/agentsWindow/icode.test.ts`）
 
@@ -122,7 +128,7 @@ L4 追加：`xvfb libnss3 libxss1 libatk-bridge2.0-0 libgtk-3-0 libasound2t64 li
 | L1 | icode (7) | 74 | 74 | 0 | 0 | 12s |
 | L1 | changeset (4) | 478 | 478 | 0 | 0 | 41s |
 | L2 | acp-process | 12 | 12 | 0 | 0 | 38s |
-| L3 | agent-host e2e | 8 | 8 | 0 | 0 | 94s |
+| L3 | host-e2e | 8 | 8 | 0 | 0 | 12s |
 | L4 | agents-window ui | 6 | 6 | 0 | 0 | 21m |
 ```
 

@@ -105,10 +105,10 @@ index 6fc58640..af031ba1 100644
  	// edge-based, so this periodic tick is the only thing that notices a model
 diff --git a/src/vs/platform/agentHost/node/icode/icodeAcpClient.ts b/src/vs/platform/agentHost/node/icode/icodeAcpClient.ts
 new file mode 100644
-index 00000000..4393d9d2
+index 00000000..7febc833
 --- /dev/null
 +++ b/src/vs/platform/agentHost/node/icode/icodeAcpClient.ts
-@@ -0,0 +1,327 @@
+@@ -0,0 +1,344 @@
 +/*---------------------------------------------------------------------------------------------
 + *  Copyright (c) Microsoft Corporation. All rights reserved.
 + *  Licensed under the MIT License. See License.txt in the project root for license information.
@@ -116,7 +116,7 @@ index 00000000..4393d9d2
 +
 +import { isThenable } from '../../../../base/common/async.js';
 +import { CancellationToken } from '../../../../base/common/cancellation.js';
-+import { BugIndicatingError } from '../../../../base/common/errors.js';
++import { BugIndicatingError, canceledName } from '../../../../base/common/errors.js';
 +import { Emitter, Event } from '../../../../base/common/event.js';
 +import { IJsonRpcNotification, IJsonRpcRequest, JsonRpcError, JsonRpcId, JsonRpcMessage, JsonRpcProtocol } from '../../../../base/common/jsonRpcProtocol.js';
 +import { DisposableStore, IDisposable, toDisposable } from '../../../../base/common/lifecycle.js';
@@ -277,11 +277,28 @@ index 00000000..4393d9d2
 +			return Promise.reject(new Error(`[IcodeAcpClient] cannot send request '${method}': ${unavailable}`));
 +		}
 +
-+		return this._protocol.sendRequest<R>(
++		const pending = this._protocol.sendRequest<R>(
 +			{ method, params },
 +			token,
 +			id => this._protocol.sendNotification({ method: CANCEL_REQUEST_METHOD, params: { requestId: id } }),
 +		);
++		// An exit cancels whatever is still in flight, which the layers above read
++		// as "the user aborted". Report the exit instead so the chat shows why the
++		// turn stopped; a real cancellation never reaches this path (we are alive).
++		return pending.catch(error => {
++			// `cancelAllRequests` wraps the reason, so the message arrives as
++			// `Canceled: Canceled` and `isCancellationError` does not recognise it.
++			const cancelled = error instanceof Error && (error.name === canceledName || error.message.startsWith(canceledName));
++			// stdout ending cancels pending requests before the transport reports the
++			// exit, so both states mean "this request can never be answered".
++			if (cancelled && (this._exited || this._stdoutClosed)) {
++				const reason = this._exited
++					? `iCode exited (${this._exitCode === null ? 'no exit code' : `code ${this._exitCode}`})`
++					: 'iCode closed its output';
++				throw new Error(`${reason} while '${method}' was in flight`, { cause: error });
++			}
++			throw error;
++		});
 +	}
 +
 +	notify(method: string, params?: IcodeJsonValue): void {
@@ -438,10 +455,10 @@ index 00000000..4393d9d2
 +}
 diff --git a/src/vs/platform/agentHost/node/icode/icodeAgent.ts b/src/vs/platform/agentHost/node/icode/icodeAgent.ts
 new file mode 100644
-index 00000000..21a7c875
+index 00000000..ab511f9a
 --- /dev/null
 +++ b/src/vs/platform/agentHost/node/icode/icodeAgent.ts
-@@ -0,0 +1,902 @@
+@@ -0,0 +1,971 @@
 +/*---------------------------------------------------------------------------------------------
 + *  Copyright (c) Microsoft Corporation. All rights reserved.
 + *  Licensed under the MIT License. See License.txt in the project root for license information.
@@ -491,8 +508,12 @@ index 00000000..21a7c875
 +import { createIcodeTurnState, mapAcpNotification, mapAcpPermissionRequest, mapAcpSessionUpdate, type IcodePermissionRequest, type IcodeSessionUpdate, type IIcodeTurnState } from './icodeMapEvents.js';
 +import { decodeIcodeProviderData, encodeIcodeProviderData } from './icodeProviderData.js';
 +
-+/** Creates the ACP client; async because resolving the executable touches the file system. */
-+export type IcodeClientFactory = () => IIcodeAcpClient | undefined | Promise<IIcodeAcpClient | undefined>;
++/**
++ * Creates the ACP client for one working directory; async because resolving the
++ * executable touches the file system. The directory is what the CLI has to be
++ * spawned *in*, so the process (not only the session) belongs to that folder.
++ */
++export type IcodeClientFactory = (cwd: string) => IIcodeAcpClient | undefined | Promise<IIcodeAcpClient | undefined>;
 +
 +/** The subset of `session/prompt`'s result this agent reads. */
 +interface IIcodePromptResult {
@@ -518,6 +539,21 @@ index 00000000..21a7c875
 +interface IIcodeSession {
 +	readonly sessionId: string;
 +	readonly cwd: string;
++}
++
++/**
++ * One `icode acp` process and the state that belongs to it.
++ *
++ * ACP session ids are only unique inside one process, so session routing is
++ * kept per process instead of in an agent-wide table.
++ */
++interface IIcodeClientEntry {
++	readonly cwd: string;
++	readonly client: IIcodeAcpClient;
++	/** Subscriptions on this process; disposed when it is replaced or gone. */
++	readonly store: DisposableStore;
++	/** ACP session id to chat, for `session/update` and the reverse requests. */
++	readonly chatsBySessionId: Map<string, URI>;
 +}
 +
 +/** A chat this agent has been told about; recorded for diagnostics only. */
@@ -582,8 +618,12 @@ index 00000000..21a7c875
 +/**
 + * Agent host provider backed by iCode's Agent Client Protocol server.
 + *
-+ * One ACP subprocess serves every chat; sessions are created lazily per chat
-+ * and reused while the chat's working directory stays the same.
++ * One `icode acp` subprocess per working directory: a process, like the CLI's
++ * relative paths and the tools it runs, belongs to the folder it was started
++ * in, so chats that share a directory share a process and a chat in another
++ * directory gets its own. ACP already routes concurrent turns by session id,
++ * so the processes turn independently. Sessions are created lazily per chat and
++ * reused while the chat's working directory stays the same.
 + */
 +export class IcodeAgent extends Disposable implements IAgent {
 +
@@ -608,8 +648,6 @@ index 00000000..21a7c875
 +
 +	private readonly _chats = new Map<string, IIcodeChatRecord>();
 +	private readonly _sessions = new Map<string, IIcodeSession>();
-+	/** ACP session id back to the chat it belongs to, for `session/update` routing. */
-+	private readonly _chatsBySessionId = new Map<string, URI>();
 +	private readonly _turns = new Map<string, IIcodeTurnState>();
 +	/** Transcript rebuilt from the last `session/load`, keyed by chat. */
 +	private readonly _history = new Map<string, readonly Turn[]>();
@@ -628,15 +666,17 @@ index 00000000..21a7c875
 +
 +	private readonly _clientStore = this._register(new DisposableStore());
 +	private readonly _clientFactory: IcodeClientFactory;
-+	private _client: IIcodeAcpClient | undefined;
-+	private _clientCreation: Promise<IIcodeAcpClient> | undefined;
++	/** One process per working directory, keyed by the cwd it was spawned in. */
++	private readonly _clients = new Map<string, IIcodeClientEntry>();
++	/** Creations in flight, so two chats of one directory share a single spawn. */
++	private readonly _clientCreations = new Map<string, Promise<IIcodeClientEntry>>();
 +
 +	constructor(
 +		private readonly _logService: ILogService,
 +		clientFactory?: IcodeClientFactory,
 +	) {
 +		super();
-+		this._clientFactory = clientFactory ?? (() => this._createDefaultClient());
++		this._clientFactory = clientFactory ?? (cwd => this._createDefaultClient(cwd));
 +	}
 +
 +	// ---- Identity and catalog -----------------------------------------------
@@ -677,8 +717,8 @@ index 00000000..21a7c875
 +			this._turns.delete(chatKey);
 +			this._chats.delete(chatKey);
 +			// A pending approval can never be answered once its chat is gone.
-+			this._cancelPendingPermissions(chatKey);
-+			this._cancelPendingInputs(chatKey);
++			this._cancelPendingPermissions(key => key === chatKey);
++			this._cancelPendingInputs(key => key === chatKey);
 +			// A replay still streaming for this chat must not be buffered any further.
 +			if (this._replay?.chatKey === chatKey) {
 +				this._replay = undefined;
@@ -689,12 +729,14 @@ index 00000000..21a7c875
 +				return;
 +			}
 +			this._sessions.delete(chatKey);
-+			this._chatsBySessionId.delete(session.sessionId);
-+			if (!this._client) {
++			// The process that owns the session is the one spawned for its cwd.
++			const entry = this._clients.get(session.cwd);
++			entry?.chatsBySessionId.delete(session.sessionId);
++			if (!entry) {
 +				return;
 +			}
 +			try {
-+				await this._client.request('session/close', { sessionId: session.sessionId });
++				await entry.client.request('session/close', { sessionId: session.sessionId });
 +			} catch (error) {
 +				this._logService.warn(`[icode] failed to close session ${session.sessionId}: ${error instanceof Error ? error.message : String(error)}`);
 +			}
@@ -718,22 +760,23 @@ index 00000000..21a7c875
 +			const chatKey = chat.toString();
 +			// iCode waits on an `ask_user` request until it is answered, so a
 +			// cancelled turn has to settle them before the session is stopped.
-+			this._cancelPendingInputs(chatKey);
++			this._cancelPendingInputs(key => key === chatKey);
 +			const session = this._sessions.get(chatKey);
-+			if (!session || !this._client) {
++			const entry = session && this._clients.get(session.cwd);
++			if (!session || !entry) {
 +				this._logService.trace(`[icode] abort ignored: no live session for ${chatKey}`);
 +				return Promise.resolve();
 +			}
 +			// The host already marked the turn cancelled and told the reducer, so
 +			// firing a completion event here would complete the same turn twice.
-+			this._client.notify('session/cancel', { sessionId: session.sessionId });
++			entry.client.notify('session/cancel', { sessionId: session.sessionId });
 +			return Promise.resolve();
 +		},
 +		changeModel: async (chat: URI, model: ModelSelection, _context: AgentChatOperationContext): Promise<void> => {
 +			const chatKey = chat.toString();
 +			const session = this._sessions.get(chatKey);
-+			const client = this._client;
-+			if (!session || !client) {
++			const entry = session && this._clients.get(session.cwd);
++			if (!session || !entry) {
 +				// The picker is reachable before the chat's first turn, and iCode
 +				// binds a model per session: there is nothing to switch yet.
 +				this._logService.warn(`[icode] iCode needs an active session before switching models (chat: ${chatKey})`);
@@ -747,7 +790,7 @@ index 00000000..21a7c875
 +				return;
 +			}
 +			try {
-+				await client.request('session/set_model', { sessionId: session.sessionId, modelId: model.id });
++				await entry.client.request('session/set_model', { sessionId: session.sessionId, modelId: model.id });
 +			} catch (error) {
 +				// Switching models is a picker affordance: a rejected switch is
 +				// logged and swallowed so it can never break the chat.
@@ -772,14 +815,15 @@ index 00000000..21a7c875
 +		// Seed the session before loading: iCode replays the session's updates
 +		// while `session/load` is still in flight, and they have to be routed.
 +		this._sessions.set(chatKey, { sessionId: data.sessionId, cwd: data.cwd });
-+		this._chatsBySessionId.set(data.sessionId, chat);
 +		this._announcedChats.add(chatKey);
 +
 +		const replay = { sessionId: data.sessionId, chatKey, updates: [] as IcodeSessionUpdate[] };
 +		this._replay = replay;
 +		try {
-+			const client = await this._ensureClient();
-+			await client.request('session/load', { sessionId: data.sessionId, cwd: data.cwd, mcpServers: [] });
++			// The session lives in the process of the directory it was created in.
++			const entry = await this._ensureClient(data.cwd);
++			entry.chatsBySessionId.set(data.sessionId, chat);
++			await entry.client.request('session/load', { sessionId: data.sessionId, cwd: data.cwd, mcpServers: [] });
 +			if (this._replay === replay) {
 +				this._history.set(chatKey, buildIcodeTurns(replay.updates));
 +			}
@@ -788,7 +832,7 @@ index 00000000..21a7c875
 +			// the next `sendMessage` starts a fresh session instead.
 +			this._logService.warn(`[icode] failed to reload session ${data.sessionId}: ${error instanceof Error ? error.message : String(error)}`);
 +			this._sessions.delete(chatKey);
-+			this._chatsBySessionId.delete(data.sessionId);
++			this._clients.get(data.cwd)?.chatsBySessionId.delete(data.sessionId);
 +			this._history.delete(chatKey);
 +		} finally {
 +			if (this._replay === replay) {
@@ -901,11 +945,11 @@ index 00000000..21a7c875
 +	// ---- Provider lifecycle --------------------------------------------------
 +
 +	async shutdown(): Promise<void> {
-+		this._disposeClient();
++		this._disposeClients();
 +	}
 +
 +	override dispose(): void {
-+		this._disposeClient();
++		this._disposeClients();
 +		super.dispose();
 +	}
 +
@@ -952,8 +996,11 @@ index 00000000..21a7c875
 +	}
 +
 +	private async _runTurn(chat: URI, chatKey: string, prompt: string, cwd: string, turnId: string): Promise<void> {
-+		const client = await this._ensureClient();
-+		const sessionId = await this._ensureSession(client, chat, chatKey, cwd);
++		// The turn runs in the process spawned for its own directory, so two chats
++		// in different folders never share a queue and never share a cwd.
++		const entry = await this._ensureClient(cwd);
++		const client = entry.client;
++		const sessionId = await this._ensureSession(entry, chat, chatKey, cwd);
 +		this._announceSession(chat, chatKey, sessionId, cwd);
 +		const state = createIcodeTurnState(turnId);
 +		this._turns.set(chatKey, state);
@@ -1022,19 +1069,19 @@ index 00000000..21a7c875
 +		});
 +	}
 +
-+	private async _ensureSession(client: IIcodeAcpClient, chat: URI, chatKey: string, cwd: string): Promise<string> {
++	private async _ensureSession(entry: IIcodeClientEntry, chat: URI, chatKey: string, cwd: string): Promise<string> {
 +		const cached = this._sessions.get(chatKey);
 +		if (cached && cached.cwd === cwd) {
-+			this._chatsBySessionId.set(cached.sessionId, chat);
++			entry.chatsBySessionId.set(cached.sessionId, chat);
 +			return cached.sessionId;
 +		}
 +
 +		if (cached) {
-+			this._chatsBySessionId.delete(cached.sessionId);
++			this._clients.get(cached.cwd)?.chatsBySessionId.delete(cached.sessionId);
 +			this._sessions.delete(chatKey);
 +		}
 +
-+		const result = await client.request<IIcodeSessionNewResult>('session/new', { cwd, mcpServers: [] });
++		const result = await entry.client.request<IIcodeSessionNewResult>('session/new', { cwd, mcpServers: [] });
 +		const sessionId = typeof result?.sessionId === 'string' ? result.sessionId : undefined;
 +		if (!sessionId) {
 +			throw new Error('iCode did not return a session id from session/new');
@@ -1042,7 +1089,7 @@ index 00000000..21a7c875
 +
 +		this._publishModels(result?.models);
 +		this._sessions.set(chatKey, { sessionId, cwd });
-+		this._chatsBySessionId.set(sessionId, chat);
++		entry.chatsBySessionId.set(sessionId, chat);
 +		return sessionId;
 +	}
 +
@@ -1072,44 +1119,56 @@ index 00000000..21a7c875
 +
 +	// ---- ACP client lifecycle and routing ------------------------------------
 +
-+	private _ensureClient(): Promise<IIcodeAcpClient> {
-+		if (this._client) {
-+			return Promise.resolve(this._client);
++	private _ensureClient(cwd: string): Promise<IIcodeClientEntry> {
++		const existing = this._clients.get(cwd);
++		if (existing) {
++			return Promise.resolve(existing);
 +		}
-+		if (!this._clientCreation) {
-+			this._clientCreation = this._createAndWireClient().finally(() => {
-+				this._clientCreation = undefined;
++		let creation = this._clientCreations.get(cwd);
++		if (!creation) {
++			creation = this._createAndWireClient(cwd).finally(() => {
++				if (this._clientCreations.get(cwd) === creation) {
++					this._clientCreations.delete(cwd);
++				}
 +			});
++			this._clientCreations.set(cwd, creation);
 +		}
-+		return this._clientCreation;
++		return creation;
 +	}
 +
-+	private async _createAndWireClient(): Promise<IIcodeAcpClient> {
-+		const client = await this._clientFactory();
++	private async _createAndWireClient(cwd: string): Promise<IIcodeClientEntry> {
++		const client = await this._clientFactory(cwd);
 +		if (!client) {
 +			throw new Error('iCode executable not found: set PICKET_ICODE_BIN or put icode on PATH');
 +		}
 +
-+		this._clientStore.clear();
-+		this._clientStore.add(client.onNotification('session/update', params => this._handleSessionUpdate(params)));
-+		for (const name of ICODE_ACTIVITY_NOTIFICATIONS) {
-+			this._clientStore.add(client.onNotification(name, params => this._handleActivityNotification(name, params)));
-+		}
-+		this._clientStore.add(client.onRequest('session/request_permission', params => this._onPermissionRequest(params)));
-+		this._clientStore.add(client.onRequest('_chrys/request_input', params => this._onInputRequest(params)));
-+		this._clientStore.add(client.onExit(code => this._handleClientExit(client, code)));
++		// Register before subscribing: an exit that fires during wiring must find
++		// the entry and drop it, instead of leaving a dead process behind.
++		const entry: IIcodeClientEntry = { cwd, client, store: new DisposableStore(), chatsBySessionId: new Map() };
++		this._clients.set(cwd, entry);
++		this._clientStore.add(entry.store);
 +
-+		this._client = client;
-+		return client;
++		entry.store.add(client.onNotification('session/update', params => this._handleSessionUpdate(entry, params)));
++		for (const name of ICODE_ACTIVITY_NOTIFICATIONS) {
++			entry.store.add(client.onNotification(name, params => this._handleActivityNotification(entry, name, params)));
++		}
++		entry.store.add(client.onRequest('session/request_permission', params => this._onPermissionRequest(entry, params)));
++		entry.store.add(client.onRequest('_chrys/request_input', params => this._onInputRequest(entry, params)));
++		entry.store.add(client.onExit(code => this._handleClientExit(entry, code)));
++
++		return entry;
 +	}
 +
-+	private async _createDefaultClient(): Promise<IIcodeAcpClient | undefined> {
++	private async _createDefaultClient(cwd: string): Promise<IIcodeAcpClient | undefined> {
 +		const resolution = await resolveIcodeCommand(process.env, path => existsSync(path));
 +		if (!('command' in resolution)) {
 +			this._logService.warn(`[icode] could not resolve the icode executable (${resolution.reason})`);
 +			return undefined;
 +		}
++		// Spawn in the session's directory: iCode and the tools it runs resolve
++		// process-relative paths against it, not against the host's own cwd.
 +		const transport = createIcodeTransport(resolution.command, {
++			cwd,
 +			log: message => this._logService.info(message),
 +		});
 +		return new IcodeAcpClient(transport, message => this._logService.trace(message));
@@ -1119,7 +1178,7 @@ index 00000000..21a7c875
 +	 * Turns one ACP permission request into a pending confirmation and parks a
 +	 * promise that `respondToPermissionRequest` settles.
 +	 */
-+	private _onPermissionRequest(params: unknown): Promise<IcodePermissionResponse> {
++	private _onPermissionRequest(entry: IIcodeClientEntry, params: unknown): Promise<IcodePermissionResponse> {
 +		const request = params as Partial<IcodePermissionRequest> | undefined;
 +		const sessionId = request?.sessionId;
 +		const toolCallId = request?.toolCall?.toolCallId;
@@ -1128,7 +1187,7 @@ index 00000000..21a7c875
 +			return Promise.resolve(CANCELLED_PERMISSION);
 +		}
 +
-+		const chat = this._chatsBySessionId.get(sessionId);
++		const chat = entry.chatsBySessionId.get(sessionId);
 +		const state = chat && this._turns.get(chat.toString());
 +		if (!chat || !state) {
 +			this._logService.trace(`[icode] auto-cancelling permission request for '${toolCallId}': no live turn for session '${sessionId}'`);
@@ -1157,10 +1216,11 @@ index 00000000..21a7c875
 +		pending.resolve(response);
 +	}
 +
-+	/** Cancel every pending approval, or only those of one chat. */
-+	private _cancelPendingPermissions(chatKey?: string): void {
++	/** Cancel every pending approval, or only those of the chats `match` selects. */
++	private _cancelPendingPermissions(match?: (chatKey: string) => boolean): void {
 +		for (const toolCallId of [...this._pendingPermissions.keys()]) {
-+			if (chatKey === undefined || this._pendingPermissions.get(toolCallId)?.chatKey === chatKey) {
++			const pending = this._pendingPermissions.get(toolCallId);
++			if (pending && (!match || match(pending.chatKey))) {
 +				this._settlePermission(toolCallId, CANCELLED_PERMISSION);
 +			}
 +		}
@@ -1175,7 +1235,7 @@ index 00000000..21a7c875
 +	 * nor one for a session that is no longer live may leave the subprocess
 +	 * waiting forever.
 +	 */
-+	private _onInputRequest(params: unknown): Promise<IIcodeInputReply> {
++	private _onInputRequest(entry: IIcodeClientEntry, params: unknown): Promise<IIcodeInputReply> {
 +		const request = params as Partial<IIcodeInputRequest> | undefined;
 +		const sessionId = request?.sessionId;
 +		const requestId = request?.requestId;
@@ -1185,7 +1245,7 @@ index 00000000..21a7c875
 +			return Promise.resolve(CANCELLED_INPUT_REPLY);
 +		}
 +
-+		const chat = this._chatsBySessionId.get(sessionId);
++		const chat = entry.chatsBySessionId.get(sessionId);
 +		const state = chat && this._turns.get(chat.toString());
 +		if (!chat || !state) {
 +			this._logService.warn(`[icode] auto-cancelling input request '${requestId}': no live turn for session '${sessionId}'`);
@@ -1217,35 +1277,59 @@ index 00000000..21a7c875
 +		pending.resolve(toIcodeInputReply(pending.questions, ChatInputResponseKind.Cancel, undefined));
 +	}
 +
-+	/** Cancel every pending input request, or only those of one chat. */
-+	private _cancelPendingInputs(chatKey?: string): void {
++	/** Cancel every pending input request, or only those of the chats `match` selects. */
++	private _cancelPendingInputs(match?: (chatKey: string) => boolean): void {
 +		for (const requestId of [...this._pendingInputs.keys()]) {
-+			if (chatKey === undefined || this._pendingInputs.get(requestId)?.chatKey === chatKey) {
++			const pending = this._pendingInputs.get(requestId);
++			if (pending && (!match || match(pending.chatKey))) {
 +				this._cancelInput(requestId);
 +			}
 +		}
 +	}
 +
-+	private _handleClientExit(client: IIcodeAcpClient, code: number | null): void {
-+		this._logService.info(`[icode] icode exited (${code === null ? 'no exit code' : `code ${code}`})`);
-+		if (this._client !== client) {
++	/**
++	 * Forgets one dead process. Only the chats and sessions created in it are
++	 * dropped: every other directory keeps its process and its live turns.
++	 */
++	private _handleClientExit(entry: IIcodeClientEntry, code: number | null): void {
++		this._logService.info(`[icode] icode exited in ${entry.cwd} (${code === null ? 'no exit code' : `code ${code}`})`);
++		if (this._clients.get(entry.cwd) !== entry) {
 +			return;
 +		}
-+		// Forget the dead process so the next turn spawns a fresh one.
-+		this._client = undefined;
-+		this._sessions.clear();
-+		this._chatsBySessionId.clear();
-+		this._turns.clear();
-+		// Nothing more will be replayed into an in-flight load.
-+		this._replay = undefined;
-+		this._cancelPendingPermissions();
-+		this._cancelPendingInputs();
++
++		// Forget the dead process so the next turn in this directory spawns a
++		// fresh one, and release its subscriptions with it.
++		this._clients.delete(entry.cwd);
++		this._clientStore.delete(entry.store);
++		entry.store.dispose();
++
++		const chatKeys = new Set<string>();
++		const sessionIds = new Set<string>();
++		for (const [sessionId, chat] of entry.chatsBySessionId) {
++			sessionIds.add(sessionId);
++			const chatKey = chat.toString();
++			chatKeys.add(chatKey);
++			if (this._sessions.get(chatKey)?.sessionId === sessionId) {
++				this._sessions.delete(chatKey);
++			}
++			this._turns.delete(chatKey);
++		}
++		entry.chatsBySessionId.clear();
++
++		// Nothing more will be replayed into an in-flight load of this process.
++		if (this._replay && sessionIds.has(this._replay.sessionId)) {
++			this._replay = undefined;
++		}
++		this._cancelPendingPermissions(chatKey => chatKeys.has(chatKey));
++		this._cancelPendingInputs(chatKey => chatKeys.has(chatKey));
 +
 +		// A dead process rejects the in-flight `session/prompt` with a plain
 +		// cancellation, which the host would read as a user abort, so the exit has
 +		// to be reported here. `_runTurn` swallows the matching rejection.
-+		const liveTurns = [...this._liveTurns.entries()];
-+		this._liveTurns.clear();
++		const liveTurns = [...this._liveTurns.entries()].filter(([, turn]) => chatKeys.has(turn.chat.toString()));
++		for (const [turnId] of liveTurns) {
++			this._liveTurns.delete(turnId);
++		}
 +		for (const [turnId, { chat, startedAt }] of liveTurns) {
 +			const message = `iCode exited (${code === null ? 'no exit code' : `code ${code}`}) before the turn finished`;
 +			this._fireAction(chat, {
@@ -1257,7 +1341,7 @@ index 00000000..21a7c875
 +		}
 +	}
 +
-+	private _handleSessionUpdate(params: any): void {
++	private _handleSessionUpdate(entry: IIcodeClientEntry, params: any): void {
 +		const sessionId: unknown = params?.sessionId;
 +		const update: unknown = params?.update;
 +		if (typeof sessionId !== 'string' || typeof update !== 'object' || update === null) {
@@ -1273,7 +1357,7 @@ index 00000000..21a7c875
 +			return;
 +		}
 +
-+		const chat = this._chatsBySessionId.get(sessionId);
++		const chat = entry.chatsBySessionId.get(sessionId);
 +		if (!chat) {
 +			this._logService.trace(`[icode] ignoring session/update for unknown session '${sessionId}'`);
 +			return;
@@ -1302,14 +1386,14 @@ index 00000000..21a7c875
 +	 * its ACP session. These are best-effort hints: an unknown session or a turn
 +	 * that already ended only leaves a trace, never an error or a signal.
 +	 */
-+	private _handleActivityNotification(name: string, params: unknown): void {
++	private _handleActivityNotification(entry: IIcodeClientEntry, name: string, params: unknown): void {
 +		const sessionId = (params as { readonly sessionId?: unknown } | undefined)?.sessionId;
 +		if (typeof sessionId !== 'string') {
 +			this._logService.trace(`[icode] ignoring ${name} without a session id: ${JSON.stringify(params ?? null).slice(0, 512)}`);
 +			return;
 +		}
 +
-+		const chat = this._chatsBySessionId.get(sessionId);
++		const chat = entry.chatsBySessionId.get(sessionId);
 +		if (!chat) {
 +			this._logService.trace(`[icode] ignoring ${name} for unknown session '${sessionId}'`);
 +			return;
@@ -1330,18 +1414,20 @@ index 00000000..21a7c875
 +		}
 +	}
 +
-+	private _disposeClient(): void {
-+		this._clientStore.clear();
++	private _disposeClients(): void {
 +		this._cancelPendingPermissions();
 +		this._cancelPendingInputs();
-+		const client = this._client;
-+		this._client = undefined;
-+		this._clientCreation = undefined;
++		const clients = [...this._clients.values()].map(entry => entry.client);
++		this._clients.clear();
++		this._clientCreations.clear();
++		// Drop every handler first, so a kill cannot re-enter this agent.
++		this._clientStore.clear();
 +		this._sessions.clear();
-+		this._chatsBySessionId.clear();
 +		this._turns.clear();
 +		this._replay = undefined;
-+		client?.dispose();
++		for (const client of clients) {
++			client.dispose();
++		}
 +	}
 +}
 diff --git a/src/vs/platform/agentHost/node/icode/icodeHistory.ts b/src/vs/platform/agentHost/node/icode/icodeHistory.ts
@@ -2502,10 +2588,10 @@ index 00000000..1a739e84
 +}
 diff --git a/src/vs/platform/agentHost/test/node/icode/icodeAcpClient.test.ts b/src/vs/platform/agentHost/test/node/icode/icodeAcpClient.test.ts
 new file mode 100644
-index 00000000..d34e4c39
+index 00000000..07b74cf6
 --- /dev/null
 +++ b/src/vs/platform/agentHost/test/node/icode/icodeAcpClient.test.ts
-@@ -0,0 +1,380 @@
+@@ -0,0 +1,382 @@
 +/*---------------------------------------------------------------------------------------------
 + *  Copyright (c) Microsoft Corporation. All rights reserved.
 + *  Licensed under the MIT License. See License.txt in the project root for license information.
@@ -2777,7 +2863,7 @@ index 00000000..d34e4c39
 +
 +		transport.exit(null);
 +
-+		await assert.rejects(pending, CancellationError);
++		await assert.rejects(pending, /iCode exited \(no exit code\) while 'session\/new' was in flight/);
 +		assert.strictEqual(client.exited, true);
 +		assert.strictEqual(client.exitCode, null);
 +		await assert.rejects(client.request('session/new'), /exited/);
@@ -2796,7 +2882,9 @@ index 00000000..d34e4c39
 +
 +		transport.fromServer.end();
 +
-+		await assert.rejects(pending, CancellationError);
++		// The pending request can never be answered; it must say so rather than
++		// surface as a user cancellation.
++		await assert.rejects(pending, /iCode closed its output while 'session\/new' was in flight/);
 +		assert.deepStrictEqual(exits, [], 'stdout end must not fire the exit event');
 +		assert.strictEqual(client.exited, false);
 +		await assert.rejects(client.request('session/new'), /stdout closed/);
@@ -2888,10 +2976,10 @@ index 00000000..d34e4c39
 +});
 diff --git a/src/vs/platform/agentHost/test/node/icode/icodeAcpProcess.test.ts b/src/vs/platform/agentHost/test/node/icode/icodeAcpProcess.test.ts
 new file mode 100644
-index 00000000..71bbedcb
+index 00000000..70b5683a
 --- /dev/null
 +++ b/src/vs/platform/agentHost/test/node/icode/icodeAcpProcess.test.ts
-@@ -0,0 +1,365 @@
+@@ -0,0 +1,441 @@
 +/*---------------------------------------------------------------------------------------------
 + *  Copyright (c) Microsoft Corporation. All rights reserved.
 + *  Licensed under the MIT License. See License.txt in the project root for license information.
@@ -2906,10 +2994,12 @@ index 00000000..71bbedcb
 +import { toDisposable } from '../../../../../base/common/lifecycle.js';
 +import { URI } from '../../../../../base/common/uri.js';
 +import { ensureNoDisposablesAreLeakedInTestSuite } from '../../../../../base/test/common/utils.js';
++import { NullLogService } from '../../../../log/common/log.js';
 +import type { AgentSignal, IAgentToolPendingConfirmationSignal } from '../../../common/agent.js';
 +import { ActionType } from '../../../common/state/sessionActions.js';
 +import { ChatInputAnswerState, ChatInputAnswerValueKind, ChatInputQuestionKind, ChatInputResponseKind, ToolCallStatus } from '../../../common/state/sessionState.js';
 +import { IcodeAcpClient, type IIcodeAcpTransport } from '../../../node/icode/icodeAcpClient.js';
++import { IcodeAgent } from '../../../node/icode/icodeAgent.js';
 +import { toChatInputRequest, toIcodeInputReply } from '../../../node/icode/icodeInputRequests.js';
 +import { createIcodeTransport, ICODE_BIN_ENV, resolveIcodeCommand } from '../../../node/icode/icodeLaunchConfig.js';
 +import { createIcodeTurnState, mapAcpPermissionRequest, mapAcpSessionUpdate } from '../../../node/icode/icodeMapEvents.js';
@@ -3194,6 +3284,15 @@ index 00000000..71bbedcb
 +		assert.ok(Date.now() - startedAt < 1000, 'a request after exit must not wait for a reply');
 +	});
 +
++	test('a crashed process rejects the in-flight prompt with an exit message, not a bare cancellation', async () => {
++		const fake = await startFake('crash');
++		const session = await newSession(fake);
++
++		// The host renders a plain cancellation as "the user aborted"; the exit has
++		// to reach it as a diagnostic error instead.
++		await assert.rejects(prompt(fake, session.sessionId), /iCode (exited \(code 1\)|closed its output) while 'session\/prompt' was in flight/);
++	});
++
 +	test('a non-JSON line and a line above MAX_LINE_LENGTH do not throw or hang', async () => {
 +		const fake = await startFake('garbage');
 +		const session = await newSession(fake);
@@ -3235,6 +3334,71 @@ index 00000000..71bbedcb
 +		assert.strictEqual(fake.cwd, directory);
 +	});
 +
++	test('one agent spawns a process per working directory, in it, and routes each chat to its own', async () => {
++		const dirA = mkdtempSync(join(tmpdir(), 'icode-agent-cwd-a-'));
++		const dirB = mkdtempSync(join(tmpdir(), 'icode-agent-cwd-b-'));
++		disposables.add(toDisposable(() => rmSync(dirA, { recursive: true, force: true })));
++		disposables.add(toDisposable(() => rmSync(dirB, { recursive: true, force: true })));
++		const cwdFileA = join(dirA, 'icode-cwd.txt');
++		const cwdFileB = join(dirB, 'icode-cwd.txt');
++
++		const resolution = await resolveIcodeCommand(
++			{ ...process.env, [ICODE_BIN_ENV]: process.execPath },
++			path => existsSync(path),
++		);
++		assert.ok('command' in resolution, `expected PICKET_ICODE_BIN to resolve, got ${JSON.stringify(resolution)}`);
++
++		const spawnedFor: string[] = [];
++		const agent = disposables.add(new IcodeAgent(new NullLogService(), cwd => {
++			spawnedFor.push(cwd);
++			const transport = createIcodeTransport(resolution.command, {
++				cwd,
++				// Both processes run the same scenario; each records the cwd Node
++				// gave it, which is what the CLI's own relative paths resolve against.
++				env: { ...process.env, FAKE_ICODE_SCENARIO: 'text', FAKE_ICODE_CWD_FILE: join(cwd, 'icode-cwd.txt') },
++				log: () => { /* transport diagnostics are irrelevant here */ },
++				spawnProcess: ((command: string, args: readonly string[], spawnOptions: SpawnOptions) => {
++					return spawn(command, [FIXTURE_PATH, ...args], spawnOptions);
++				}) as unknown as typeof spawn,
++			});
++			return new IcodeAcpClient(transport, () => { /* client diagnostics are irrelevant here */ });
++		}));
++
++		// Each chat keeps its own transcript, so a routing mistake shows up as
++		// another chat's chunks.
++		const chunks = new Map<string, string[]>();
++		const completions: string[] = [];
++		disposables.add(agent.onDidChatProgress(signal => {
++			if (signal.kind !== 'action') {
++				return;
++			}
++			const key = signal.resource.toString();
++			if (signal.action.type === ActionType.ChatDelta) {
++				chunks.set(key, [...(chunks.get(key) ?? []), signal.action.content]);
++			} else if (signal.action.type === ActionType.ChatTurnComplete) {
++				completions.push(key);
++			}
++		}));
++
++		const chatA = URI.parse('ahp-chat://test/folder-a');
++		const chatB = URI.parse('ahp-chat://test/folder-b');
++		await Promise.all([
++			agent.chats.sendMessage(chatA, 'in A', [URI.file(dirA)], [], 'turn-a'),
++			agent.chats.sendMessage(chatB, 'in B', [URI.file(dirB)], [], 'turn-b'),
++		]);
++
++		assert.deepStrictEqual(spawnedFor, [dirA, dirB]);
++		await waitUntil(() => existsSync(cwdFileA) && existsSync(cwdFileB), 'both fake CLIs to record their cwd');
++		assert.strictEqual(readFileSync(cwdFileA, 'utf8'), realpathSync(dirA));
++		assert.strictEqual(readFileSync(cwdFileB, 'utf8'), realpathSync(dirB));
++
++		// The two processes hand out the same session id (`fake-1`), so this only
++		// holds if routing is scoped per process rather than per session id.
++		assert.deepStrictEqual(chunks.get(chatA.toString()), ['fake-', 'fake-', 'fake-']);
++		assert.deepStrictEqual(chunks.get(chatB.toString()), ['fake-', 'fake-', 'fake-']);
++		assert.deepStrictEqual(completions.sort(), [chatA.toString(), chatB.toString()].sort());
++	});
++
 +	test('a SIGTERM exit fires onExit exactly once without an exit code', async () => {
 +		const fake = await startFake('text');
 +
@@ -3259,20 +3423,22 @@ index 00000000..71bbedcb
 +});
 diff --git a/src/vs/platform/agentHost/test/node/icode/icodeAgent.test.ts b/src/vs/platform/agentHost/test/node/icode/icodeAgent.test.ts
 new file mode 100644
-index 00000000..1a3d30d2
+index 00000000..9b59c290
 --- /dev/null
 +++ b/src/vs/platform/agentHost/test/node/icode/icodeAgent.test.ts
-@@ -0,0 +1,617 @@
+@@ -0,0 +1,874 @@
 +/*---------------------------------------------------------------------------------------------
 + *  Copyright (c) Microsoft Corporation. All rights reserved.
 + *  Licensed under the MIT License. See License.txt in the project root for license information.
 + *--------------------------------------------------------------------------------------------*/
 +
 +import assert from 'assert';
++import { mkdtempSync, rmSync } from 'fs';
 +import { tmpdir } from 'os';
++import { join } from 'path';
 +import { timeout } from '../../../../../base/common/async.js';
 +import { Emitter } from '../../../../../base/common/event.js';
-+import { IDisposable } from '../../../../../base/common/lifecycle.js';
++import { IDisposable, toDisposable } from '../../../../../base/common/lifecycle.js';
 +import { URI } from '../../../../../base/common/uri.js';
 +import { ensureNoDisposablesAreLeakedInTestSuite } from '../../../../../base/test/common/utils.js';
 +import { NullLogService } from '../../../../log/common/log.js';
@@ -3290,6 +3456,7 @@ index 00000000..1a3d30d2
 +	readonly onExit = this.exitEmitter.event;
 +	exited = false;
 +	exitCode: number | null = null;
++	disposed = false;
 +	readonly requests: { method: string; params: any }[] = [];
 +	readonly notifications: { method: string; params: any }[] = [];
 +	/** `session/update` payloads replayed for `session/load`, emitted while the request is in flight. */
@@ -3301,19 +3468,24 @@ index 00000000..1a3d30d2
 +		sessionId: SESSION_ID,
 +		models: { availableModels: [], currentModelId: 'mock' },
 +	};
++	/** When set, overrides `newSessionResult.sessionId` for each `session/new`. */
++	nextSessionId: (() => string) | undefined;
 +	/** When set, `session/set_model` rejects with it. */
 +	setModelError: Error | undefined;
 +	private readonly notificationHandlers = new Map<string, (params: any) => void>();
 +	private readonly requestHandlers = new Map<string, (params: any, id?: any) => unknown>();
 +	/** The reply promise of the last server-to-client request, per method. */
 +	private readonly replies = new Map<string, Promise<unknown>>();
-+	private resolvePrompt: ((value: any) => void) | undefined;
-+	private rejectPrompt: ((reason: Error) => void) | undefined;
++	/** In-flight `session/prompt` calls by session id; one process can run several. */
++	private readonly pendingPrompts = new Map<string, { resolve: (value: any) => void; reject: (reason: Error) => void }>();
++
++	get pendingPromptCount(): number { return this.pendingPrompts.size; }
 +
 +	request<R>(method: string, params?: unknown): Promise<R> {
 +		this.requests.push({ method, params });
 +		if (method === 'session/new') {
-+			return Promise.resolve(this.newSessionResult as unknown as R);
++			const sessionId = this.nextSessionId?.() ?? this.newSessionResult.sessionId;
++			return Promise.resolve({ ...this.newSessionResult, sessionId } as unknown as R);
 +		}
 +		if (method === 'session/set_model') {
 +			return this.setModelError ? Promise.reject(this.setModelError) : Promise.resolve({} as R);
@@ -3329,9 +3501,9 @@ index 00000000..1a3d30d2
 +			return Promise.resolve({} as R);
 +		}
 +		if (method === 'session/prompt') {
++			const sessionId = (params as { sessionId?: string } | undefined)?.sessionId ?? '';
 +			return new Promise<R>((resolve, reject) => {
-+				this.resolvePrompt = resolve as (value: any) => void;
-+				this.rejectPrompt = reject;
++				this.pendingPrompts.set(sessionId, { resolve: resolve as (value: any) => void, reject });
 +			});
 +		}
 +		return Promise.resolve({} as R);
@@ -3359,17 +3531,38 @@ index 00000000..1a3d30d2
 +		assert.ok(reply, `no reply captured for ${method}`);
 +		return reply;
 +	}
-+	finishPrompt(result: unknown): void { this.resolvePrompt?.(result); }
++	/** Settles the most recent in-flight `session/prompt`. */
++	finishPrompt(result: unknown): void {
++		const last = [...this.pendingPrompts.entries()].at(-1);
++		assert.ok(last, 'no in-flight session/prompt to settle');
++		this.pendingPrompts.delete(last[0]);
++		last[1].resolve(result);
++	}
 +	/** Settles the in-flight `session/prompt` with a bare stop reason. */
 +	completePrompt(stopReason: string): void { this.finishPrompt({ stopReason }); }
++	/** Settles every in-flight turn, e.g. when two chats share one process. */
++	completeAllPrompts(stopReason: string): void {
++		const pending = [...this.pendingPrompts.values()];
++		this.pendingPrompts.clear();
++		for (const turn of pending) {
++			turn.resolve({ stopReason });
++		}
++	}
 +	emitExit(code: number | null): void {
 +		this.exited = true;
 +		this.exitCode = code;
 +		this.exitEmitter.fire(code);
 +		// The real client cancels every in-flight request when the process exits.
-+		this.rejectPrompt?.(new Error('icode exited'));
++		const pending = [...this.pendingPrompts.values()];
++		this.pendingPrompts.clear();
++		for (const turn of pending) {
++			turn.reject(new Error('icode exited'));
++		}
 +	}
-+	dispose(): void { this.exitEmitter.dispose(); }
++	dispose(): void {
++		this.disposed = true;
++		this.exitEmitter.dispose();
++	}
 +}
 +
 +const chat = URI.parse('ahp-chat://test/chat');
@@ -3387,6 +3580,33 @@ index 00000000..1a3d30d2
 +
 +	/** An agent wired to the injected client, disposed with the suite. */
 +	const createAgent = (client: IIcodeAcpClient): IcodeAgent => disposables.add(new IcodeAgent(new NullLogService(), () => client));
++
++	/**
++	 * An agent whose factory hands out a fresh fake per working directory and
++	 * records the cwd it was asked for, so a test can tell "one process per
++	 * directory" from "one process for the agent".
++	 */
++	function createPerCwdAgent() {
++		const createdFor: string[] = [];
++		const byCwd = new Map<string, FakeIcodeClient[]>();
++		const agent = disposables.add(new IcodeAgent(new NullLogService(), cwd => {
++			const index = createdFor.push(cwd);
++			const client = new FakeIcodeClient();
++			// Session ids are only unique inside one process.
++			let sessions = 0;
++			client.nextSessionId = () => `sess-${index}-${++sessions}`;
++			byCwd.set(cwd, [...(byCwd.get(cwd) ?? []), client]);
++			return client;
++		}));
++		return { agent, createdFor, clientsFor: (cwd: string) => byCwd.get(cwd) ?? [] };
++	}
++
++	/** A directory that really exists, removed with the suite. */
++	function tempDirectory(prefix: string): string {
++		const directory = mkdtempSync(join(tmpdir(), prefix));
++		disposables.add(toDisposable(() => rmSync(directory, { recursive: true, force: true })));
++		return directory;
++	}
 +
 +	test('creates a session and completes a prompt round-trip', async () => {
 +		const client = new FakeIcodeClient();
@@ -3538,6 +3758,207 @@ index 00000000..1a3d30d2
 +		clients[1].finishPrompt({ stopReason: 'end_turn' });
 +		await second;
 +		agent.dispose();
++	});
++
++	test('spawns one client per working directory, each asked for its own directory', async () => {
++		const dirA = tempDirectory('icode-cwd-a-');
++		const dirB = tempDirectory('icode-cwd-b-');
++		const cwdA = URI.file(dirA).fsPath;
++		const cwdB = URI.file(dirB).fsPath;
++		const { agent, createdFor, clientsFor } = createPerCwdAgent();
++		const chatA = URI.parse('ahp-chat://test/cwd-a');
++		const chatB = URI.parse('ahp-chat://test/cwd-b');
++
++		const a = agent.chats.sendMessage(chatA, 'hello', [URI.file(dirA)], [], 'turn-a');
++		const b = agent.chats.sendMessage(chatB, 'hello', [URI.file(dirB)], [], 'turn-b');
++		await timeout(10);
++
++		assert.deepStrictEqual(createdFor, [cwdA, cwdB], 'one process per directory, spawned in that directory');
++		assert.deepStrictEqual(clientsFor(cwdA)[0].requests[0], { method: 'session/new', params: { cwd: cwdA, mcpServers: [] } });
++		assert.deepStrictEqual(clientsFor(cwdB)[0].requests[0], { method: 'session/new', params: { cwd: cwdB, mcpServers: [] } });
++
++		clientsFor(cwdA)[0].completePrompt('end_turn');
++		clientsFor(cwdB)[0].completePrompt('end_turn');
++		await Promise.all([a, b]);
++	});
++
++	test('shares one client between chats in the same working directory', async () => {
++		const directory = tempDirectory('icode-cwd-shared-');
++		const cwd = URI.file(directory).fsPath;
++		const { agent, createdFor, clientsFor } = createPerCwdAgent();
++		const chatA = URI.parse('ahp-chat://test/shared-a');
++		const chatB = URI.parse('ahp-chat://test/shared-b');
++
++		const a = agent.chats.sendMessage(chatA, 'hello', [URI.file(directory)], [], 'turn-a');
++		const b = agent.chats.sendMessage(chatB, 'hello', [URI.file(directory)], [], 'turn-b');
++		await timeout(10);
++
++		assert.deepStrictEqual(createdFor, [cwd], 'a second chat in the same directory must not spawn a second process');
++		const client = clientsFor(cwd)[0];
++		assert.strictEqual(client.pendingPromptCount, 2, 'both chats run on that one process');
++		assert.deepStrictEqual(
++			client.requests.filter(request => request.method === 'session/new'),
++			[
++				{ method: 'session/new', params: { cwd, mcpServers: [] } },
++				{ method: 'session/new', params: { cwd, mcpServers: [] } },
++			],
++			'each chat gets its own ACP session in the shared process',
++		);
++
++		client.completeAllPrompts('end_turn');
++		await Promise.all([a, b]);
++	});
++
++	test('routes each process by session id even when two processes reuse the same one', async () => {
++		const dirA = tempDirectory('icode-route-a-');
++		const dirB = tempDirectory('icode-route-b-');
++		const cwdA = URI.file(dirA).fsPath;
++		const cwdB = URI.file(dirB).fsPath;
++		const byCwd = new Map<string, FakeIcodeClient>();
++		const agent = disposables.add(new IcodeAgent(new NullLogService(), cwd => {
++			const client = new FakeIcodeClient();
++			// ACP only promises uniqueness inside one process: both hand out the
++			// same session id, which is what a shared routing table cannot survive.
++			client.nextSessionId = () => 'sess-shared';
++			byCwd.set(cwd, client);
++			return client;
++		}));
++		const chunks = new Map<string, string[]>();
++		disposables.add(agent.onDidChatProgress(signal => {
++			if (signal.kind === 'action' && signal.action.type === ActionType.ChatDelta) {
++				const key = signal.resource.toString();
++				chunks.set(key, [...(chunks.get(key) ?? []), signal.action.content]);
++			}
++		}));
++
++		const chatA = URI.parse('ahp-chat://test/route-a');
++		const chatB = URI.parse('ahp-chat://test/route-b');
++		const a = agent.chats.sendMessage(chatA, 'hello', [URI.file(dirA)], [], 'turn-a');
++		const b = agent.chats.sendMessage(chatB, 'hello', [URI.file(dirB)], [], 'turn-b');
++		await timeout(10);
++
++		const chunk = (text: string) => ({ sessionUpdate: 'agent_message_chunk', messageId: 'm1', content: { type: 'text', text } });
++		byCwd.get(cwdA)!.emitNotification('session/update', { sessionId: 'sess-shared', update: chunk('a') });
++		byCwd.get(cwdB)!.emitNotification('session/update', { sessionId: 'sess-shared', update: chunk('b') });
++
++		assert.deepStrictEqual(chunks.get(chatA.toString()), ['a']);
++		assert.deepStrictEqual(chunks.get(chatB.toString()), ['b']);
++
++		byCwd.get(cwdA)!.completePrompt('end_turn');
++		byCwd.get(cwdB)!.completePrompt('end_turn');
++		await Promise.all([a, b]);
++	});
++
++	test('two chats in different directories run concurrently', async () => {
++		const dirA = tempDirectory('icode-parallel-a-');
++		const dirB = tempDirectory('icode-parallel-b-');
++		const cwdA = URI.file(dirA).fsPath;
++		const cwdB = URI.file(dirB).fsPath;
++		const { agent, createdFor, clientsFor } = createPerCwdAgent();
++		const chatA = URI.parse('ahp-chat://test/parallel-a');
++		const chatB = URI.parse('ahp-chat://test/parallel-b');
++		const completions: string[] = [];
++		disposables.add(agent.onDidChatProgress(signal => {
++			if (signal.kind === 'action' && signal.action.type === ActionType.ChatTurnComplete) {
++				completions.push(signal.resource.toString());
++			}
++		}));
++
++		let aDone = false;
++		const a = agent.chats.sendMessage(chatA, 'slow', [URI.file(dirA)], [], 'turn-a').then(() => { aDone = true; });
++		const b = agent.chats.sendMessage(chatB, 'quick', [URI.file(dirB)], [], 'turn-b');
++		await timeout(10);
++		assert.deepStrictEqual(createdFor, [cwdA, cwdB]);
++
++		// B is not queued behind A: it finishes on its own process while A's turn
++		// is still open, which would be impossible if the guard were agent-wide.
++		clientsFor(cwdB)[0].completePrompt('end_turn');
++		await b;
++		assert.strictEqual(aDone, false, 'A must still be running');
++		assert.deepStrictEqual(completions, [chatB.toString()]);
++
++		clientsFor(cwdA)[0].completePrompt('end_turn');
++		await a;
++		assert.deepStrictEqual(completions, [chatB.toString(), chatA.toString()]);
++	});
++
++	test('a second prompt for the same chat fails fast even while another chat runs', async () => {
++		const directory = tempDirectory('icode-failfast-');
++		const cwd = URI.file(directory).fsPath;
++		const { agent, createdFor, clientsFor } = createPerCwdAgent();
++		const chatA = URI.parse('ahp-chat://test/failfast-a');
++		const chatB = URI.parse('ahp-chat://test/failfast-b');
++
++		const a = agent.chats.sendMessage(chatA, 'hello', [URI.file(directory)], [], 'turn-a');
++		const b = agent.chats.sendMessage(chatB, 'hello', [URI.file(directory)], [], 'turn-b');
++		await timeout(10);
++
++		await assert.rejects(
++			agent.chats.sendMessage(chatA, 'again', [URI.file(directory)], [], 'turn-a-2'),
++			/already running/,
++		);
++		await assert.rejects(
++			agent.chats.sendMessage(chatA, 'again', [URI.file(directory)], [], 'turn-a-3'),
++			/already running/,
++		);
++		assert.deepStrictEqual(createdFor, [cwd], 'rejected prompts must not spawn anything');
++
++		clientsFor(cwd)[0].completeAllPrompts('end_turn');
++		await Promise.all([a, b]);
++	});
++
++	test('one client exiting leaves the chats of the other directory working', async () => {
++		const dirA = tempDirectory('icode-exit-a-');
++		const dirB = tempDirectory('icode-exit-b-');
++		const cwdA = URI.file(dirA).fsPath;
++		const cwdB = URI.file(dirB).fsPath;
++		const { agent, createdFor, clientsFor } = createPerCwdAgent();
++		const chatA = URI.parse('ahp-chat://test/exit-a');
++		const chatB = URI.parse('ahp-chat://test/exit-b');
++		const errors: string[] = [];
++		disposables.add(agent.onDidChatProgress(signal => {
++			if (signal.kind === 'action' && signal.action.type === ActionType.ChatError) {
++				errors.push(signal.resource.toString());
++			}
++		}));
++
++		const a = agent.chats.sendMessage(chatA, 'hello', [URI.file(dirA)], [], 'turn-a');
++		const b = agent.chats.sendMessage(chatB, 'hello', [URI.file(dirB)], [], 'turn-b');
++		await timeout(10);
++
++		clientsFor(cwdA)[0].emitExit(1);
++		await a;
++		assert.deepStrictEqual(errors, [chatA.toString()], 'only the dead process fails its turn');
++
++		// B's turn still completes on its own process...
++		clientsFor(cwdB)[0].completePrompt('end_turn');
++		await b;
++
++		// ...and its session survives: the next turn reuses process and session.
++		const next = agent.chats.sendMessage(chatB, 'again', [URI.file(dirB)], [], 'turn-b-2');
++		await timeout(10);
++		assert.deepStrictEqual(createdFor, [cwdA, cwdB], 'B must not respawn');
++		assert.deepStrictEqual(clientsFor(cwdB)[0].requests.map(request => request.method), ['session/new', 'session/prompt', 'session/prompt']);
++
++		clientsFor(cwdB)[0].completePrompt('end_turn');
++		await next;
++	});
++
++	test('dispose tears down every client', async () => {
++		const dirA = tempDirectory('icode-dispose-a-');
++		const dirB = tempDirectory('icode-dispose-b-');
++		const cwdA = URI.file(dirA).fsPath;
++		const cwdB = URI.file(dirB).fsPath;
++		const { agent, clientsFor } = createPerCwdAgent();
++
++		agent.chats.sendMessage(URI.parse('ahp-chat://test/dispose-a'), 'hello', [URI.file(dirA)], [], 'turn-a');
++		agent.chats.sendMessage(URI.parse('ahp-chat://test/dispose-b'), 'hello', [URI.file(dirB)], [], 'turn-b');
++		await timeout(10);
++		assert.deepStrictEqual([clientsFor(cwdA)[0].disposed, clientsFor(cwdB)[0].disposed], [false, false]);
++
++		agent.dispose();
++
++		assert.deepStrictEqual([clientsFor(cwdA)[0].disposed, clientsFor(cwdB)[0].disposed], [true, true], 'both processes must be torn down');
 +	});
 +
 +	test('materializeChat loads the persisted session and getMessages returns the replay', async () => {
@@ -3878,6 +4299,800 @@ index 00000000..1a3d30d2
 +
 +		client.completePrompt('end_turn');
 +		await turn;
++	});
++});
+diff --git a/src/vs/platform/agentHost/test/node/icode/icodeAgentHostE2E.test.ts b/src/vs/platform/agentHost/test/node/icode/icodeAgentHostE2E.test.ts
+new file mode 100644
+index 00000000..43d8f0f3
+--- /dev/null
++++ b/src/vs/platform/agentHost/test/node/icode/icodeAgentHostE2E.test.ts
+@@ -0,0 +1,788 @@
++/*---------------------------------------------------------------------------------------------
++ *  Copyright (c) Microsoft Corporation. All rights reserved.
++ *  Licensed under the MIT License. See License.txt in the project root for license information.
++ *--------------------------------------------------------------------------------------------*/
++
++/**
++ * L3 — the whole agent host over AHP/WebSocket, with the real iCode provider and the
++ * fake ACP CLI (`vscode/test/fixtures/fake-icode-acp.mjs`) behind it.
++ *
++ * Unlike the integration suites under `test/node/protocol/`, this file spawns the
++ * compiled host (`out/vs/platform/agentHost/node/agentHostServerMain.js`) as a plain
++ * Node child process and speaks AHP to it with a hand-rolled `ws` client, so it runs
++ * under `npm run test-node` with no display and no Electron. Everything asserted here
++ * is protocol traffic — action types, their payloads and the state a snapshot reports —
++ * never a host internal.
++ *
++ * The fake CLI reads `FAKE_ICODE_SCENARIO` once at spawn, so every case starts its own
++ * host with the scenario it needs (~1s each).
++ */
++
++import assert from 'assert';
++import { type ChildProcess, spawn } from 'child_process';
++import { existsSync, mkdtempSync, readFileSync, realpathSync, rmSync } from 'fs';
++import { tmpdir } from 'os';
++import { join } from 'path';
++import { randomUUID } from 'crypto';
++import { fileURLToPath, pathToFileURL } from 'url';
++import { WebSocket, type RawData } from 'ws';
++import { PROTOCOL_VERSION } from '../../../common/state/protocol/version/registry.js';
++import { ActionType } from '../../../common/state/sessionActions.js';
++import {
++	ChatInputAnswerState,
++	ChatInputAnswerValueKind,
++	ChatInputResponseKind,
++	MessageKind,
++	ResponsePartKind,
++	ToolCallConfirmationReason,
++	ToolCallStatus,
++	TurnState,
++} from '../../../common/state/sessionState.js';
++
++/** `test/node/icode/` → the VS Code tree root; both `out/` and `out-build/` sit there. */
++const REPO_ROOT = fileURLToPath(new URL('../../../../../../../', import.meta.url));
++const FIXTURE_PATH = join(REPO_ROOT, 'test', 'fixtures', 'fake-icode-acp.mjs');
++const SERVER_MAIN = fileURLToPath(new URL('../../../node/agentHostServerMain.js', import.meta.url));
++
++const ROOT_CHANNEL = 'ahp-root://';
++const STARTUP_TIMEOUT_MS = 30_000;
++const OPERATION_TIMEOUT_MS = 20_000;
++const GRACEFUL_SHUTDOWN_TIMEOUT_MS = 10_000;
++
++// ---- AHP client -------------------------------------------------------------
++
++type JsonRpcMessage = {
++	readonly jsonrpc?: string;
++	readonly id?: number;
++	readonly method?: string;
++	readonly params?: any;
++	readonly result?: any;
++	readonly error?: { readonly code: number; readonly message: string; readonly data?: unknown };
++};
++
++type ActionMessage = { readonly type: string; readonly [key: string]: any };
++
++interface IWaiter {
++	readonly predicate: (message: JsonRpcMessage) => boolean;
++	readonly resolve: (message: JsonRpcMessage) => void;
++	readonly timer: ReturnType<typeof setTimeout>;
++}
++
++function actionOf(message: JsonRpcMessage): ActionMessage | undefined {
++	return message.method === 'action' ? (message.params as { action?: ActionMessage } | undefined)?.action : undefined;
++}
++
++/**
++ * Minimal AHP client: JSON-RPC 2.0 over one WebSocket. Server→client state changes
++ * arrive as `action` notifications; client→server actions are `dispatchAction`
++ * notifications. Every received notification is buffered so a test can assert on the
++ * traffic after a turn has finished.
++ */
++class AhpTestClient {
++
++	private readonly _ws: WebSocket;
++	private readonly _pending = new Map<number, { resolve: (value: any) => void; reject: (error: Error) => void }>();
++	private readonly _received: JsonRpcMessage[] = [];
++	private readonly _waiters: IWaiter[] = [];
++	private _nextId = 1;
++	private _clientSeq = 0;
++
++	constructor(port: number) {
++		this._ws = new WebSocket(`ws://127.0.0.1:${port}`);
++	}
++
++	connect(): Promise<void> {
++		return new Promise<void>((resolve, reject) => {
++			this._ws.once('open', () => {
++				this._ws.on('message', (data: RawData) => this._onMessage(data.toString()));
++				resolve();
++			});
++			this._ws.once('error', (error: Error) => reject(error));
++		});
++	}
++
++	private _onMessage(text: string): void {
++		let message: JsonRpcMessage;
++		try {
++			message = JSON.parse(text) as JsonRpcMessage;
++		} catch {
++			return;
++		}
++		if (message.id !== undefined && message.method !== undefined) {
++			// A reverse request. The iCode provider never asks the client for anything,
++			// so answer with "method not found" rather than leaving the host waiting.
++			this._ws.send(JSON.stringify({ jsonrpc: '2.0', id: message.id, error: { code: -32601, message: `unsupported: ${message.method}` } }));
++			return;
++		}
++		if (message.id !== undefined) {
++			const pending = this._pending.get(message.id);
++			if (!pending) {
++				return;
++			}
++			this._pending.delete(message.id);
++			if (message.error) {
++				pending.reject(new Error(`${message.error.code}: ${message.error.message}`));
++			} else {
++				pending.resolve(message.result);
++			}
++			return;
++		}
++		this._received.push(message);
++		for (let i = this._waiters.length - 1; i >= 0; i--) {
++			const waiter = this._waiters[i];
++			if (waiter.predicate(message)) {
++				this._waiters.splice(i, 1);
++				clearTimeout(waiter.timer);
++				waiter.resolve(message);
++			}
++		}
++	}
++
++	call<T>(method: string, params?: unknown, timeoutMs = OPERATION_TIMEOUT_MS): Promise<T> {
++		const id = this._nextId++;
++		return new Promise<T>((resolve, reject) => {
++			const timer = setTimeout(() => {
++				this._pending.delete(id);
++				reject(new Error(`timed out after ${timeoutMs}ms waiting for ${method} (id=${id})`));
++			}, timeoutMs);
++			this._pending.set(id, {
++				resolve: value => { clearTimeout(timer); resolve(value as T); },
++				reject: error => { clearTimeout(timer); reject(error); },
++			});
++			this._ws.send(JSON.stringify({ jsonrpc: '2.0', id, method, params }));
++		});
++	}
++
++	/** Dispatch a client action on a channel (write-ahead, fire-and-forget). */
++	dispatch(channel: string, action: ActionMessage): void {
++		this._ws.send(JSON.stringify({
++			jsonrpc: '2.0',
++			method: 'dispatchAction',
++			params: { channel, clientSeq: ++this._clientSeq, action },
++		}));
++	}
++
++	/** Resolve with the first received message matching `predicate` (buffered or future). */
++	waitFor(predicate: (message: JsonRpcMessage) => boolean, description: string, timeoutMs = OPERATION_TIMEOUT_MS): Promise<JsonRpcMessage> {
++		const existing = this._received.find(predicate);
++		if (existing) {
++			return Promise.resolve(existing);
++		}
++		return new Promise<JsonRpcMessage>((resolve, reject) => {
++			const waiter: IWaiter = {
++				predicate,
++				resolve,
++				timer: setTimeout(() => {
++					const index = this._waiters.indexOf(waiter);
++					if (index >= 0) {
++						this._waiters.splice(index, 1);
++					}
++					reject(new Error(`timed out after ${timeoutMs}ms waiting for ${description}; received: ${this._describeReceived()}`));
++				}, timeoutMs),
++			};
++			this._waiters.push(waiter);
++		});
++	}
++
++	waitForAction(type: string, predicate: (action: ActionMessage) => boolean = () => true, description: string = type, timeoutMs = OPERATION_TIMEOUT_MS): Promise<ActionMessage> {
++		return this.waitFor(message => {
++			const action = actionOf(message);
++			return action !== undefined && action.type === type && predicate(action);
++		}, description, timeoutMs).then(message => actionOf(message)!);
++	}
++
++	actionsOfType(type: string): ActionMessage[] {
++		const actions: ActionMessage[] = [];
++		for (const message of this._received) {
++			const action = actionOf(message);
++			if (action?.type === type) {
++				actions.push(action);
++			}
++		}
++		return actions;
++	}
++
++	/** Drop the buffered traffic so the next phase only sees what it caused. */
++	clear(): void {
++		this._received.length = 0;
++	}
++
++	close(): void {
++		for (const waiter of this._waiters.splice(0)) {
++			clearTimeout(waiter.timer);
++		}
++		for (const pending of this._pending.values()) {
++			pending.reject(new Error('client closed'));
++		}
++		this._pending.clear();
++		this._ws.close();
++	}
++
++	private _describeReceived(): string {
++		const described = this._received.map(message => {
++			const action = actionOf(message);
++			return action ? `${message.method}:${action.type}` : message.method ?? 'response';
++		});
++		return described.length > 0 ? described.join(', ') : '<nothing>';
++	}
++}
++
++// ---- Host process -----------------------------------------------------------
++
++interface IServerHandle {
++	readonly child: ChildProcess;
++	readonly port: number;
++	readonly stderr: string[];
++}
++
++interface ILaunchOptions {
++	readonly scenario: string;
++	/** Reuse an existing directory to test restore; a fresh one is created otherwise. */
++	readonly userDataDir?: string;
++	readonly workingDirectory?: string;
++	/** Where the fake CLI records the directory it was spawned in. */
++	readonly cwdFile?: string;
++}
++
++interface IHostRun {
++	readonly client: AhpTestClient;
++	readonly server: IServerHandle;
++	readonly userDataDir: string;
++	readonly workingDirectory: string;
++	dispose(): Promise<void>;
++}
++
++const runningHosts = new Set<number>();
++
++function delay(ms: number): Promise<void> {
++	return new Promise(resolve => setTimeout(resolve, ms));
++}
++
++async function waitUntil(predicate: () => boolean, what: string, timeoutMs = 10_000): Promise<void> {
++	const deadline = Date.now() + timeoutMs;
++	while (!predicate()) {
++		if (Date.now() > deadline) {
++			throw new Error(`timed out after ${timeoutMs}ms waiting for ${what}`);
++		}
++		await delay(25);
++	}
++}
++
++function waitForExit(child: ChildProcess, timeoutMs: number): Promise<boolean> {
++	if (child.exitCode !== null || child.signalCode !== null) {
++		return Promise.resolve(true);
++	}
++	return new Promise<boolean>(resolve => {
++		let timer: ReturnType<typeof setTimeout>;
++		const onExit = () => {
++			clearTimeout(timer);
++			resolve(true);
++		};
++		timer = setTimeout(() => {
++			child.off('exit', onExit);
++			resolve(false);
++		}, timeoutMs);
++		child.once('exit', onExit);
++	});
++}
++
++function isProcessGone(pid: number): boolean {
++	try {
++		process.kill(pid, 0);
++		return false;
++	} catch (error) {
++		return (error as NodeJS.ErrnoException).code === 'ESRCH';
++	}
++}
++
++/** Kill the host's process group, so the fake ACP CLI it spawned cannot outlive it. */
++function killProcessGroup(child: ChildProcess): void {
++	const pid = child.pid;
++	if (pid === undefined || process.platform === 'win32') {
++		return;
++	}
++	try {
++		process.kill(-pid, 'SIGKILL');
++	} catch {
++		// The group is already empty.
++	}
++}
++
++async function startHost(options: ILaunchOptions & { readonly userDataDir: string; readonly workingDirectory: string }): Promise<IServerHandle> {
++	const args = [SERVER_MAIN, '--port', '0', '--without-connection-token', '--quiet', '--user-data-dir', options.userDataDir];
++	const env: NodeJS.ProcessEnv = {
++		...process.env,
++		PICKET_ICODE_BIN: FIXTURE_PATH,
++		PICKET_ICODE_AGENT_ENABLED: '1',
++		FAKE_ICODE_SCENARIO: options.scenario,
++		HOME: options.userDataDir,
++		USERPROFILE: options.userDataDir,
++	};
++	if (options.cwdFile !== undefined) {
++		env['FAKE_ICODE_CWD_FILE'] = options.cwdFile;
++	}
++	// `detached` makes the host a process-group leader on POSIX, so teardown can reap
++	// the fake CLI along with it. stdin stays piped open: the host shuts down on EOF.
++	const child = spawn(process.execPath, args, {
++		stdio: ['pipe', 'pipe', 'pipe'],
++		env,
++		detached: process.platform !== 'win32',
++	});
++	if (child.pid !== undefined) {
++		runningHosts.add(child.pid);
++	}
++	const stderr: string[] = [];
++	child.stderr?.on('data', (data: Buffer) => stderr.push(data.toString()));
++
++	const port = await new Promise<number>((resolve, reject) => {
++		let stdout = '';
++		const timer = setTimeout(() => {
++			reject(new Error(`the agent host did not print READY:<port> within ${STARTUP_TIMEOUT_MS}ms\n${stderr.join('')}`));
++		}, STARTUP_TIMEOUT_MS);
++		const settle = (fn: () => void) => {
++			clearTimeout(timer);
++			fn();
++		};
++		child.stdout?.on('data', (data: Buffer) => {
++			stdout += data.toString();
++			const match = /READY:(\d+)/.exec(stdout);
++			if (match) {
++				settle(() => resolve(Number(match[1])));
++			}
++		});
++		child.once('error', error => settle(() => reject(error)));
++		child.once('exit', code => settle(() => reject(new Error(`the agent host exited with code ${code} before printing READY\n${stderr.join('')}`))));
++	});
++
++	return { child, port, stderr };
++}
++
++async function stopHost(server: IServerHandle): Promise<void> {
++	const { child } = server;
++	const pid = child.pid;
++	if (pid === undefined) {
++		return;
++	}
++	if (child.exitCode === null && child.signalCode === null) {
++		// Graceful path: closing stdin makes agentHostServerMain shut down and exit 0.
++		child.stdin?.end();
++		if (!await waitForExit(child, GRACEFUL_SHUTDOWN_TIMEOUT_MS)) {
++			killProcessGroup(child);
++			await waitForExit(child, 5_000);
++		}
++	}
++	// Reap whatever the host left in its process group (the fake ACP CLI).
++	killProcessGroup(child);
++	const deadline = Date.now() + 5_000;
++	while (!isProcessGone(pid) && Date.now() < deadline) {
++		await delay(25);
++	}
++	assert.ok(child.exitCode !== null || child.signalCode !== null, `the agent host (pid ${pid}) must have exited`);
++	assert.ok(isProcessGone(pid), `the agent host (pid ${pid}) must not have been left running`);
++	runningHosts.delete(pid);
++}
++
++function makeTempDir(prefix: string): string {
++	return mkdtempSync(join(tmpdir(), prefix));
++}
++
++async function launchHost(options: ILaunchOptions): Promise<IHostRun> {
++	const userDataDir = options.userDataDir ?? makeTempDir('picket-l3-data-');
++	const workingDirectory = options.workingDirectory ?? makeTempDir('picket-l3-work-');
++	const ownsUserDataDir = options.userDataDir === undefined;
++	const ownsWorkingDirectory = options.workingDirectory === undefined;
++	const server = await startHost({ ...options, userDataDir, workingDirectory });
++	const client = new AhpTestClient(server.port);
++	try {
++		await client.connect();
++	} catch (error) {
++		await stopHost(server);
++		throw error;
++	}
++	return {
++		client,
++		server,
++		userDataDir,
++		workingDirectory,
++		async dispose(): Promise<void> {
++			client.close();
++			await stopHost(server);
++			if (ownsUserDataDir) {
++				rmSync(userDataDir, { recursive: true, force: true });
++			}
++			if (ownsWorkingDirectory) {
++				rmSync(workingDirectory, { recursive: true, force: true });
++			}
++		},
++	};
++}
++
++// ---- Session/turn helpers ---------------------------------------------------
++
++interface ISessionHandle {
++	readonly session: string;
++	readonly chat: string;
++}
++
++/**
++ * Handshake and subscribe to the root channel. `initialize` reports no snapshots
++ * on this host, so the agent catalog is read from the root subscription's snapshot;
++ * subscribing also makes the root actions (`agentsChanged`, `activeSessionsChanged`)
++ * part of the traffic instead of only the broadcast `sessionSummaryChanged`.
++ */
++async function initializeRoot(client: AhpTestClient, clientId: string): Promise<any> {
++	await client.call('initialize', {
++		channel: ROOT_CHANNEL,
++		protocolVersions: [PROTOCOL_VERSION],
++		clientId,
++	});
++	const root = await client.call<any>('subscribe', { channel: ROOT_CHANNEL });
++	assert.ok(root?.snapshot?.state, 'the root channel must serve a snapshot after initialize');
++	return root.snapshot.state;
++}
++
++/** Handshake, create an iCode session, subscribe to it and to its default chat. */
++async function createIcodeSession(client: AhpTestClient, clientId: string, workingDirectory: string): Promise<ISessionHandle> {
++	await initializeRoot(client, clientId);
++	await client.call('createSession', {
++		channel: `ahp-session:/${randomUUID()}`,
++		provider: 'icode',
++		workingDirectories: [pathToFileURL(workingDirectory).toString()],
++	});
++	const added = await client.waitFor(message => message.method === 'root/sessionAdded', 'root/sessionAdded');
++	const summary = (added.params as { summary: any }).summary;
++	const session: string = summary.resource;
++	const sessionSnapshot = await client.call<any>('subscribe', { channel: session });
++	const chat: string | undefined = summary.defaultChat ?? sessionSnapshot?.snapshot?.state?.defaultChat;
++	assert.ok(chat, 'the host must advertise a default chat for an iCode session');
++	await client.call('subscribe', { channel: chat });
++	client.clear();
++	return { session, chat };
++}
++
++function startTurn(client: AhpTestClient, chat: string, turnId: string, text: string): void {
++	client.dispatch(chat, {
++		type: ActionType.ChatTurnStarted,
++		turnId,
++		startedAt: new Date().toISOString(),
++		message: { text, origin: { kind: MessageKind.User } },
++	});
++}
++
++/** Every markdown chunk the host streamed for `turnId`, in arrival order. */
++function streamedText(client: AhpTestClient, turnId: string): string {
++	const text: string[] = [];
++	for (const action of client.actionsOfType(ActionType.ChatResponsePart)) {
++		if (action.turnId === turnId && action.part?.kind === ResponsePartKind.Markdown) {
++			text.push(action.part.content);
++		}
++	}
++	for (const action of client.actionsOfType(ActionType.ChatDelta)) {
++		if (action.turnId === turnId) {
++			text.push(action.content);
++		}
++	}
++	return text.join('');
++}
++
++// ---- Suite ------------------------------------------------------------------
++
++suite('iCode agent host end-to-end over WebSocket (L3)', function () {
++
++	suiteSetup(function () {
++		if (process.platform === 'win32') {
++			// Production launches iCode through a `.cmd` shim on Windows; spawning the
++			// fixture `.mjs` directly would test a path the product never takes.
++			console.log('[icodeAgentHostE2E] skipped on win32: the fake ACP CLI is spawned directly, which is not how iCode launches on Windows');
++			this.skip();
++		}
++	});
++
++	suiteTeardown(function () {
++		assert.deepStrictEqual([...runningHosts], [], 'every spawned agent host must have been shut down');
++	});
++
++	test('starts from --port 0 and lists the icode provider', async function () {
++		this.timeout(90_000);
++		const host = await launchHost({ scenario: 'text' });
++		try {
++			const root = await initializeRoot(host.client, 'l3-provider');
++			const agents = root.agents ?? [];
++			const providers = agents.map((agent: any) => agent.provider);
++			assert.ok(providers.includes('icode'), `the icode provider must be listed; got ${JSON.stringify(providers)}`);
++
++			const icode = agents.find((agent: any) => agent.provider === 'icode');
++			assert.strictEqual(icode.displayName, 'iCode');
++			assert.ok(Array.isArray(icode.models) && icode.models.length > 0, 'the icode provider must advertise at least one model before any session exists');
++			assert.ok(icode.models.every((model: any) => model.provider === 'icode'));
++		} finally {
++			await host.dispose();
++		}
++	});
++
++	test('publishes the model catalog session/new reports', async function () {
++		this.timeout(90_000);
++		const host = await launchHost({ scenario: 'text' });
++		try {
++			const handle = await createIcodeSession(host.client, 'l3-models', host.workingDirectory);
++			// iCode opens its ACP session on the first prompt, so the catalog arrives
++			// with the first turn rather than with createSession.
++			startTurn(host.client, handle.chat, 'turn-models', 'hello');
++			const agentsChanged = await host.client.waitForAction(
++				ActionType.RootAgentsChanged,
++				action => (action.agents ?? []).some((agent: any) => agent.provider === 'icode' && (agent.models ?? []).some((model: any) => model.id === 'fake-model-a')),
++				'root/agentsChanged carrying the fake ACP model catalog',
++			);
++			const icode = agentsChanged.agents.find((agent: any) => agent.provider === 'icode');
++			assert.deepStrictEqual(icode.models.map((model: any) => model.id).sort(), ['fake-model-a', 'fake-model-b']);
++			await host.client.waitForAction(ActionType.ChatTurnComplete, action => action.turnId === 'turn-models', 'chat/turnComplete');
++		} finally {
++			await host.dispose();
++		}
++	});
++
++	test('streams one full turn: text, tool call and completion', async function () {
++		this.timeout(90_000);
++		const host = await launchHost({ scenario: 'text' });
++		try {
++			const handle = await createIcodeSession(host.client, 'l3-turn', host.workingDirectory);
++			startTurn(host.client, handle.chat, 'turn-text', 'hello');
++			await host.client.waitForAction(ActionType.ChatTurnComplete, action => action.turnId === 'turn-text', 'chat/turnComplete');
++
++			// The turn was announced and the three `fake-` chunks were streamed as one
++			// response part plus three deltas.
++			assert.ok(host.client.actionsOfType(ActionType.ChatTurnStarted).some(action => action.turnId === 'turn-text'), 'the turn start must be echoed');
++			assert.strictEqual(streamedText(host.client, 'turn-text'), 'fake-fake-fake-');
++			const responseParts = host.client.actionsOfType(ActionType.ChatResponsePart).filter(action => action.turnId === 'turn-text');
++			assert.strictEqual(responseParts.length, 1, 'the first chunk opens one markdown part');
++			assert.strictEqual(responseParts[0].part.kind, ResponsePartKind.Markdown);
++			assert.strictEqual(host.client.actionsOfType(ActionType.ChatDelta).filter(action => action.turnId === 'turn-text').length, 3);
++
++			// The ACP `execute` tool call is mapped through start → ready → complete.
++			const start = host.client.actionsOfType(ActionType.ChatToolCallStart).find(action => action.toolCallId === 'tc-1');
++			assert.ok(start, 'chat/toolCallStart for tc-1');
++			assert.strictEqual(start.toolName, 'shell');
++			const ready = host.client.actionsOfType(ActionType.ChatToolCallReady).find(action => action.toolCallId === 'tc-1');
++			assert.ok(ready, 'chat/toolCallReady for tc-1');
++			assert.strictEqual(ready.confirmed, ToolCallConfirmationReason.NotNeeded);
++			const complete = host.client.actionsOfType(ActionType.ChatToolCallComplete).find(action => action.toolCallId === 'tc-1');
++			assert.ok(complete, 'chat/toolCallComplete for tc-1');
++			assert.strictEqual(complete.result.success, true);
++
++			// The settled chat state agrees: one complete turn, no active turn.
++			const snapshot = await host.client.call<any>('subscribe', { channel: handle.chat });
++			const chatState = snapshot?.snapshot?.state;
++			assert.strictEqual(chatState.activeTurn, undefined);
++			assert.strictEqual(chatState.turns.length, 1);
++			assert.strictEqual(chatState.turns[0].state, TurnState.Complete);
++			assert.strictEqual(chatState.turns[0].message.text, 'hello');
++		} finally {
++			await host.dispose();
++		}
++	});
++
++	test('round-trips a tool permission through chat/toolCallConfirmed', async function () {
++		this.timeout(90_000);
++		const host = await launchHost({ scenario: 'permission' });
++		try {
++			const handle = await createIcodeSession(host.client, 'l3-permission', host.workingDirectory);
++			startTurn(host.client, handle.chat, 'turn-permission', 'change the workspace');
++
++			// A pending confirmation is a `chat/toolCallReady` with no `confirmed`.
++			const pending = await host.client.waitForAction(
++				ActionType.ChatToolCallReady,
++				action => action.toolCallId === 'tc-p' && action.confirmed === undefined,
++				'chat/toolCallReady asking for tc-p',
++				30_000,
++			);
++			assert.ok(pending.confirmationTitle, 'a pending confirmation must carry a confirmation title');
++
++			host.client.dispatch(handle.chat, {
++				type: ActionType.ChatToolCallConfirmed,
++				turnId: 'turn-permission',
++				toolCallId: 'tc-p',
++				approved: true,
++				confirmed: ToolCallConfirmationReason.UserAction,
++			});
++
++			const complete = await host.client.waitForAction(ActionType.ChatToolCallComplete, action => action.toolCallId === 'tc-p', 'chat/toolCallComplete for tc-p');
++			assert.strictEqual(complete.result.success, true, 'allowing the call must let it run to completion');
++			await host.client.waitForAction(ActionType.ChatTurnComplete, action => action.turnId === 'turn-permission', 'chat/turnComplete');
++		} finally {
++			await host.dispose();
++		}
++	});
++
++	test('round-trips an ask_user request through chat/inputCompleted', async function () {
++		this.timeout(90_000);
++		const host = await launchHost({ scenario: 'ask' });
++		try {
++			const handle = await createIcodeSession(host.client, 'l3-ask', host.workingDirectory);
++			startTurn(host.client, handle.chat, 'turn-ask', 'ask me something');
++
++			const requested = await host.client.waitForAction(ActionType.ChatInputRequested, () => true, 'chat/inputRequested');
++			const request = requested.request;
++			assert.strictEqual(request.id, 'req-1');
++			const question = request.questions?.[0];
++			assert.ok(question, 'the request must carry one question');
++			assert.strictEqual(question.id, 'req-1:0');
++			assert.strictEqual(question.message, 'Q?');
++			assert.strictEqual(question.title, 'H');
++			assert.deepStrictEqual((question.options ?? []).map((option: any) => option.id), ['A', 'B']);
++
++			host.client.dispatch(handle.chat, {
++				type: ActionType.ChatInputCompleted,
++				requestId: 'req-1',
++				response: ChatInputResponseKind.Accept,
++				answers: {
++					'req-1:0': {
++						state: ChatInputAnswerState.Submitted,
++						value: { kind: ChatInputAnswerValueKind.Selected, value: 'A' },
++					},
++				},
++			});
++
++			// The fake CLI only continues once it accepted the answer shape.
++			await host.client.waitForAction(ActionType.ChatTurnComplete, action => action.turnId === 'turn-ask', 'chat/turnComplete');
++			assert.strictEqual(streamedText(host.client, 'turn-ask'), 'after-answer');
++		} finally {
++			await host.dispose();
++		}
++	});
++
++	test('cancels a turn mid-stream and leaves the turn cancelled', async function () {
++		this.timeout(90_000);
++		const host = await launchHost({ scenario: 'cancel' });
++		try {
++			const handle = await createIcodeSession(host.client, 'l3-cancel', host.workingDirectory);
++			startTurn(host.client, handle.chat, 'turn-cancel', 'keep talking');
++
++			// Wait until the turn is actually streaming before cancelling it.
++			await host.client.waitForAction(
++				ActionType.ChatResponsePart,
++				action => action.turnId === 'turn-cancel',
++				'the first streamed chunk',
++			);
++
++			host.client.dispatch(handle.chat, { type: ActionType.ChatTurnCancelled, turnId: 'turn-cancel', duration: 10 });
++			await host.client.waitForAction(ActionType.ChatTurnCancelled, action => action.turnId === 'turn-cancel', 'chat/turnCancelled');
++
++			// Give the host time to deliver anything still in flight before asserting.
++			await delay(500);
++			assert.strictEqual(host.client.actionsOfType(ActionType.ChatTurnComplete).filter(action => action.turnId === 'turn-cancel').length, 0);
++			assert.strictEqual(host.client.actionsOfType(ActionType.ChatError).filter(action => action.turnId === 'turn-cancel').length, 0);
++
++			const snapshot = await host.client.call<any>('subscribe', { channel: handle.chat });
++			const chatState = snapshot?.snapshot?.state;
++			assert.strictEqual(chatState.activeTurn, undefined, 'a cancelled turn must not stay active');
++			const turn = chatState.turns[chatState.turns.length - 1];
++			assert.strictEqual(turn.id, 'turn-cancel');
++			assert.strictEqual(turn.state, TurnState.Cancelled);
++		} finally {
++			await host.dispose();
++		}
++	});
++
++	test('replays provider history after a host restart', async function () {
++		this.timeout(180_000);
++		const userDataDir = makeTempDir('picket-l3-restore-data-');
++		const workingDirectory = makeTempDir('picket-l3-restore-work-');
++		const firstCwdFile = join(userDataDir, 'spawned-cwd-1.txt');
++		const reloadCwdFile = join(userDataDir, 'spawned-cwd-2.txt');
++		let session: string;
++		let chat: string;
++
++		// ---- Phase 1: one real turn, persisted under --user-data-dir -----------
++		const first = await launchHost({ scenario: 'text', userDataDir, workingDirectory, cwdFile: firstCwdFile });
++		try {
++			const handle = await createIcodeSession(first.client, 'l3-restore-1', workingDirectory);
++			session = handle.session;
++			chat = handle.chat;
++			startTurn(first.client, chat, 'turn-restore', 'hello');
++			await first.client.waitForAction(ActionType.ChatTurnComplete, action => action.turnId === 'turn-restore', 'chat/turnComplete before restart');
++			// Let the host flush the chat catalog (including the provider data) to disk.
++			await delay(500);
++		} finally {
++			await first.dispose();
++		}
++
++		// ---- Phase 2: restart, subscribe, assert the replayed transcript ------
++		// `restore-user` replays one stored conversation: a user message and the
++		// assistant/tool updates that followed it.
++		const second = await launchHost({ scenario: 'restore-user', userDataDir, workingDirectory, cwdFile: reloadCwdFile });
++		try {
++			await initializeRoot(second.client, 'l3-restore-2');
++			// Subscribing is what triggers the restore-on-subscribe path.
++			const sessionSnapshot = await second.client.call<any>('subscribe', { channel: session });
++			const sessionState = sessionSnapshot?.snapshot?.state;
++			assert.ok(sessionState, 'the persisted session must be restore-able by its URI alone');
++			assert.strictEqual(sessionState.provider, 'icode');
++			assert.strictEqual(sessionState.defaultChat, chat, 'the persisted default chat must survive the restart');
++
++			// The provider re-materialized the chat: it spawned its CLI in the persisted
++			// directory and issued `session/load`, which is the only thing that makes the
++			// fake CLI write this file in phase 2.
++			await waitUntil(
++				() => existsSync(reloadCwdFile) && readFileSync(reloadCwdFile, 'utf8').trim().length > 0,
++				'the provider to spawn its ACP CLI for session/load',
++				15_000,
++			);
++			assert.strictEqual(realpathSync(readFileSync(reloadCwdFile, 'utf8').trim()), realpathSync(workingDirectory));
++
++			const chatSnapshot = await second.client.call<any>('subscribe', { channel: chat });
++			const chatState = chatSnapshot?.snapshot?.state;
++			assert.ok(chatState, 'the restored chat must serve a snapshot');
++			assert.strictEqual(chatState.turns.length, 1, 'the replayed session must produce one turn');
++			const turn = chatState.turns[0];
++			assert.strictEqual(turn.message.text, 'history prompt');
++			assert.strictEqual(turn.state, TurnState.Complete);
++
++			const markdown = turn.responseParts.filter((part: any) => part.kind === ResponsePartKind.Markdown).map((part: any) => part.content).join('');
++			assert.strictEqual(markdown, 'history-1history-2');
++			const toolCall = turn.responseParts.find((part: any) => part.kind === ResponsePartKind.ToolCall)?.toolCall;
++			assert.ok(toolCall, 'the replayed tool call must be restored');
++			assert.strictEqual(toolCall.toolCallId, 'tc-history');
++			assert.strictEqual(toolCall.status, ToolCallStatus.Completed);
++		} finally {
++			await second.dispose();
++			rmSync(userDataDir, { recursive: true, force: true });
++			rmSync(workingDirectory, { recursive: true, force: true });
++		}
++	});
++
++	test('ends the turn with an error when the CLI crashes, and keeps serving', async function () {
++		this.timeout(120_000);
++		const host = await launchHost({ scenario: 'crash' });
++		try {
++			const handle = await createIcodeSession(host.client, 'l3-crash', host.workingDirectory);
++			startTurn(host.client, handle.chat, 'turn-crash-1', 'hello');
++
++			const error = await host.client.waitForAction(ActionType.ChatError, action => action.turnId === 'turn-crash-1', 'chat/error for the crashed turn', 30_000);
++			assert.strictEqual(error.part.kind, ResponsePartKind.Error);
++			assert.ok(typeof error.part.error.message === 'string' && error.part.error.message.length > 0, 'the error must carry a message');
++			// The dead CLI rejects the in-flight `session/prompt`, so the host's
++			// send-failure path and the provider's own exit reporting race; both are a
++			// plain turn error, which is all the protocol promises here.
++			assert.ok(
++				['icodeExited', 'sendFailed'].includes(error.part.error.errorType),
++				`the turn must end with a provider/send failure; got ${error.part.error.errorType}`,
++			);
++
++			// The host is still up and answering.
++			const sessions = await host.client.call<any>('listSessions', { channel: ROOT_CHANNEL });
++			assert.ok(Array.isArray(sessions?.items), 'listSessions must still answer after a provider crash');
++
++			// A second turn re-spawns the CLI and streams again before failing the same
++			// way — proof the provider released the dead process and stayed usable.
++			host.client.clear();
++			startTurn(host.client, handle.chat, 'turn-crash-2', 'again');
++			const secondError = await host.client.waitForAction(ActionType.ChatError, action => action.turnId === 'turn-crash-2', 'chat/error for the second turn', 30_000);
++			assert.strictEqual(secondError.part.kind, ResponsePartKind.Error);
++			assert.ok(['icodeExited', 'sendFailed'].includes(secondError.part.error.errorType));
++			// The chunk precedes the error, so the turn's text is complete by now.
++			assert.strictEqual(streamedText(host.client, 'turn-crash-2'), 'partial');
++		} finally {
++			await host.dispose();
++		}
 +	});
 +});
 diff --git a/src/vs/platform/agentHost/test/node/icode/icodeHistory.test.ts b/src/vs/platform/agentHost/test/node/icode/icodeHistory.test.ts
@@ -4426,10 +5641,10 @@ index 00000000..356c154e
 +});
 diff --git a/test/fixtures/fake-icode-acp.mjs b/test/fixtures/fake-icode-acp.mjs
 new file mode 100755
-index 00000000..99d101a7
+index 00000000..43b14985
 --- /dev/null
 +++ b/test/fixtures/fake-icode-acp.mjs
-@@ -0,0 +1,450 @@
+@@ -0,0 +1,459 @@
 +#!/usr/bin/env node
 +/*---------------------------------------------------------------------------------------------
 + *  Copyright (c) Microsoft Corporation. All rights reserved.
@@ -4466,6 +5681,7 @@ index 00000000..99d101a7
 +	'hang',
 +	'unknown',
 +	'restore',
++	'restore-user',
 +	'restore-fail',
 +]);
 +
@@ -4612,7 +5828,15 @@ index 00000000..99d101a7
 +	sendUpdate(sessionId, { sessionUpdate: 'usage_update', used: 42, size: 1000 });
 +}
 +
-+function replayHistory(sessionId) {
++/**
++ * The transcript `session/load` replays. A provider opens a turn on a
++ * `user_message_chunk`, so `restore` (which starts with assistant chunks) yields no
++ * turn at all, while `restore-user` replays a complete stored conversation.
++ */
++function replayHistory(sessionId, includeUserMessage = false) {
++	if (includeUserMessage) {
++		sendUpdate(sessionId, { sessionUpdate: 'user_message_chunk', content: { type: 'text', text: 'history prompt' } });
++	}
 +	sendUpdate(sessionId, textChunk('history-1'));
 +	sendUpdate(sessionId, textChunk('history-2'));
 +	sendUpdate(sessionId, {
@@ -4805,8 +6029,8 @@ index 00000000..99d101a7
 +			if (scenario === 'restore-fail') {
 +				return sendError(id, -32000, 'session gone');
 +			}
-+			if (scenario === 'restore') {
-+				replayHistory(params?.sessionId);
++			if (scenario === 'restore' || scenario === 'restore-user') {
++				replayHistory(params?.sessionId, scenario === 'restore-user');
 +			}
 +			return sendResult(id, { models: models() });
 +		case 'session/prompt':

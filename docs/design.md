@@ -247,6 +247,8 @@ src/vs/platform/agentHost/node/icode/
 - P4 落地（2026-11-03 验收通过）：`session/load` 会话恢复（providerData 持久化 → 回放成 `Turn[]`）、`_chrys/request_input` ↔ `ChatInputRequested`/`respondToUserInputRequest`、`session/new` 的真实模型目录 + `session/set_model`、早期进度（`_chrys/turn_started`/`agent_load_*`/`retry_attempt` → `ChatActivityChanged`）。
 - per-turn diff 走 git checkpoint：64 号补丁把 changeset 的 diff 策略从写死的 `'fileEditTracker'`（该树里无生产调用，`file_edits` 永远空）改为 `'auto'`，并在 turn 结束时先等 checkpoint 落地再算 diff；chat 级 Session Changes 仍用 tracker（git 无法把改动归属到单个 chat）。实测：demo 仓库内 iCode 改文件后响应下方出现真实 before/after。
 - 已知前提：会话的工作目录在会话创建时固定（`SessionState.workingDirectories`）。Agents Window 里由输入框的 workspace pill 决定，窗口 open-handoff 带的 `folderUri` 在已有草稿/超时后会被丢弃，落到上次使用的文件夹（本次是 `~/`，导致 checkpoint 建不出来）；选对文件夹后 diff 正常。
+- 进程与目录（2026-11-03 修正）：`icode acp` 子进程改为**按会话工作目录复用**（`Map<cwd, client>`），每个不同目录一个进程、同目录的会话共用一个；`session/update` 等反向事件按「进程 → sessionId」路由（session id 只在单个进程内唯一）。这样 ACP 进程的 cwd 与会话目录一致，不同目录的会话也能真正并行（同一 chat 仍单回合 fail-fast）。退出只清理该进程的缓存，`dispose()` 关闭全部。
+- 进程退出诊断（2026-11-03 修正）：stdout 结束会先取消在途请求，原先上报的是裸 `Canceled`，宿主会显示成"用户中止"。现在 `request()` 把「进程已退出 / stdout 已关闭」时的取消翻译成 `iCode exited (code N) while '<method>' was in flight`，回合以可诊断的错误结束。
 - 会话恢复的冷启动成本：`materializeChat` 要拉起 `icode acp` 并 `session/load`，实测 3.07s 落在首绘关键路径上（`ChatOpen total=5175ms`）。`IAgent` 目前没有「先渲染已有 turns、后台补历史」的通道，属后续 spike。
 
 ### 6.5 聊天 UI 结论（复核修正）

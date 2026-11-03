@@ -39,7 +39,8 @@ const USAGE = `Usage: node build/test/summarize.mjs [options]
 /** Layer a report file belongs to, from its name / the testsuites name. */
 const LAYER_RULES = [
 	{ layer: 'L2', pattern: /(acp[-_ ]?process|\bl2\b)/i },
-	{ layer: 'L3', pattern: /(agent[-_ ]?host.*(e2e|integration)|\be2e\b|\bl3\b)/i },
+	// The L3 job reports as `host-e2e`, the suite as `iCode agent host … (L3)`.
+	{ layer: 'L3', pattern: /(host[-_ ]?e2e|agent[-_ ]?host.*(e2e|integration)|\be2e\b|\bl3\b)/i },
 	{ layer: 'L4', pattern: /(smoke|agents[-_ ]?window|[:/]ui\b|\bl4\b)/i },
 	{ layer: 'L5', pattern: /(verify[-_ ]?release|\bverify\b|\bl5\b)/i },
 	{ layer: 'L1', pattern: /(icode|changeset|chat|unit|\bl1\b)/i },
