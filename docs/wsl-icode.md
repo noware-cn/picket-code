@@ -187,6 +187,16 @@ Measure-Command { Get-ChildItem -Recurse "\\wsl.localhost\Ubuntu\home\<user>\pro
 
 判定：监视不触发 → M3 的主动刷新是必需项（当前设计已含）；`rg` 超过 ~30 s 或仓库超过 ~10 万文件 → 该仓库建议直接用 C（WSLg 里跑 Linux 版），A 只服务中等规模仓库。
 
+### 3.1 为什么不用微软发布的 server 二进制 + 补丁
+
+技术上"能连上"已经验证过：握手只校验 commit 相等（`remoteExtensionHostAgentServer.ts:351-357`，`Client refused: version mismatch`），我们的 commit 与上游一致，所以微软对应 commit 的 server 会接受我们的客户端；vsda 那一关是 `:361` 的 `if (!validator) valid = true`，把 `node_modules/vsda` 移开即可放行未签名客户端（`build/manual-wsl-server.sh:299-306` 就是这么做的）。
+
+但**远程窗口的 agent host 跑在 server 侧**：`serverServices.ts:284` 实例化 `ServerAgentHostManager`，由它在 server 进程里起 `agentHostServerMain`。微软的 server 二进制里没有我们的 iCode provider（补丁 63 在我们的 `out/vs/platform/agentHost/**`），所以工作区虽然在 WSL 里跑起来了，**iCode 不在那里**。
+
+要让 iCode 出现，只能把 MS bundle 里的 agent host 子树替换成我们编译的版本（`-min` 构建保留 `out/vs/**` 的文件布局，理论上可覆盖），代价是：修改并分发微软二进制（条款 §6 禁止）、无 CI 覆盖、每次上游升级要重新对齐 commit 并重做替换。个人自用可以，产品化不行。
+
+自建 server（A′）与它的差别只在于 **server 从哪来**：多一个构建 job，同时解决许可、iCode 归属、可验证性三件事。
+
 ## 4. 里程碑
 
 | 阶段 | 内容 | 验证 |
