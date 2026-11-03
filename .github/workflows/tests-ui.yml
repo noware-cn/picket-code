@@ -208,8 +208,10 @@ jobs:
           echo "==> cd vscode/test/automation && npx tsc -p tsconfig.json"
           cd vscode/test/automation
           npx tsc -p tsconfig.json > /tmp/automation-tsc.log 2>&1 || true
-          if grep -E 'agentsWindow\.ts|areas/agentsWindow/icode\.test\.ts' /tmp/automation-tsc.log; then
-            echo "FAIL: type errors in the iCode smoke test assets"
+          # Only the new suite is held to "no type errors": agentsWindow.ts itself
+          # carries the same duplicate-Page errors in its pre-existing methods.
+          if grep -E 'areas/agentsWindow/icode\.test\.ts' /tmp/automation-tsc.log; then
+            echo "FAIL: type errors in the iCode smoke suite"
             exit 1
           fi
           known=$(grep -c 'error TS' /tmp/automation-tsc.log || true)
@@ -234,12 +236,24 @@ jobs:
           # The smoke runner keys the JUnit path off GITHUB_WORKSPACE and switches on
           # mocha-multi-reporters when it is set, so the report lands in ./test-results.
           mkdir -p test-results
-          echo "==> cd vscode && xvfb-run -a --server-args \"-screen 0 1280x1024x24\" npm run smoketest-no-compile -- -f icode --fail-zero"
+          echo "==> cd vscode && xvfb-run -a --server-args \"-screen 0 1280x1024x24\" npm run smoketest-no-compile -- -f icode"
           cd vscode
-          # --fail-zero turns "the filter matched nothing" into a failure: an empty L4 run
-          # must not be reported as a green release gate.
           xvfb-run -a --server-args "-screen 0 1280x1024x24" \
-            npm run smoketest-no-compile -- -f icode --fail-zero
+            npm run smoketest-no-compile -- -f icode || rc=$?
+          # An empty L4 run must not pass: the runner ignores mocha's --fail-zero, so
+          # the report itself is checked for at least one executed test.
+          report=$(ls ../test-results/*.xml 2>/dev/null | head -1)
+          if [ -z "$report" ]; then
+            echo "FAIL: the smoke run produced no JUnit report; the filter matched nothing."
+            exit 1
+          fi
+          tests=$(grep -o 'tests="[0-9]*"' "$report" | head -1 | tr -dc '0-9')
+          echo "executed tests: ${tests:-0} ($report)"
+          if [ "${tests:-0}" -eq 0 ]; then
+            echo "FAIL: the JUnit report has no test cases."
+            exit 1
+          fi
+          exit ${rc:-0}
 
       # Not fatal: when the build fails before the suite runs there is nothing to
       # summarize, and the step above already failed the job.
