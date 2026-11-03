@@ -1,0 +1,207 @@
+name: tests (UI)
+
+# L4 of docs/testing.md §2: a real Electron window, the Agents Window and the chat panel,
+# driven by the smoke harness against the fake iCode CLI. It needs the full compile path
+# (gulp compile + Electron + built-in extensions) and Xvfb, so it costs 35–45 minutes and
+# never runs on a PR — only on a schedule, by hand, or as a release gate (release.yml
+# calls this file on tag pushes).
+#
+# The single job deliberately mirrors upstream microsoft/vscode's smoke-test workflow:
+# clone the pinned tree, apply the Picket Code patches, compile, then
+# `npm run smoketest-no-compile -- -f icode`.
+on:
+  workflow_dispatch:
+    inputs:
+      vscode_version:
+        description: "Upstream VS Code tag to test (e.g. 1.143.1). Defaults to the newest picket-code release tag."
+        required: false
+        type: string
+  schedule:
+    # Daily, before the release window: upstream drift and Electron/runtime breakage
+    # surface here instead of on a tag.
+    - cron: "0 3 * * *"
+  workflow_call:
+    inputs:
+      vscode_version:
+        description: "Upstream VS Code tag to test (e.g. 1.143.1). Defaults to the newest picket-code release tag."
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tests-ui-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  ui:
+    name: "UI smoke (L4: Agents Window, Electron + Xvfb)"
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # git tag --list needs the tags, see the resolve step.
+          fetch-depth: 0
+
+      - name: Resolve tag (input → release tag → newest release tag → upstream latest)
+        id: resolve
+        shell: bash
+        env:
+          INPUT_TAG: ${{ inputs.vscode_version }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          tag="$INPUT_TAG"
+          if [ -z "$tag" ] && [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            tag="${GITHUB_REF_NAME#v}"
+            tag="${tag%%-p*}"
+          fi
+          if [ -z "$tag" ]; then
+            newest="$(git tag --list 'v[0-9]*' --sort=-v:refname | head -1 || true)"
+            echo "newest release tag in this repository: ${newest:-<none>}"
+            tag="$(printf '%s' "$newest" | sed -e 's/^v//' -e 's/-p.*$//')"
+          fi
+          if ! [[ "$tag" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "no usable tag found; falling back to the latest stable microsoft/vscode release"
+            tag="$(curl -fsSL -H "Authorization: Bearer $GITHUB_TOKEN" \
+              https://api.github.com/repos/microsoft/vscode/releases/latest \
+              | python3 -c 'import sys,json;print(json.load(sys.stdin)["tag_name"])')"
+          fi
+          tag="$(printf '%s' "$tag" | tr -d '[:space:]')"
+          node_version="$(curl -fsSL "https://raw.githubusercontent.com/microsoft/vscode/$tag/.nvmrc" | tr -d '[:space:]')"
+          echo "testing upstream VS Code $tag with node $node_version"
+          echo "vscode=$tag" >> "$GITHUB_OUTPUT"
+          echo "node=$node_version" >> "$GITHUB_OUTPUT"
+
+      # Fail in seconds, not after a 40-minute compile: the L4 suite is our test asset and
+      # arrives with the patches. A missing suite would make `-f icode` an empty run.
+      - name: Assert the L4 suite is in the patched tree
+        shell: bash
+        run: |
+          suite=vscode/test/smoke/src/areas/agentsWindow/icode.test.ts
+          if [ ! -f "$suite" ]; then
+            echo "FAIL: $suite is missing; the L4 suite and its fixture must ship with the"
+            echo "      patches in build/patches/apply-list.txt."
+            exit 1
+          fi
+          echo "ok: $suite"
+          if ! grep -q 'icode.test' vscode/test/smoke/src/main.ts; then
+            echo "WARN: $suite exists but test/smoke/src/main.ts does not reference it;"
+            echo "      the suite will not be registered and '-f icode' will match nothing."
+          fi
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: ${{ steps.resolve.outputs.node }}
+
+      # L1–L3 need only the headers below. L4 additionally needs a display server (Xvfb)
+      # and Electron's shared libraries. The runtime set matches what
+      # verify-release.yml already proves can start the packaged app on this image:
+      #   xvfb                         virtual X server, `xvfb-run -a` below
+      #   libnss3                      NSS (Electron's network stack loads at startup)
+      #   libxss1                      XScreenSaver, used by the power-monitor shim
+      #   libatk-bridge2.0-0           accessibility bridge (pulls libatk1.0-0)
+      #   libgtk-3-0                   GTK 3, every window and native menu
+      #   libasound2t64                ALSA (Ubuntu 24.04 name; libasound2 on 22.04)
+      #   libgbm1                      GBM, Electron's software GPU path under Xvfb
+      #   libxkbcommon0                keymap handling for the window
+      # plus the compile-time development headers node-gyp needs for native modules.
+      - name: Install Linux UI dependencies (Xvfb + Electron runtime + dev headers)
+        shell: bash
+        run: |
+          echo "==> sudo apt-get install -y xvfb libnss3 libxss1 libatk-bridge2.0-0 libgtk-3-0 libasound2t64 libgbm1 libxkbcommon0 libkrb5-dev libx11-dev libxkbfile-dev libsecret-1-dev libxext-dev libxrender-dev libxrandr-dev"
+          sudo apt-get update
+          sudo apt-get install -y \
+            xvfb libnss3 libxss1 libatk-bridge2.0-0 libgtk-3-0 libasound2t64 libgbm1 libxkbcommon0 \
+            libkrb5-dev libx11-dev libxkbfile-dev libsecret-1-dev libxext-dev libxrender-dev libxrandr-dev
+
+      # --no-transpile: this layer needs the real gulp compile below, which rimrafs out/.
+      - name: Clone the pinned tree, apply the patches and npm ci
+        shell: bash
+        env:
+          VSCODE_TAG: ${{ steps.resolve.outputs.vscode }}
+        run: |
+          echo "==> bash build/test/prepare-vscode.sh $VSCODE_TAG --no-transpile"
+          bash build/test/prepare-vscode.sh "$VSCODE_TAG" --no-transpile
+
+      # Electron is a ~120 MB download per run; it only changes when upstream's
+      # `.build/electron` version does, so cache it per tag.
+      - name: Cache the Electron binary
+        uses: actions/cache@v4
+        with:
+          path: vscode/.build/electron
+          key: electron-${{ steps.resolve.outputs.vscode }}-${{ runner.os }}-${{ runner.arch }}
+
+      # `npm run compile` is NOT usable here: patch 53 removed the `compile-copilot`
+      # script, so the aggregating script fails with "Missing script: compile-copilot".
+      # `compile-client` is the script that still exists and runs the same gulp task
+      # (`gulp compile` = monaco typecheck + compile-client + extensions + media).
+      - name: "Full compile (gulp compile: client, extensions, media)"
+        shell: bash
+        env:
+          NODE_OPTIONS: --max-old-space-size=8192
+        run: |
+          echo "==> cd vscode && npm run compile-client"
+          cd vscode
+          npm run compile-client
+
+      # Downloads Electron into vscode/.build/electron and the built-in extensions
+      # (ms-vscode.js-debug*, fetched from GitHub releases, hence the token).
+      - name: Prepare Electron and the built-in extensions
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "==> cd vscode && node build/lib/preLaunch.ts"
+          cd vscode
+          node build/lib/preLaunch.ts
+
+      - name: Compile the smoke harness
+        shell: bash
+        run: |
+          echo "==> cd vscode/test/smoke && npm run compile"
+          cd vscode/test/smoke
+          npm run compile
+
+      - name: Run the Agents Window smoke tests (L4)
+        shell: bash
+        run: |
+          # The smoke runner keys the JUnit path off GITHUB_WORKSPACE and switches on
+          # mocha-multi-reporters when it is set, so the report lands in ./test-results.
+          mkdir -p test-results
+          echo "==> cd vscode && xvfb-run -a --server-args \"-screen 0 1280x1024x24\" npm run smoketest-no-compile -- -f icode --fail-zero"
+          cd vscode
+          # --fail-zero turns "the filter matched nothing" into a failure: an empty L4 run
+          # must not be reported as a green release gate.
+          xvfb-run -a --server-args "-screen 0 1280x1024x24" \
+            npm run smoketest-no-compile -- -f icode --fail-zero
+
+      - name: Summarize the JUnit reports
+        if: always()
+        shell: bash
+        run: |
+          echo "==> node build/test/summarize.mjs --dir test-results"
+          node build/test/summarize.mjs --dir test-results
+
+      - name: Upload the JUnit reports
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: test-results-ui
+          path: test-results
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Upload the app and harness logs (failure only)
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: test-logs-ui
+          path: |
+            vscode/.build/logs
+            vscode/test/smoke/smoke-test-runner.log
+            test-results
+          if-no-files-found: warn
+          retention-days: 14

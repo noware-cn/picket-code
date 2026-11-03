@@ -4,3 +4,4 @@ vscode/
 *.zip
 .DS_Store
 .superpowers/
+test-results/

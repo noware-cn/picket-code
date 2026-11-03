@@ -18,6 +18,12 @@ on:
 permissions:
   contents: write
 
+# Gate order (docs/testing.md §3.1): the automated test layers run before anything is
+# compiled, packaged or published, so a red layer means no artifacts and no release.
+#   tests     → L1 (iCode + agentHostChangeset) and L2 (fake ACP CLI) + contract checks
+#   tests-ui  → L4 (Electron/Agents Window smoke), tag pushes only: it costs ~40 minutes
+# A reusable-workflow job cannot carry `timeout-minutes`; every job inside tests.yml and
+# tests-ui.yml sets its own, which bounds those jobs.
 jobs:
   # Version resolution first: vscode tag, upstream node version, picket-code version.
   versions:
@@ -57,12 +63,34 @@ jobs:
             echo "picket-code=0.0.0-dev" >> "$GITHUB_OUTPUT"
           fi
 
+  # ---- release gate ---------------------------------------------------------------------
+  # Both jobs reuse the standalone workflows, so a release runs exactly what a PR runs.
+  tests:
+    name: "Tests (contract + L1 + L2)"
+    needs: versions
+    uses: ./.github/workflows/tests.yml
+    with:
+      # Test the tree this release is built from, not "whatever is newest upstream".
+      vscode_version: ${{ needs.versions.outputs.vscode }}
+
+  # 35–45 minutes: only worth it when something is about to be published.
+  tests-ui:
+    name: "Tests (L4 UI smoke)"
+    needs: versions
+    if: startsWith(github.ref, 'refs/tags/')
+    uses: ./.github/workflows/tests-ui.yml
+    with:
+      vscode_version: ${{ needs.versions.outputs.vscode }}
+
   # Compile stage: clone + patch + npm ci + upstream min build, then ship the
   # vscode/ tree + built VSCode-<plat>-<arch> as vscode.tar.gz. Mirrors
   # VSCodium's compile job; no packaging happens here.
   compile:
     name: "Compile ${{ matrix.platform }}-${{ matrix.arch }}"
-    needs: versions
+    needs: [versions, tests, tests-ui]
+    # The gate: nothing is built unless the test layers passed. `tests-ui` only runs on
+    # tag pushes, so a manual (non-tag) dispatch is gated by `tests` alone.
+    if: ${{ !cancelled() && needs.tests.result == 'success' && (needs.tests-ui.result == 'success' || needs.tests-ui.result == 'skipped') }}
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -116,7 +144,10 @@ jobs:
   # picket-code-*, archives, checksums. Mirrors VSCodium's package jobs.
   package:
     name: "Package ${{ matrix.platform }}-${{ matrix.arch }}"
-    needs: [versions, compile]
+    needs: [versions, compile, tests, tests-ui]
+    # Same gate as compile; listed here too so the dependency is explicit in the graph
+    # instead of only transitive.
+    if: ${{ !cancelled() && needs.tests.result == 'success' && (needs.tests-ui.result == 'success' || needs.tests-ui.result == 'skipped') }}
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -273,8 +304,10 @@ jobs:
 
   release:
     name: Publish GitHub Release
-    needs: package
-    if: startsWith(github.ref, 'refs/tags/')
+    needs: [package, tests, tests-ui]
+    # Publishing is impossible unless every layer passed: the tag-only L4 job must be
+    # green here, not merely skipped, because a tag build is what users download.
+    if: ${{ !cancelled() && startsWith(github.ref, 'refs/tags/') && needs.package.result == 'success' && needs.tests.result == 'success' && needs.tests-ui.result == 'success' }}
     runs-on: ubuntu-latest
     steps:
       # `gh release view/edit` shell out to git when they cannot resolve the repo
@@ -283,8 +316,11 @@ jobs:
         with:
           fetch-depth: 1
 
+      # Only the final deliverables: the vscode-* compile intermediates are not published
+      # and pulling them here just cost disk and time.
       - uses: actions/download-artifact@v8
         with:
+          pattern: picket-code-*
           path: artifacts
           merge-multiple: true
 
@@ -295,6 +331,30 @@ jobs:
           cat artifacts/SHA256SUMS-* > "artifacts/picket-code-${{ github.ref_name }}-SHA256SUMS"
           cat "artifacts/picket-code-${{ github.ref_name }}-SHA256SUMS"
 
+      # The JUnit XML from the gate jobs, merged into one directory: L1/L2 from
+      # tests.yml (test-results-unit, test-results-acp-process), L4 from tests-ui.yml.
+      - name: Download the test reports (L1–L4)
+        uses: actions/download-artifact@v8
+        with:
+          pattern: test-results-*
+          path: test-report
+          merge-multiple: true
+
+      # Zero-dependency script, so the runner's own node is enough here.
+      - name: Summarize the test reports (JUnit → Markdown)
+        shell: bash
+        run: |
+          echo "==> node build/test/summarize.mjs --dir test-report"
+          node build/test/summarize.mjs --dir test-report
+
+      - name: Package the test report
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "==> tar -czf test-report-${{ github.ref_name }}.tar.gz test-report"
+          tar -czf "test-report-${{ github.ref_name }}.tar.gz" test-report
+          ls -l "test-report-${{ github.ref_name }}.tar.gz"
+
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
@@ -303,6 +363,7 @@ jobs:
           # The versioned names (archives + checksums) all start with `picket-code-`.
           files: |
             artifacts/picket-code-*
+            test-report-*.tar.gz
           prerelease: ${{ github.event.inputs.pre_release == 'true' }}
           generate_release_notes: true
 

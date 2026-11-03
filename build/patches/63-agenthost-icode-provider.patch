@@ -438,10 +438,10 @@ index 00000000..4393d9d2
 +}
 diff --git a/src/vs/platform/agentHost/node/icode/icodeAgent.ts b/src/vs/platform/agentHost/node/icode/icodeAgent.ts
 new file mode 100644
-index 00000000..cc447a81
+index 00000000..21a7c875
 --- /dev/null
 +++ b/src/vs/platform/agentHost/node/icode/icodeAgent.ts
-@@ -0,0 +1,894 @@
+@@ -0,0 +1,902 @@
 +/*---------------------------------------------------------------------------------------------
 + *  Copyright (c) Microsoft Corporation. All rights reserved.
 + *  Licensed under the MIT License. See License.txt in the project root for license information.
@@ -874,8 +874,16 @@ index 00000000..cc447a81
 +			return;
 +		}
 +		this._pendingPermissions.delete(requestId);
++		// The host answers with its own option ids (`allow-once`, `allow-session`, …),
++		// which mean nothing to iCode: only forward an id iCode actually offered for
++		// this request, otherwise map the decision onto one of its options.
++		const selected = context?.selectedOptionId;
++		const offered = selected !== undefined && pending.options.some(option => option.optionId === selected);
++		if (selected !== undefined && !offered) {
++			this._logService.trace(`[icode] mapping host option '${selected}' onto the ACP decision (approved=${approved})`);
++		}
 +		pending.resolve({
-+			outcome: { outcome: 'selected', optionId: context?.selectedOptionId ?? permissionOptionId(pending.options, approved) },
++			outcome: { outcome: 'selected', optionId: offered ? selected! : permissionOptionId(pending.options, approved) },
 +		});
 +	}
 +
@@ -2878,12 +2886,383 @@ index 00000000..d34e4c39
 +		});
 +	});
 +});
+diff --git a/src/vs/platform/agentHost/test/node/icode/icodeAcpProcess.test.ts b/src/vs/platform/agentHost/test/node/icode/icodeAcpProcess.test.ts
+new file mode 100644
+index 00000000..71bbedcb
+--- /dev/null
++++ b/src/vs/platform/agentHost/test/node/icode/icodeAcpProcess.test.ts
+@@ -0,0 +1,365 @@
++/*---------------------------------------------------------------------------------------------
++ *  Copyright (c) Microsoft Corporation. All rights reserved.
++ *  Licensed under the MIT License. See License.txt in the project root for license information.
++ *--------------------------------------------------------------------------------------------*/
++
++import assert from 'assert';
++import { type ChildProcess, spawn, type SpawnOptions } from 'child_process';
++import { existsSync, mkdtempSync, readFileSync, realpathSync, rmSync } from 'fs';
++import { tmpdir } from 'os';
++import { join } from 'path';
++import { fileURLToPath } from 'url';
++import { toDisposable } from '../../../../../base/common/lifecycle.js';
++import { URI } from '../../../../../base/common/uri.js';
++import { ensureNoDisposablesAreLeakedInTestSuite } from '../../../../../base/test/common/utils.js';
++import type { AgentSignal, IAgentToolPendingConfirmationSignal } from '../../../common/agent.js';
++import { ActionType } from '../../../common/state/sessionActions.js';
++import { ChatInputAnswerState, ChatInputAnswerValueKind, ChatInputQuestionKind, ChatInputResponseKind, ToolCallStatus } from '../../../common/state/sessionState.js';
++import { IcodeAcpClient, type IIcodeAcpTransport } from '../../../node/icode/icodeAcpClient.js';
++import { toChatInputRequest, toIcodeInputReply } from '../../../node/icode/icodeInputRequests.js';
++import { createIcodeTransport, ICODE_BIN_ENV, resolveIcodeCommand } from '../../../node/icode/icodeLaunchConfig.js';
++import { createIcodeTurnState, mapAcpPermissionRequest, mapAcpSessionUpdate } from '../../../node/icode/icodeMapEvents.js';
++
++/**
++ * The fake CLI lives next to the sources (`test/fixtures/`), not under `out/`,
++ * so it is located by climbing to the repository root. Both `out/` and
++ * `out-build/` sit at that root, which keeps `--build` runs working.
++ */
++const REPO_ROOT = fileURLToPath(new URL('../../../../../../../', import.meta.url));
++const FIXTURE_PATH = join(REPO_ROOT, 'test', 'fixtures', 'fake-icode-acp.mjs');
++
++const CHAT = URI.parse('chat:/fake-chat');
++
++/** The `garbage` scenario writes this many `x` characters inside one JSON string. */
++const FAKE_GARBAGE_TEXT_LENGTH = 5 * 1024 * 1024;
++
++interface IFakeProcess {
++	readonly client: IcodeAcpClient;
++	readonly transport: IIcodeAcpTransport;
++	/** The cwd the transport was asked to spawn in. */
++	readonly cwd: string;
++	/** Every `session/update` payload the fake streamed, in arrival order. */
++	readonly updates: any[];
++	/** Transport and client diagnostics, prefixed with `[icode]` / `[IcodeAcpClient]`. */
++	readonly logs: string[];
++	/** The real child process, available once the transport spawned it. */
++	readonly child: ChildProcess;
++}
++
++function delay(ms: number): Promise<void> {
++	return new Promise(resolve => setTimeout(resolve, ms));
++}
++
++async function waitUntil(predicate: () => boolean, what: string, timeoutMs = 4000): Promise<void> {
++	const deadline = Date.now() + timeoutMs;
++	while (!predicate()) {
++		if (Date.now() > deadline) {
++			throw new Error(`timed out after ${timeoutMs}ms waiting for ${what}`);
++		}
++		await delay(5);
++	}
++}
++
++function actionsOf(signals: readonly AgentSignal[]): (AgentSignal & { kind: 'action' })['action'][] {
++	return signals
++		.filter((signal): signal is Extract<AgentSignal, { kind: 'action' }> => signal.kind === 'action')
++		.map(signal => signal.action);
++}
++
++function actionsOfType<T extends (AgentSignal & { kind: 'action' })['action']['type']>(signals: readonly AgentSignal[], type: T) {
++	return actionsOf(signals).filter((action): action is Extract<(AgentSignal & { kind: 'action' })['action'], { type: T }> => action.type === type);
++}
++
++suite('icodeAcpProcess', () => {
++	const disposables = ensureNoDisposablesAreLeakedInTestSuite();
++
++	/**
++	 * Spawns the real `icode acp` transport (real child process, real stdio, real
++	 * NDJSON framing) against the fake CLI. The only adjustment is the
++	 * interpreter: `process.execPath` is prefixed with the fixture path, so the
++	 * argument list the transport builds (`acp --approval manual -a Code`) still
++	 * reaches the fake verbatim and is validated there.
++	 */
++	async function startFake(scenario: string, options: { cwd?: string; extraEnv?: Record<string, string> } = {}): Promise<IFakeProcess> {
++		const cwd = options.cwd ?? process.cwd();
++		const resolution = await resolveIcodeCommand(
++			{ ...process.env, [ICODE_BIN_ENV]: process.execPath },
++			path => existsSync(path),
++		);
++		assert.ok('command' in resolution, `expected PICKET_ICODE_BIN to resolve, got ${JSON.stringify(resolution)}`);
++
++		const logs: string[] = [];
++		const updates: any[] = [];
++		let child: ChildProcess | undefined;
++
++		const transport = createIcodeTransport(resolution.command, {
++			cwd,
++			env: { ...process.env, FAKE_ICODE_SCENARIO: scenario, ...options.extraEnv },
++			log: line => logs.push(line),
++			spawnProcess: ((command: string, args: readonly string[], spawnOptions: SpawnOptions) => {
++				child = spawn(command, [FIXTURE_PATH, ...args], spawnOptions);
++				return child;
++			}) as unknown as typeof spawn,
++		});
++
++		const client = new IcodeAcpClient(transport, line => logs.push(line));
++		disposables.add(client);
++		disposables.add(client.onNotification('session/update', (params: any) => updates.push(params)));
++
++		assert.ok(child, 'the transport must have spawned the fake CLI synchronously');
++		return { client, transport, cwd, updates, logs, child };
++	}
++
++	async function newSession(fake: IFakeProcess): Promise<any> {
++		return fake.client.request('session/new', { cwd: fake.cwd, mcpServers: [] });
++	}
++
++	function prompt(fake: IFakeProcess, sessionId: string): Promise<any> {
++		return fake.client.request('session/prompt', { sessionId, prompt: [{ type: 'text', text: 'hello' }] });
++	}
++
++	test('streams three text chunks, one tool call, a plan and a usage update, then end_turn', async () => {
++		const fake = await startFake('text');
++
++		const session = await newSession(fake);
++		assert.strictEqual(session.sessionId, 'fake-1');
++		assert.deepStrictEqual(session.models, {
++			availableModels: [
++				{ modelId: 'fake-model-a', name: 'Fake A' },
++				{ modelId: 'fake-model-b', name: 'Fake B' },
++			],
++			currentModelId: 'fake-model-a',
++		});
++
++		const result = await prompt(fake, session.sessionId);
++		assert.deepStrictEqual(result, { stopReason: 'end_turn' });
++
++		await waitUntil(() => fake.updates.length >= 8, 'the full update sequence');
++		assert.deepStrictEqual(fake.updates.map(params => params.update.sessionUpdate), [
++			'agent_message_chunk', 'agent_message_chunk', 'agent_message_chunk',
++			'tool_call', 'tool_call_update', 'tool_call_update', 'plan', 'usage_update',
++		]);
++
++		const updates = fake.updates.map(params => params.update);
++		const state = createIcodeTurnState('turn-1');
++		const signals = updates.flatMap(update => mapAcpSessionUpdate(CHAT, state, update));
++
++		const deltas = actionsOfType(signals, ActionType.ChatDelta);
++		assert.strictEqual(deltas.length, 3);
++		assert.deepStrictEqual(deltas.map(delta => delta.content), ['fake-', 'fake-', 'fake-']);
++		assert.strictEqual(new Set(deltas.map(delta => delta.partId)).size, 1, 'the three chunks must land in one response part');
++
++		const starts = actionsOfType(signals, ActionType.ChatToolCallStart);
++		assert.strictEqual(starts.length, 1);
++		assert.strictEqual(starts[0].toolCallId, 'tc-1');
++		assert.strictEqual(starts[0].toolName, 'shell');
++
++		const readies = actionsOfType(signals, ActionType.ChatToolCallReady);
++		assert.strictEqual(readies.length, 1);
++		assert.strictEqual(readies[0].toolCallId, 'tc-1');
++		assert.strictEqual(readies[0].toolInput, JSON.stringify({ command: 'echo fake' }));
++
++		const completes = actionsOfType(signals, ActionType.ChatToolCallComplete);
++		assert.strictEqual(completes.length, 1);
++		assert.strictEqual(completes[0].toolCallId, 'tc-1');
++		assert.strictEqual(completes[0].result.success, true);
++
++		// The provider deliberately maps `plan` and `usage_update` to no signals
++		// (they carry no transcript content); asserting that keeps the fake honest
++		// about the payloads while pinning the mapper's contract.
++		assert.deepStrictEqual(updates[6].entries, [
++			{ content: 'first step', priority: 'high', status: 'pending' },
++			{ content: 'second step', priority: 'medium', status: 'in_progress' },
++		]);
++		assert.deepStrictEqual({ used: updates[7].used, size: updates[7].size }, { used: 42, size: 1000 });
++		assert.deepStrictEqual(mapAcpSessionUpdate(CHAT, createIcodeTurnState('turn-2'), updates[6]), []);
++		assert.deepStrictEqual(mapAcpSessionUpdate(CHAT, createIcodeTurnState('turn-2'), updates[7]), []);
++	});
++
++	test('surfaces an ask_user reverse request and resumes the turn with the answer', async () => {
++		const fake = await startFake('ask');
++
++		const requests: any[] = [];
++		disposables.add(fake.client.onRequest('_chrys/request_input', (params: any) => {
++			requests.push(params);
++			return { answers: [{ values: ['A'], note: '' }], cancelled: false };
++		}));
++
++		const session = await newSession(fake);
++		assert.deepStrictEqual(await prompt(fake, session.sessionId), { stopReason: 'end_turn' });
++
++		assert.strictEqual(requests.length, 1);
++		assert.deepStrictEqual(requests[0], {
++			sessionId: session.sessionId,
++			requestId: 'req-1',
++			questions: [{ question: 'Q?', header: 'H', options: [{ label: 'A' }, { label: 'B' }] }],
++		});
++
++		// iCode's options are label-only, so the label doubles as the option id.
++		assert.deepStrictEqual(toChatInputRequest(requests[0].requestId, requests[0].questions), {
++			id: 'req-1',
++			questions: [{
++				id: 'req-1:0',
++				message: 'Q?',
++				title: 'H',
++				kind: ChatInputQuestionKind.SingleSelect,
++				options: [{ id: 'A', label: 'A' }, { id: 'B', label: 'B' }],
++			}],
++		});
++
++		// The answer the fake accepted is exactly the shape our mapper produces.
++		assert.deepStrictEqual(
++			toIcodeInputReply(requests[0].questions, ChatInputResponseKind.Accept, {
++				'req-1:0': { state: ChatInputAnswerState.Submitted, value: { kind: ChatInputAnswerValueKind.Selected, value: 'A' } },
++			}),
++			{ answers: [{ values: ['A'], note: '' }], cancelled: false },
++		);
++
++		const texts = fake.updates
++			.map(params => params.update)
++			.filter(update => update.sessionUpdate === 'agent_message_chunk')
++			.map(update => update.content.text);
++		assert.deepStrictEqual(texts, ['after-answer']);
++	});
++
++	test('surfaces a permission reverse request and completes the tool call on allow', async () => {
++		const fake = await startFake('permission');
++
++		const requests: any[] = [];
++		disposables.add(fake.client.onRequest('session/request_permission', (params: any) => {
++			requests.push(params);
++			return { outcome: { outcome: 'selected', optionId: 'allow' } };
++		}));
++
++		const session = await newSession(fake);
++		assert.deepStrictEqual(await prompt(fake, session.sessionId), { stopReason: 'end_turn' });
++
++		assert.strictEqual(requests.length, 1);
++		assert.deepStrictEqual(requests[0], {
++			sessionId: session.sessionId,
++			toolCall: { toolCallId: 'tc-p', kind: 'execute', rawInput: { command: 'touch x' } },
++			options: [
++				{ kind: 'allow_once', name: 'Allow once', optionId: 'allow' },
++				{ kind: 'reject_once', name: 'Reject once', optionId: 'reject' },
++			],
++		});
++
++		const state = createIcodeTurnState('turn-p');
++		const pending = mapAcpPermissionRequest(CHAT, state, requests[0])
++			.filter((signal): signal is IAgentToolPendingConfirmationSignal => signal.kind === 'pending_confirmation');
++		assert.strictEqual(pending.length, 1);
++		assert.strictEqual(pending[0].state.toolCallId, 'tc-p');
++		assert.strictEqual(pending[0].state.status, ToolCallStatus.PendingConfirmation);
++		assert.strictEqual(pending[0].permissionKind, 'shell');
++
++		const updates = fake.updates.map(params => params.update).filter(update => update.sessionUpdate === 'tool_call_update');
++		assert.deepStrictEqual(updates.map(update => update.status), ['completed']);
++
++		const completed = actionsOfType(updates.flatMap(update => mapAcpSessionUpdate(CHAT, state, update)), ActionType.ChatToolCallComplete);
++		assert.strictEqual(completed.length, 1);
++		assert.strictEqual(completed[0].toolCallId, 'tc-p');
++		assert.strictEqual(completed[0].result.success, true);
++	});
++
++	test('session/cancel stops a streaming turn with stopReason cancelled in under five seconds', async () => {
++		const fake = await startFake('cancel');
++		const session = await newSession(fake);
++
++		const startedAt = Date.now();
++		const result = prompt(fake, session.sessionId);
++
++		await waitUntil(() => fake.updates.length >= 1, 'the first chunk');
++		const chunksBeforeCancel = fake.updates.length;
++		fake.client.notify('session/cancel', { sessionId: session.sessionId });
++
++		assert.deepStrictEqual(await result, { stopReason: 'cancelled' });
++		const elapsed = Date.now() - startedAt;
++		assert.ok(elapsed < 5000, `cancelling took ${elapsed}ms`);
++		assert.ok(fake.updates.length < 20, `the stream must stop before the scripted 20 chunks, got ${fake.updates.length} (from ${chunksBeforeCancel})`);
++	});
++
++	test('a crashed process reports exited and fails later requests immediately', async () => {
++		const fake = await startFake('crash');
++		const session = await newSession(fake);
++
++		const exited = new Promise<number | null>(resolve => {
++			const listener = fake.transport.onExit(code => {
++				listener.dispose();
++				resolve(code);
++			});
++		});
++
++		await assert.rejects(prompt(fake, session.sessionId));
++		assert.strictEqual(await exited, 1);
++		assert.strictEqual(fake.client.exited, true);
++		assert.strictEqual(fake.client.exitCode, 1);
++		await waitUntil(() => fake.updates.length >= 1, 'the partial chunk the fake wrote before dying');
++
++		const startedAt = Date.now();
++		await assert.rejects(fake.client.request('session/new'), /exited/);
++		assert.ok(Date.now() - startedAt < 1000, 'a request after exit must not wait for a reply');
++	});
++
++	test('a non-JSON line and a line above MAX_LINE_LENGTH do not throw or hang', async () => {
++		const fake = await startFake('garbage');
++		const session = await newSession(fake);
++
++		// Either outcome is acceptable: the guard may cut the transport before or
++		// after the fake's `session/prompt` result reaches us.
++		await prompt(fake, session.sessionId).then(() => undefined, () => undefined);
++
++		await waitUntil(() => fake.logs.some(line => line.includes('longer than')), 'the MAX_LINE_LENGTH guard log');
++		assert.ok(
++			fake.logs.some(line => /longer than \d+ bytes; stopping the transport/.test(line)),
++			`expected the oversized-line guard log, got:\n${fake.logs.join('\n')}`,
++		);
++		await waitUntil(() => fake.client.exited, 'the guard to stop the transport');
++
++		// The guard drops the chunk that crossed the limit and stops the transport,
++		// so the client never sees the whole 5 MB string the fake wrote. (It kills
++		// the process rather than discarding the already-buffered line prefix, which
++		// is why the remainder can still surface as one large, valid message.)
++		const texts = fake.updates
++			.map(params => params.update?.content?.text)
++			.filter((text): text is string => typeof text === 'string');
++		const largest = texts.reduce((max, text) => Math.max(max, text.length), 0);
++		assert.ok(
++			largest < FAKE_GARBAGE_TEXT_LENGTH,
++			`the guard must drop part of the oversized line, largest accepted text was ${largest} chars`,
++		);
++	});
++
++	test('spawns the CLI in the cwd passed to the transport', async () => {
++		const directory = mkdtempSync(join(tmpdir(), 'icode-acp-cwd-'));
++		disposables.add(toDisposable(() => rmSync(directory, { recursive: true, force: true })));
++		const cwdFile = join(directory, 'cwd.txt');
++
++		const fake = await startFake('text', { cwd: directory, extraEnv: { FAKE_ICODE_CWD_FILE: cwdFile } });
++		await waitUntil(() => existsSync(cwdFile), 'the fake CLI to record its cwd');
++
++		assert.strictEqual(readFileSync(cwdFile, 'utf8'), realpathSync(directory));
++		assert.strictEqual(fake.cwd, directory);
++	});
++
++	test('a SIGTERM exit fires onExit exactly once without an exit code', async () => {
++		const fake = await startFake('text');
++
++		const exits: (number | null)[] = [];
++		disposables.add(fake.client.onExit(code => exits.push(code)));
++
++		const closed = new Promise<void>(resolve => fake.child.once('close', () => resolve()));
++		fake.child.kill('SIGTERM');
++		await closed;
++		await waitUntil(() => exits.length >= 1, 'the exit event');
++
++		// A signal exit has no exit code; the transport still reports it exactly once.
++		await delay(100);
++		assert.deepStrictEqual(exits, [null]);
++		assert.strictEqual(fake.client.exited, true);
++		assert.strictEqual(fake.client.exitCode, null);
++		assert.ok(
++			fake.logs.some(line => line.includes('signal SIGTERM')),
++			`expected the transport to name the signal, got:\n${fake.logs.join('\n')}`,
++		);
++	});
++});
 diff --git a/src/vs/platform/agentHost/test/node/icode/icodeAgent.test.ts b/src/vs/platform/agentHost/test/node/icode/icodeAgent.test.ts
 new file mode 100644
-index 00000000..878c7c66
+index 00000000..1a3d30d2
 --- /dev/null
 +++ b/src/vs/platform/agentHost/test/node/icode/icodeAgent.test.ts
-@@ -0,0 +1,596 @@
+@@ -0,0 +1,617 @@
 +/*---------------------------------------------------------------------------------------------
 + *  Copyright (c) Microsoft Corporation. All rights reserved.
 + *  Licensed under the MIT License. See License.txt in the project root for license information.
@@ -3222,6 +3601,27 @@ index 00000000..878c7c66
 +		assert.strictEqual(sessionNew?.params?.cwd, workspace.fsPath);
 +		client.completePrompt('end_turn');
 +		await sending;
++		agent.dispose();
++	});
++
++	test('maps a host option id onto the ACP decision iCode understands', async () => {
++		const client = new FakeIcodeClient();
++		const agent = createAgent(client);
++		const turn = agent.chats.sendMessage(chat, 'hello', [workspace], [], 'turn-1');
++		await timeout(10);
++
++		const reply = client.emitRequest('session/request_permission', {
++			sessionId: SESSION_ID,
++			toolCall: { toolCallId: 'tc-host', kind: 'execute', rawInput: { command: 'touch x' } },
++			options: [{ kind: 'allow_once', name: 'Allow once', optionId: 'allow' }, { kind: 'reject_once', name: 'Reject once', optionId: 'reject' }],
++		});
++		await timeout(10);
++		// The host sends its own ids; iCode only knows `allow`/`reject`.
++		agent.respondToPermissionRequest('tc-host', true, { decisionSource: 'human_response', selectedOptionId: 'allow-once' });
++		assert.deepStrictEqual(await reply, { outcome: { outcome: 'selected', optionId: 'allow' } });
++
++		client.completePrompt('end_turn');
++		await turn;
 +		agent.dispose();
 +	});
 +
@@ -4023,4 +4423,460 @@ index 00000000..356c154e
 +		assert.strictEqual(decodeIcodeProviderData('{"v":2,"sessionId":"a","cwd":"/r","createdAt":1}'), undefined);
 +		assert.strictEqual(decodeIcodeProviderData('{"v":1,"sessionId":"a"}'), undefined);
 +	});
++});
+diff --git a/test/fixtures/fake-icode-acp.mjs b/test/fixtures/fake-icode-acp.mjs
+new file mode 100755
+index 00000000..99d101a7
+--- /dev/null
++++ b/test/fixtures/fake-icode-acp.mjs
+@@ -0,0 +1,450 @@
++#!/usr/bin/env node
++/*---------------------------------------------------------------------------------------------
++ *  Copyright (c) Microsoft Corporation. All rights reserved.
++ *  Licensed under the MIT License. See License.txt in the project root for license information.
++ *--------------------------------------------------------------------------------------------*/
++
++/**
++ * Stand-in for the real `icode acp` CLI used by the process-integration tests.
++ *
++ * It speaks ACP v1 over stdio: one JSON-RPC 2.0 message per line on stdin and on
++ * stdout. Zero dependencies, so it can run under a bare `node` without the
++ * extension host.
++ *
++ * The command line is validated on purpose: the transport under test builds it,
++ * and a silent mismatch would let an argument regression pass unnoticed.
++ *
++ * `FAKE_ICODE_SCENARIO` selects what `session/prompt` does; `FAKE_ICODE_CWD_FILE`
++ * (optional) receives the process's working directory at startup, so a test can
++ * assert which cwd the transport actually spawned with.
++ */
++
++import { appendFileSync, writeFileSync } from 'node:fs';
++import { join } from 'node:path';
++
++const KNOWN_SCENARIOS = new Set([
++	'text',
++	'ask',
++	'permission',
++	'diff',
++	'cancel',
++	'slow',
++	'crash',
++	'garbage',
++	'hang',
++	'unknown',
++	'restore',
++	'restore-fail',
++]);
++
++const MAX_LINE_BYTES = 5 * 1024 * 1024;
++
++function fail(message) {
++	process.stderr.write(`[fake-icode-acp] ${message}\n`);
++}
++
++// ---- Command-line contract -------------------------------------------------
++
++const argv = process.argv;
++const approvalIndex = argv.indexOf('--approval');
++const agentIndex = argv.indexOf('-a');
++if (
++	argv[2] !== 'acp'
++	|| approvalIndex === -1 || !argv[approvalIndex + 1]
++	|| agentIndex === -1 || !argv[agentIndex + 1]
++) {
++	fail(`unexpected arguments: ${argv.slice(2).join(' ') || '(none)'}`);
++	process.exit(2);
++}
++
++const scenario = process.env.FAKE_ICODE_SCENARIO ?? 'text';
++if (!KNOWN_SCENARIOS.has(scenario)) {
++	fail(`unknown FAKE_ICODE_SCENARIO '${scenario}'`);
++	process.exit(3);
++}
++
++const cwdFile = process.env.FAKE_ICODE_CWD_FILE;
++if (cwdFile) {
++	writeFileSync(cwdFile, process.cwd());
++}
++
++// ---- Output ----------------------------------------------------------------
++
++let exiting = false;
++
++function send(message) {
++	process.stdout.write(`${JSON.stringify(message)}\n`);
++}
++
++function sendResult(id, result) {
++	send({ jsonrpc: '2.0', id, result });
++}
++
++function sendError(id, code, message) {
++	send({ jsonrpc: '2.0', id, error: { code, message } });
++}
++
++function sendUpdate(sessionId, update) {
++	send({ jsonrpc: '2.0', method: 'session/update', params: { sessionId, update } });
++}
++
++/**
++ * Exits only after the pending stdout writes were handed to the OS; a bare
++ * `process.exit` can truncate the last response on a pipe. The fallback timer
++ * guarantees termination even if the flush callback never runs.
++ */
++function flushAndExit(code) {
++	if (exiting) {
++		return;
++	}
++	exiting = true;
++	process.stdin.pause();
++	process.stdout.write('', () => process.exit(code));
++	setTimeout(() => process.exit(code), 2000);
++}
++
++// ---- Server-to-client requests --------------------------------------------
++
++let nextServerRequestId = 0;
++/** Id to the resolver of a request this process sent to the client. */
++const pendingServerRequests = new Map();
++
++function requestFromClient(method, params) {
++	const id = ++nextServerRequestId;
++	send({ jsonrpc: '2.0', id, method, params });
++	return new Promise(resolve => pendingServerRequests.set(id, resolve));
++}
++
++// ---- Session/prompt state -------------------------------------------------
++
++let nextSessionNumber = 0;
++let diffCount = 0;
++const cancelledSessions = new Set();
++/** Resolver of the sleep a cancellation should cut short. */
++let wakeSleep;
++
++function sleep(ms) {
++	return new Promise(resolve => {
++		const timer = setTimeout(() => {
++			wakeSleep = undefined;
++			resolve();
++		}, ms);
++		wakeSleep = () => {
++			clearTimeout(timer);
++			wakeSleep = undefined;
++			resolve();
++		};
++	});
++}
++
++function models() {
++	return {
++		availableModels: [
++			{ modelId: 'fake-model-a', name: 'Fake A' },
++			{ modelId: 'fake-model-b', name: 'Fake B' },
++		],
++		currentModelId: 'fake-model-a',
++	};
++}
++
++function textChunk(text) {
++	return { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text } };
++}
++
++/** The `text` scenario: three chunks, one tool call, a plan and a usage update. */
++function emitTextTurn(sessionId) {
++	for (let i = 0; i < 3; i++) {
++		sendUpdate(sessionId, textChunk('fake-'));
++	}
++	sendUpdate(sessionId, {
++		sessionUpdate: 'tool_call',
++		toolCallId: 'tc-1',
++		kind: 'execute',
++		status: 'in_progress',
++		rawInput: { command: 'echo fake' },
++	});
++	sendUpdate(sessionId, { sessionUpdate: 'tool_call_update', toolCallId: 'tc-1', status: 'in_progress' });
++	sendUpdate(sessionId, {
++		sessionUpdate: 'tool_call_update',
++		toolCallId: 'tc-1',
++		status: 'completed',
++		content: [{ type: 'content', content: { type: 'text', text: 'fake' } }],
++	});
++	sendUpdate(sessionId, {
++		sessionUpdate: 'plan',
++		entries: [
++			{ content: 'first step', priority: 'high', status: 'pending' },
++			{ content: 'second step', priority: 'medium', status: 'in_progress' },
++		],
++	});
++	sendUpdate(sessionId, { sessionUpdate: 'usage_update', used: 42, size: 1000 });
++}
++
++function replayHistory(sessionId) {
++	sendUpdate(sessionId, textChunk('history-1'));
++	sendUpdate(sessionId, textChunk('history-2'));
++	sendUpdate(sessionId, {
++		sessionUpdate: 'tool_call',
++		toolCallId: 'tc-history',
++		title: 'read file',
++		kind: 'read',
++		status: 'completed',
++		content: [{ type: 'text', text: 'history' }],
++	});
++}
++
++/** iCode's answer shape for `_chrys/request_input`: one entry per question, no option ids. */
++function isInputReply(value) {
++	if (!value || typeof value !== 'object' || !Array.isArray(value.answers) || value.cancelled !== false) {
++		return false;
++	}
++	return value.answers.every(answer => answer
++		&& typeof answer === 'object'
++		&& Array.isArray(answer.values)
++		&& answer.values.every(entry => typeof entry === 'string')
++		&& typeof answer.note === 'string');
++}
++
++async function runAsk(sessionId, id) {
++	const reply = await requestFromClient('_chrys/request_input', {
++		sessionId,
++		requestId: 'req-1',
++		questions: [{ question: 'Q?', header: 'H', options: [{ label: 'A' }, { label: 'B' }] }],
++	});
++
++	if (!isInputReply(reply)) {
++		fail(`_chrys/request_input reply does not match the answer shape: ${JSON.stringify(reply)}`);
++		flushAndExit(1);
++		return;
++	}
++
++	sendUpdate(sessionId, textChunk('after-answer'));
++	sendResult(id, { stopReason: 'end_turn' });
++}
++
++async function runPermission(sessionId, id) {
++	const response = await requestFromClient('session/request_permission', {
++		sessionId,
++		toolCall: { toolCallId: 'tc-p', kind: 'execute', rawInput: { command: 'touch x' } },
++		options: [
++			{ kind: 'allow_once', name: 'Allow once', optionId: 'allow' },
++			{ kind: 'reject_once', name: 'Reject once', optionId: 'reject' },
++		],
++	});
++
++	const outcome = response?.outcome;
++	const optionId = outcome?.outcome === 'selected' ? outcome.optionId : undefined;
++	if (optionId === 'allow') {
++		sendUpdate(sessionId, {
++			sessionUpdate: 'tool_call_update',
++			toolCallId: 'tc-p',
++			status: 'completed',
++			content: [{ type: 'text', text: 'touched x' }],
++		});
++	} else {
++		sendUpdate(sessionId, { sessionUpdate: 'tool_call_update', toolCallId: 'tc-p', status: 'failed' });
++	}
++	sendResult(id, { stopReason: 'end_turn' });
++}
++
++function runDiff(sessionId, id) {
++	const path = join(process.cwd(), 'probe-diff.txt');
++	const change = `change-${++diffCount}`;
++	appendFileSync(path, `${change}\n`);
++	sendUpdate(sessionId, {
++		sessionUpdate: 'tool_call',
++		toolCallId: 'tc-diff',
++		title: 'edit probe-diff.txt',
++		kind: 'edit',
++		status: 'in_progress',
++		rawInput: { path },
++	});
++	sendUpdate(sessionId, {
++		sessionUpdate: 'tool_call_update',
++		toolCallId: 'tc-diff',
++		status: 'completed',
++		content: [{ type: 'text', text: `wrote ${change}` }],
++	});
++	sendResult(id, { stopReason: 'end_turn' });
++}
++
++async function runCancel(sessionId, id) {
++	for (let i = 0; i < 20; i++) {
++		if (cancelledSessions.has(sessionId)) {
++			break;
++		}
++		await sleep(100);
++		if (cancelledSessions.has(sessionId)) {
++			break;
++		}
++		sendUpdate(sessionId, textChunk(`chunk-${i}`));
++	}
++	sendResult(id, { stopReason: cancelledSessions.has(sessionId) ? 'cancelled' : 'end_turn' });
++}
++
++async function runSlow(sessionId, id) {
++	for (let i = 0; i < 50; i++) {
++		await sleep(200);
++		sendUpdate(sessionId, textChunk(`chunk-${i}`));
++	}
++	sendResult(id, { stopReason: 'end_turn' });
++}
++
++function runGarbage(sessionId, id) {
++	process.stdout.write('not-json\n');
++	// One line above the client's MAX_LINE_LENGTH (4 MiB) guard, so it must be dropped.
++	process.stdout.write(`${JSON.stringify({
++		jsonrpc: '2.0',
++		method: 'session/update',
++		params: { sessionId, update: textChunk('x'.repeat(MAX_LINE_BYTES)) },
++	})}\n`);
++	emitTextTurn(sessionId);
++	sendResult(id, { stopReason: 'end_turn' });
++}
++
++async function runPrompt(id, params) {
++	const sessionId = params?.sessionId;
++	switch (scenario) {
++		case 'hang':
++			// Deliberately never answers; the client's cancel/timeout path is under test.
++			return;
++		case 'crash':
++			sendUpdate(sessionId, textChunk('partial'));
++			flushAndExit(1);
++			return;
++		case 'cancel':
++			return runCancel(sessionId, id);
++		case 'slow':
++			return runSlow(sessionId, id);
++		case 'garbage':
++			return runGarbage(sessionId, id);
++		case 'unknown':
++			sendUpdate(sessionId, { sessionUpdate: 'something_new', content: { type: 'text', text: 'unknown' } });
++			break;
++		case 'ask':
++			return runAsk(sessionId, id);
++		case 'permission':
++			return runPermission(sessionId, id);
++		case 'diff':
++			return runDiff(sessionId, id);
++		default:
++			// `text` plus the `restore`/`restore-fail` scenarios, which only change `session/load`.
++			break;
++	}
++
++	emitTextTurn(sessionId);
++	sendResult(id, { stopReason: 'end_turn' });
++}
++
++// ---- Dispatch --------------------------------------------------------------
++
++function handleClientResponse(message) {
++	const pending = pendingServerRequests.get(message.id);
++	if (!pending) {
++		return;
++	}
++	pendingServerRequests.delete(message.id);
++	pending(message.error !== undefined ? { outcome: { outcome: 'cancelled' } } : message.result);
++}
++
++function handleNotification(method, params) {
++	if (method === 'session/cancel') {
++		const sessionId = params?.sessionId;
++		if (typeof sessionId === 'string') {
++			cancelledSessions.add(sessionId);
++		}
++		if (wakeSleep) {
++			wakeSleep();
++		}
++	}
++}
++
++function handleRequest(id, method, params) {
++	switch (method) {
++		case 'initialize':
++			// Never sent by our client (ACP v1 needs no handshake), but a crash here
++			// would look like an ACP regression.
++			return sendResult(id, { protocolVersion: 1 });
++		case 'session/new': {
++			const number = ++nextSessionNumber;
++			return sendResult(id, { sessionId: `fake-${number}`, models: models() });
++		}
++		case 'session/load':
++			if (scenario === 'restore-fail') {
++				return sendError(id, -32000, 'session gone');
++			}
++			if (scenario === 'restore') {
++				replayHistory(params?.sessionId);
++			}
++			return sendResult(id, { models: models() });
++		case 'session/prompt':
++			void runPrompt(id, params);
++			return;
++		case 'session/set_model':
++			return sendResult(id, {});
++		case 'session/close':
++			return sendResult(id, null);
++		default:
++			return sendError(id, -32601, `Method not found: ${method}`);
++	}
++}
++
++function handleLine(line) {
++	const trimmed = line.trim();
++	if (!trimmed) {
++		return;
++	}
++
++	let message;
++	try {
++		message = JSON.parse(trimmed);
++	} catch {
++		fail(`ignoring malformed line: ${trimmed.slice(0, 200)}`);
++		return;
++	}
++	if (typeof message !== 'object' || message === null || Array.isArray(message)) {
++		return;
++	}
++
++	if (typeof message.method !== 'string') {
++		if (message.id !== undefined && ('result' in message || 'error' in message)) {
++			handleClientResponse(message);
++		}
++		return;
++	}
++
++	if (message.id === undefined) {
++		handleNotification(message.method, message.params);
++		return;
++	}
++
++	handleRequest(message.id, message.method, message.params);
++}
++
++// ---- Input -----------------------------------------------------------------
++
++let buffered = '';
++process.stdin.setEncoding('utf8');
++process.stdin.on('data', chunk => {
++	buffered += chunk;
++	let newline = buffered.indexOf('\n');
++	while (newline !== -1) {
++		const line = buffered.slice(0, newline);
++		buffered = buffered.slice(newline + 1);
++		handleLine(line);
++		newline = buffered.indexOf('\n');
++	}
++});
++process.stdin.on('end', () => {
++	if (buffered) {
++		handleLine(buffered);
++		buffered = '';
++	}
++	flushAndExit(0);
++});
++process.stdin.on('error', error => {
++	fail(`stdin error: ${error instanceof Error ? error.message : String(error)}`);
++});
++process.stdout.on('error', () => {
++	// The client killed the pipe; nothing useful to report.
 +});
