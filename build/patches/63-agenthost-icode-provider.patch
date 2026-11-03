@@ -438,10 +438,10 @@ index 00000000..4393d9d2
 +}
 diff --git a/src/vs/platform/agentHost/node/icode/icodeAgent.ts b/src/vs/platform/agentHost/node/icode/icodeAgent.ts
 new file mode 100644
-index 00000000..14f98c19
+index 00000000..cc447a81
 --- /dev/null
 +++ b/src/vs/platform/agentHost/node/icode/icodeAgent.ts
-@@ -0,0 +1,869 @@
+@@ -0,0 +1,894 @@
 +/*---------------------------------------------------------------------------------------------
 + *  Copyright (c) Microsoft Corporation. All rights reserved.
 + *  Licensed under the MIT License. See License.txt in the project root for license information.
@@ -602,6 +602,10 @@ index 00000000..14f98c19
 +		{ provider: 'icode', id: 'default', name: 'iCode (BYOK)', supportsVision: false },
 +	]);
 +
++	/** Model ids iCode reported for a session; anything else (including the
++	 * pre-session placeholder above) must never be forwarded to `session/set_model`. */
++	private readonly _catalogModelIds = new Set<string>();
++
 +	private readonly _chats = new Map<string, IIcodeChatRecord>();
 +	private readonly _sessions = new Map<string, IIcodeSession>();
 +	/** ACP session id back to the chat it belongs to, for `session/update` routing. */
@@ -733,6 +737,13 @@ index 00000000..14f98c19
 +				// The picker is reachable before the chat's first turn, and iCode
 +				// binds a model per session: there is nothing to switch yet.
 +				this._logService.warn(`[icode] iCode needs an active session before switching models (chat: ${chatKey})`);
++				return;
++			}
++			if (!this._catalogModelIds.has(model.id)) {
++				// The picker can report a selection this provider never published
++				// (iCode rejects unknown ids), so an unknown id is a no-op rather
++				// than a request iCode answers with `Invalid params`.
++				this._logService.info(`[icode] ignoring unpublished model id ${model.id} for ${chatKey}`);
 +				return;
 +			}
 +			try {
@@ -897,8 +908,19 @@ index 00000000..14f98c19
 +			throw new Error('iCode requires a turn id');
 +		}
 +
-+		const workingDirectory = (Array.isArray(workingDirectoriesOrDirectory) ? workingDirectoriesOrDirectory[0] : workingDirectoriesOrDirectory)?.fsPath;
-+		const cwd = workingDirectory ?? homedir();
++		const chatKey = chat.toString();
++		const provided = (Array.isArray(workingDirectoriesOrDirectory) ? workingDirectoriesOrDirectory[0] : workingDirectoriesOrDirectory)?.fsPath;
++		// A chat created without a folder (the agents window always is unless a
++		// workspace was handed over) sends no working directories, so fall back to
++		// what the chat was created with before dropping to the home directory:
++		// iCode scans whatever directory it is given, and the host's git-backed
++		// turn checkpoints can only work inside a repository.
++		const remembered = this._chats.get(chatKey)?.cwd;
++		const cached = this._sessions.get(chatKey)?.cwd;
++		const cwd = provided ?? remembered ?? cached ?? homedir();
++		if (!provided) {
++			this._logService.info(`[icode] no working directory for ${chatKey}; using ${cwd}${remembered ? ' (from chat creation)' : ''}`);
++		}
 +		// Validate before touching the client: iCode requires an existing absolute
 +		// directory for `session/new`, and spawning a process for a doomed turn is a
 +		// real cost.
@@ -906,7 +928,6 @@ index 00000000..14f98c19
 +			throw new Error(`iCode requires an existing absolute working directory: ${cwd}`);
 +		}
 +
-+		const chatKey = chat.toString();
 +		if (this._activePrompts.has(chatKey)) {
 +			throw new Error('iCode is already running a turn for this chat');
 +		}
@@ -1033,6 +1054,10 @@ index 00000000..14f98c19
 +			// iCode's ACP capabilities declare no image input, so no model claims vision.
 +			.map(model => ({ provider: this.id, id: model.modelId, name: model.name, supportsVision: false }));
 +		if (models.length > 0) {
++			this._catalogModelIds.clear();
++			for (const model of models) {
++				this._catalogModelIds.add(model.id);
++			}
 +			this.models.set(models, undefined);
 +		}
 +	}
@@ -2855,10 +2880,10 @@ index 00000000..d34e4c39
 +});
 diff --git a/src/vs/platform/agentHost/test/node/icode/icodeAgent.test.ts b/src/vs/platform/agentHost/test/node/icode/icodeAgent.test.ts
 new file mode 100644
-index 00000000..8841fb00
+index 00000000..a8a0c9a3
 --- /dev/null
 +++ b/src/vs/platform/agentHost/test/node/icode/icodeAgent.test.ts
-@@ -0,0 +1,568 @@
+@@ -0,0 +1,596 @@
 +/*---------------------------------------------------------------------------------------------
 + *  Copyright (c) Microsoft Corporation. All rights reserved.
 + *  Licensed under the MIT License. See License.txt in the project root for license information.
@@ -3186,6 +3211,33 @@ index 00000000..8841fb00
 +		agent.dispose();
 +	});
 +
++	test('uses the working directory recorded at chat creation when a send passes none', async () => {
++		const client = new FakeIcodeClient();
++		const agent = new IcodeAgent(new NullLogService(), () => client);
++
++		await agent.chats.createChat(chat, { session: chat }, { workingDirectories: [workspace] });
++		const sending = agent.chats.sendMessage(chat, 'hello', undefined, undefined, 'turn-1');
++		await timeout(0);
++		const sessionNew = client.requests.find(r => r.method === 'session/new');
++		assert.strictEqual(sessionNew?.params?.cwd, workspace.fsPath);
++		client.completePrompt('end_turn');
++		await sending;
++		agent.dispose();
++	});
++
++	test('ignores a model switch to an id that was never published', async () => {
++		const client = new FakeIcodeClient();
++		const agent = new IcodeAgent(new NullLogService(), () => client);
++
++		const sending = agent.chats.sendMessage(chat, 'hello', [workspace], undefined, 'turn-1');
++		await timeout(0);
++		await agent.chats.changeModel(chat, { id: 'default' }, { session: chat });
++		assert.ok(!client.requests.some(r => r.method === 'session/set_model'), 'no set_model request for an unknown id');
++		client.completePrompt('end_turn');
++		await sending;
++		agent.dispose();
++	});
++
 +	test('an aborted replay leaves no buffered history behind', async () => {
 +		const client = new FakeIcodeClient();
 +		const agent = new IcodeAgent(new NullLogService(), () => client);
@@ -3412,8 +3464,9 @@ index 00000000..8841fb00
 +		await agent.refreshModels();
 +		assert.deepStrictEqual(client.requests.map(r => r.method), ['session/new']);
 +
-+		// With a session the switch reaches iCode.
-+		client.newSessionResult = { sessionId: SESSION_ID };
++		// With a session the switch reaches iCode — but only for an id the session
++		// actually published.
++		client.newSessionResult = { sessionId: SESSION_ID, models: { availableModels: [{ modelId: 'm-2', name: 'M2' }, { modelId: 'm-3', name: 'M3' }], currentModelId: 'm-2' } };
 +		const turn = agent.chats.sendMessage(chat, 'hello', [workspace], [], 'turn-2');
 +		await timeout(10);
 +		await agent.chats.changeModel(chat, { id: 'm-2' }, chat);
