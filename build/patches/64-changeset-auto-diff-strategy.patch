@@ -38,7 +38,7 @@ index 670c23bd..f17b961c 100644
  		} else if (parsed.kind === ChangesetKind.Compare && parsed.originalTurnId && parsed.modifiedTurnId) {
  			// Compare-turns is computed once on subscribe. Both turns are
 diff --git a/src/vs/platform/agentHost/node/agentHostChangesetService.ts b/src/vs/platform/agentHost/node/agentHostChangesetService.ts
-index 270c9241..8d960675 100644
+index 270c9241..0cdc0451 100644
 --- a/src/vs/platform/agentHost/node/agentHostChangesetService.ts
 +++ b/src/vs/platform/agentHost/node/agentHostChangesetService.ts
 @@ -70,6 +70,13 @@ import { SessionConfigKey } from '../common/sessionConfigKeys.js';
@@ -55,15 +55,15 @@ index 270c9241..8d960675 100644
  /**
   * Maximum number of per-repository git diffs a multi-folder fan-out runs at
   * once. Every resolved repository is diffed; this only bounds how many `git`
-@@ -499,7 +506,7 @@ export class AgentHostChangesetService extends Disposable implements IAgentHostC
+@@ -493,7 +500,7 @@ export class AgentHostChangesetService extends Disposable implements IAgentHostC
+ 	 * Recomputes a chat's own Session Changes while a client observes them.
+ 	 * Git checkpoints capture the working tree shared by every chat of the
+ 	 * session and cannot attribute changes to a single chat, so chat-scoped
+-	 * Session Changes always come from the chat's tracked edits.
++	 * Session Changes stay on the chat's tracked edits.
+ 	 */
+ 	private _refreshChatSessionChangeset(chat: ProtocolURI, changedTurnId?: string, clientContext?: IAgentHostClientTelemetryContext): void {
  		if (!this._hasSubscription(chat, buildSessionChangesetUri(chat)) || !this._hasWorkingDirectory(chat)) {
- 			return;
- 		}
--		this._scheduleStaticRecompute(chat, 'session', changedTurnId, false, clientContext, 'fileEditTracker');
-+		this._scheduleStaticRecompute(chat, 'session', changedTurnId, false, clientContext, DEFAULT_CHANGESET_DIFF_STRATEGY);
- 	}
- 
- 	/**
 @@ -536,7 +543,7 @@ export class AgentHostChangesetService extends Disposable implements IAgentHostC
  					break;
  				case ChangesetKind.Turn:
