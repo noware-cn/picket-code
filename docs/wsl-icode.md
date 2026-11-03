@@ -144,6 +144,17 @@ WslGitExecutor    → cp.execFile('wsl.exe', ['-d', distro, '--cd', posix(cwd), 
 
 也就是说远程窗口里 Windows 侧只有 UI 与 RPC 客户端；文件系统、`rg`、语言服务全在 WSL。官方文档反复警告"别把代码放 `/mnt/c`"，正是因为一旦跨界就掉到这条慢路径上。
 
+**为什么会出现"在 Windows 上监视 WSL 文件"这件事**：它不是设计意图，是 A 的所有权决定的。UNC 工作区由 **Windows 侧窗口的 `fileService` 拥有**，本地窗口打开任意文件夹时的默认机制就是对该根目录做递归监视（`DiskFileSystemProvider` + watcher）；根目录换成 `\\wsl.localhost\…` 后，代码路径不变，只是监视落到了跨界路径上。
+
+真正需要"知道文件变了"的消费者全在 Windows 侧：资源管理器、已打开的编辑器（重载/脏标记）、搜索、会话的 git 状态、diff 视图。变更来源分两类，感知手段不同：
+
+| 变更来源 | 有没有协议事件 | 感知方式 |
+|---|---|---|
+| agent 的工具调用（`edit`/`write`） | 有（`tool_call` 里带 diff/内容） | 直接刷新，不需要监视 |
+| agent 跑的 shell 命令（`npm run build`、`git checkout`、`sed -i`） | 没有 | 只有监视/轮询，或 turn 结束时用 WSL git 比对兜底 |
+
+所以 §2.8 的结论不是"优化监视"，而是**让 UI 不依赖监视**：turn 边界用 WSL git 的变更列表补齐第二类来源，第一类本来就走协议事件。
+
 我们的 A 方案框架不同：工作区在 Windows 侧以 UNC `\\wsl.localhost\<distro>\…` 打开，此后任何宿主侧的文件动作都经过 WSL 的重定向器（9p）。逐项评估：
 
 | 宿主侧动作 | 走 9p？ | 实测预期 | 严重度 |
