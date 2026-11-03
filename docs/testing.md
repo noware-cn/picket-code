@@ -3,6 +3,8 @@
 > 目标：每次发布（`v*` tag）自动跑完所有能自动化的检查，产出一份人与机器都能读的报告；自动化到不了的地方，给出固定的人工验收清单。
 >
 > 适用对象：picket-code（VS Code fork，`vscode/` 树）+ `platform/agentHost/node/icode/` 适配层。
+>
+> 配套文档：谁能在什么情况下合并、发布由谁签字、AI 的能力边界见 [branching.md](branching.md)；每次发布要勾的人工验收项见 [release-checklist.md](release-checklist.md)。
 
 ## 1. GitHub Actions 能测到什么程度
 
