@@ -244,7 +244,10 @@ src/vs/platform/agentHost/node/icode/
 | 会话状态在 CLI 进程内 | 仍由 iCode 进程持有；`session/new` 按 chat + cwd 惰性创建并复用 |
 
 - 审批语义映射已落地：iCode workflow 的 manual 审批 ↔ AgentHost 的 `pending_confirmation` 信号 + `respondToPermissionRequest`。
-- P4 剩余项（不属于本次 P3）：diff 预览、`session/load` 会话恢复、`ask_user`（`_chrys/request_input`）映射、模型目录动态刷新。
+- P4 落地（2026-11-03 验收通过）：`session/load` 会话恢复（providerData 持久化 → 回放成 `Turn[]`）、`_chrys/request_input` ↔ `ChatInputRequested`/`respondToUserInputRequest`、`session/new` 的真实模型目录 + `session/set_model`、早期进度（`_chrys/turn_started`/`agent_load_*`/`retry_attempt` → `ChatActivityChanged`）。
+- per-turn diff 走 git checkpoint：64 号补丁把 changeset 的 diff 策略从写死的 `'fileEditTracker'`（该树里无生产调用，`file_edits` 永远空）改为 `'auto'`，并在 turn 结束时先等 checkpoint 落地再算 diff；chat 级 Session Changes 仍用 tracker（git 无法把改动归属到单个 chat）。实测：demo 仓库内 iCode 改文件后响应下方出现真实 before/after。
+- 已知前提：会话的工作目录在会话创建时固定（`SessionState.workingDirectories`）。Agents Window 里由输入框的 workspace pill 决定，窗口 open-handoff 带的 `folderUri` 在已有草稿/超时后会被丢弃，落到上次使用的文件夹（本次是 `~/`，导致 checkpoint 建不出来）；选对文件夹后 diff 正常。
+- 会话恢复的冷启动成本：`materializeChat` 要拉起 `icode acp` 并 `session/load`，实测 3.07s 落在首绘关键路径上（`ChatOpen total=5175ms`）。`IAgent` 目前没有「先渲染已有 turns、后台补历史」的通道，属后续 spike。
 
 ### 6.5 聊天 UI 结论（复核修正）
 
@@ -298,7 +301,7 @@ src/vs/platform/agentHost/node/icode/
 | P2 | 零 provider 核心：52/53 对齐 | host 启动正常、编辑器正常、产物无三套 SDK |
 | P2.5 | 核心 UI 验证（新增，已决策路线） | ✅ 2026-11-01 实测通过：mock provider 会话在 **Agents Window** 可见、`createSession` 成功、`hello` 往返成功（编辑器窗口不支持远程 host；另需 62 号补丁修复默认 agent 门槛） |
 | P3 | iCode 骨架注册 | **已通过（2026-11-02）**：63 号补丁 + 47 个单测；Agents Window 实测 picker 出现 iCode、`hello` 真实模型往返（`AgentHostFirstResponse outcome=success`，9.7s）、运行中打断（`outcome=cancelled`，面板不卡运行中） |
-| P4 | 常驻会话（ACP） | 多轮上下文、diff 预览、会话恢复（`session/load`）、`ask_user` 映射 |
+| P4 | 常驻会话（ACP） | **已通过（2026-11-03）**：会话恢复（Ctrl+Q 重开后历史回填）、`ask_user` 往返、模型目录发布与切换、早期进度文案、per-turn diff（git checkpoint，64 号补丁）；icode 七套件 74 个单测、changeset 三套件 332 个全绿 |
 | P5 | UI/分发与品牌 | 安装包无国外 agent 字节；双平台冒烟 |
 
 待验证项：56 个 copilot 引导文件降级行为、release.yml 四段真实 runner 验证（2026-10-23 run #13 已触发，versions 已通过，compile 进行中）、G6 L1 哈希比对脚本落地。（P2.5 面板渲染已于 2026-11-01 实测通过，见 §6.5。）
