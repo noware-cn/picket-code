@@ -20,7 +20,7 @@
 | 形态 | Windows UI + 本机 agent host，iCode 子进程经 `wsl.exe` 启动 | Windows UI 连接 WSL 内的 agent host（`chat.remoteAgentHosts`） | 在 WSL 里直接跑 `picket-code`，WSLg 显示 |
 | 文件身份 | 工作区用 `\\wsl.localhost\<distro>\...` 打开，Windows 侧与 WSL 侧是同一批文件 | 同上，但远端 host 直读原生路径 | 原生，无歧义 |
 | 改动量 | 小：1 个新模块 + 传输策略 + 路径回译；不改协议 | 大：要打开 editor 窗口的 `supportsWebSocketConnections`、自管远端 host 生命周期、鉴权、路径映射、每工作区一个 host | 零改动 |
-| 主要风险 | 9p 上跑 git / 大仓库慢（`AgentHostGitService` 在 Windows 侧执行） | 与 A 同样的 9p 风险，外加连接与进程管理复杂度 | 两个窗口，不是"Windows 客户端"体验 |
+| 主要风险 | 宿主侧仍走 9p 的是监视/搜索/语言服务（见 §2.8） | 只去掉 agent 与 git 的 9p；工作区仍以 UNC 打开，监视与搜索依旧跨界（除非自研远程 FS 提供者） | 两个窗口，不是"Windows 客户端"体验 |
 | 授权 | 干净：不用任何微软扩展 | 干净 | 干净 |
 | 结论 | **本次实现** | 作为 A 跑通后的演进（A 的路径映射代码可复用） | 文档里的兜底方案 |
 
@@ -116,7 +116,9 @@ WslGitExecutor    → cp.execFile('wsl.exe', ['-d', distro, '--cd', posix(cwd), 
 
 | 风险 | 说明 | 缓解 |
 |---|---|---|
-| 9p 读写 | 除 git 之外，宿主仍会通过 UNC 读文件（diff 内容、搜索、文件监视）。9p 比原生慢，大仓库的文件监视也可能丢事件 | 会话级接受；文件内容读取加缓存不做（先测再定） |
+| UNC 监视不可靠 | 宿主侧递归监视经 `ReadDirectoryChangesW` 打 `\\wsl.localhost`，事件不保证投递 | M3 主动刷新（按 turn 的变更列表），不依赖监视 |
+| 搜索/语言服务吞吐 | rg 与 TS/eslint 在 Windows 侧扫 UNC，大仓库明显变慢 | 文档给出仓库规模建议；超过阈值推荐 C |
+| 单文件读写 | 每次一次 9p 往返 | 接受，不做补偿 |
 | `wsl.exe` 行尾转换 | 若 `wsl.exe` 在管道上做 CRLF 转换，NDJSON 会带 `\r` | 读取侧已按 `\n` 切行，补一条 `\r` 剥除 + 一条集成用例 |
 | 首次冷启动 | 未启动的 distro 首个 `wsl.exe` 调用要 1–3 s | 会话创建时预热一次 `wsl.exe -d d -- true` |
 | 权限 | `/mnt` 上的写权限与 NTFS ACL 交叉 | 文档明确推荐把工作区放在 distro 原生文件系统（`/home/...`），不要放在 `/mnt/d` |
@@ -131,7 +133,48 @@ WslGitExecutor    → cp.execFile('wsl.exe', ['-d', distro, '--cd', posix(cwd), 
 3. 把 A 的路径映射复用过来；
 4. 权限模型：远端 host 上的 `request_permission` 要回到 Windows UI。
 
-收益：agent host 也在 WSL 里，`git`、文件读写都是原生路径，9p 风险消失。成本约为 A 的 3–4 倍，且要动上游判定逻辑（补丁面变大）。建议 A 上线、收集真实反馈后再决定。
+收益：agent host 也在 WSL 里，`git` 与 agent 的文件读写都是原生路径；但**工作区仍以 UNC 打开**，宿主侧的递归监视、搜索、语言服务照样跨界，所以 B 不会让 9p 风险消失——要彻底消除，得自己实现远程 FS 提供者（等于重造 `vscode-remote`），不在范围内。成本约为 A 的 3–4 倍，且要动上游判定逻辑（补丁面变大）。建议 A 上线、收集真实反馈后再决定。
+
+### 2.8 宿主侧仍走 9p 的部分：真实评估
+
+先回答对照问题：**官方 VS Code + Remote-WSL 里不存在这个风险，一个字节都不走 9p。** 远程窗口的工作区由 `vscode-remote` 通道服务，读、写、枚举、递归监视都在远端进程里执行：
+
+- `src/vs/server/node/remoteFileSystemProviderServer.ts:20` — `RemoteAgentFileSystemProviderChannel extends AbstractDiskFileSystemProviderChannel`，客户端只是 RPC 转发，落盘由 server 自己的磁盘 FS 完成；
+- 同文件 `:76`、`:91` — `IRecursiveWatcherOptions`、`--file-watcher-polling` 都在**服务端**配置，说明递归监视由远端进程执行。
+
+也就是说远程窗口里 Windows 侧只有 UI 与 RPC 客户端；文件系统、`rg`、语言服务全在 WSL。官方文档反复警告"别把代码放 `/mnt/c`"，正是因为一旦跨界就掉到这条慢路径上。
+
+我们的 A 方案框架不同：工作区在 Windows 侧以 UNC `\\wsl.localhost\<distro>\…` 打开，此后任何宿主侧的文件动作都经过 WSL 的重定向器（9p）。逐项评估：
+
+| 宿主侧动作 | 走 9p？ | 实测预期 | 严重度 |
+|---|---|---|---|
+| iCode 自身的读、写、编辑 | 否（WSL 原生） | 原生速度 | — |
+| git（`status`/`diff`/`commit`/`push`） | 否（§2.6 已改道 WSL） | 原生速度 | — |
+| 打开/保存单个文件、diff 文档两侧内容 | 是，一次整文件读写 | 常见源文件毫秒级到几十毫秒 | 低，可接受 |
+| 资源管理器目录枚举、首次展开 | 是 | 千级文件目录数百毫秒 | 低 |
+| **全仓搜索（rg 在 Windows 侧跑）** | 是 | 慢一个数量级；10 万文件规模可能数十秒 | **中～高**（仓库越大越差） |
+| **递归文件监视** | 是，且**不可靠** | `fs.watch` 走 `ReadDirectoryChangesW`，对 `\\wsl.localhost` 的重定向器不保证投递事件 | **高**：iCode 改完文件，编辑器可能不刷新、不重载 |
+| 语言服务（TS server、eslint 等） | 是 | 这些扩展仍跑在 Windows 侧本地扩展宿主，扫描与诊断比官方远程窗口慢 | 中（大仓库明显） |
+
+结论要精确：**"宿主侧读文件内容"本身不是问题**（一次读写，量级可接受）。真正的两处软肋是**递归监视的可靠性**（功能正确性）与**全仓搜索/语言服务的吞吐**（体验）。
+
+所以 M3 里要做的不是"文件读取优化"，而是**摆脱对宿主监视的依赖**：每轮 turn 结束时宿主已经用 WSL git 拿到变更文件列表，据此主动刷新对应模型与状态（或退化为带 `files.watcherExclude` 的轮询监视）。这样即使 UNC 监视不触发，用户也能看到 iCode 改完的结果。搜索与语言服务不做补偿，改为在文档里给出仓库规模建议。
+
+**先测再定（30 分钟，在你的 Windows 机器上）**：
+
+```powershell
+# 1) 监视是否真的会触发 —— A 方案成立与否的关键
+node -e "const fs=require('fs');fs.watch('\\wsl.localhost\Ubuntu\home\<user>\proj',{recursive:true},(e,f)=>console.log(e,f))"
+#    同时在 WSL 里：touch /home/<user>/proj/x.txt
+
+# 2) 全仓搜索耗时（Windows 侧 rg over UNC）
+Measure-Command { rg --files "\\wsl.localhost\Ubuntu\home\<user>\proj" | Out-Null }
+
+# 3) 枚举耗时
+Measure-Command { Get-ChildItem -Recurse "\\wsl.localhost\Ubuntu\home\<user>\proj" | Out-Null }
+```
+
+判定：监视不触发 → M3 的主动刷新是必需项（当前设计已含）；`rg` 超过 ~30 s 或仓库超过 ~10 万文件 → 该仓库建议直接用 C（WSLg 里跑 Linux 版），A 只服务中等规模仓库。
 
 ## 4. 里程碑
 
@@ -139,7 +182,7 @@ WslGitExecutor    → cp.execFile('wsl.exe', ['-d', distro, '--cd', posix(cwd), 
 |---|---|---|
 | M1（0.5–1 天） | `icodeWslPaths.ts`（检测 + 双向映射 + `shQuote`）+ 单测；`icodeLaunchConfig` 增加 `wsl` 传输策略 | 纯单元，fixture 用假 `wsl.exe`（node 脚本记录 argv 并回显 NDJSON） |
 | M2（1 天） | 注册门禁改造 + `icodeAgent` 按工作区选策略 + 启动失败的可读错误 | 单元：UNC 工作区 → 断言 spawn 的是 `wsl.exe` 且 argv 正确；非 UNC → 仍是本机 |
-| M3（1.5 天） | `IGitExecutor` + `WslGitExecutor`（含命令白名单翻译、超时余量）；路径回译（`icodeMapEvents` 之前）；杀进程三级阶梯 + 预热 | 单元：假 `wsl.exe` 断言 git 调用被改道；POSIX 的 `rawInput` 回译成 UNC；`pkill` 被调用 |
+| M3（2 天） | `IGitExecutor` + `WslGitExecutor`（含命令白名单翻译、超时余量）；路径回译（`icodeMapEvents` 之前）；turn 结束按 WSL git 的变更列表主动刷新（不依赖 UNC 监视）；杀进程三级阶梯 + 预热 | 单元：假 `wsl.exe` 断言 git 调用被改道；POSIX 的 `rawInput` 回译成 UNC；`pkill` 被调用；变更列表驱动刷新被触发 |
 | M4（0.5 天） | 文档（`docs/design.md` 一节 + `website/docs/guide/wsl.md` 排障）+ 手动验收清单 | 手工 |
 
 CI 可自动化的部分：M1–M3 全部单元测试（`windows-2022` runner 上 `wsl.exe` 存在，假 distro 用假可执行文件替代；真实 distro 不进 CI）。真机验收项见下。
