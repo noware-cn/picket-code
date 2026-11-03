@@ -52,3 +52,4 @@
 61-build-source-adaptations.patch
 62-chat-default-agent-fallback.patch
 63-agenthost-icode-provider.patch
+64-changeset-auto-diff-strategy.patch

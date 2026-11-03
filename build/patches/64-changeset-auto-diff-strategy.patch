@@ -1,0 +1,207 @@
+diff --git a/src/vs/platform/agentHost/node/agentHostChangesetCoordinator.ts b/src/vs/platform/agentHost/node/agentHostChangesetCoordinator.ts
+index 670c23bd..f17b961c 100644
+--- a/src/vs/platform/agentHost/node/agentHostChangesetCoordinator.ts
++++ b/src/vs/platform/agentHost/node/agentHostChangesetCoordinator.ts
+@@ -10,6 +10,7 @@ import { buildBranchChangesetUri, buildSessionChangesetUri, changesetSession, Ch
+ import { ChangesetFileMonitorCoordinator } from './agentHostChangesetFileMonitorCoordinator.js';
+ import { AgentHostStateManager, ChatRemovalReason, IAgentHostStateManager } from './agentHostStateManager.js';
+ import { IAgentHostChangesetService } from '../common/agentHostChangesetService.js';
++import { DEFAULT_CHANGESET_DIFF_STRATEGY } from './agentHostChangesetService.js';
+ import { IAgentHostChangesetSubscriptionService } from '../common/agentHostChangesetSubscriptionService.js';
+ import { IAgentHostChangesetOperationService } from '../common/agentHostChangesetOperationService.js';
+ import { IAgentHostGitStateService } from '../common/agentHostGitStateService.js';
+@@ -268,7 +269,7 @@ export class AgentHostChangesetCoordinator extends Disposable {
+ 		if (parsed?.kind === ChangesetKind.Turn && parsed.turnId !== undefined) {
+ 			this._addSubscription(parsed.ownerUri, resourceStr);
+ 			if (sessionLoaded) {
+-				void this._changesets.computeTurnChangeset(parsed.ownerUri, parsed.turnId, 'fileEditTracker');
++				void this._changesets.computeTurnChangeset(parsed.ownerUri, parsed.turnId, DEFAULT_CHANGESET_DIFF_STRATEGY);
+ 			}
+ 			return;
+ 		}
+@@ -500,7 +501,7 @@ export class AgentHostChangesetCoordinator extends Disposable {
+ 					break;
+ 				case ChangesetKind.Turn:
+ 					if (parsed.turnId !== undefined) {
+-						void this._changesets.computeTurnChangeset(parsed.ownerUri, parsed.turnId, 'fileEditTracker');
++						void this._changesets.computeTurnChangeset(parsed.ownerUri, parsed.turnId, DEFAULT_CHANGESET_DIFF_STRATEGY);
+ 					}
+ 					break;
+ 			}
+@@ -534,7 +535,7 @@ export class AgentHostChangesetCoordinator extends Disposable {
+ 		await this.restoreSessionIfChangesetSubscription(resource, restoreOwner);
+ 		if (parsed.kind === ChangesetKind.Turn && parsed.turnId) {
+ 			if (!this._stateManager.getChangesetState(resourceStr)) {
+-				void this._changesets.computeTurnChangeset(parsed.ownerUri, parsed.turnId, 'fileEditTracker');
++				void this._changesets.computeTurnChangeset(parsed.ownerUri, parsed.turnId, DEFAULT_CHANGESET_DIFF_STRATEGY);
+ 			}
+ 		} else if (parsed.kind === ChangesetKind.Compare && parsed.originalTurnId && parsed.modifiedTurnId) {
+ 			// Compare-turns is computed once on subscribe. Both turns are
+diff --git a/src/vs/platform/agentHost/node/agentHostChangesetService.ts b/src/vs/platform/agentHost/node/agentHostChangesetService.ts
+index 270c9241..8d960675 100644
+--- a/src/vs/platform/agentHost/node/agentHostChangesetService.ts
++++ b/src/vs/platform/agentHost/node/agentHostChangesetService.ts
+@@ -70,6 +70,13 @@ import { SessionConfigKey } from '../common/sessionConfigKeys.js';
+ import { resolveAgentMergeOwningChat, resolveBranchChangesetScopeForOwner, resolveBranchChangesetScopeForSource, resolveGitHubStateFolder } from './agentHostBranchChangesetScope.js';
+ import { IAgentHostChatOwnershipService } from './agentHostChatOwnershipService.js';
+ 
++/**
++ * The strategy per-turn and Session Changes computations start from: `auto`
++ * diffs the turn's Git checkpoint pair when one resolves, and otherwise falls
++ * back to the tracked file edits.
++ */
++export const DEFAULT_CHANGESET_DIFF_STRATEGY: ChangesetDiffStrategy = 'auto';
++
+ /**
+  * Maximum number of per-repository git diffs a multi-folder fan-out runs at
+  * once. Every resolved repository is diffed; this only bounds how many `git`
+@@ -499,7 +506,7 @@ export class AgentHostChangesetService extends Disposable implements IAgentHostC
+ 		if (!this._hasSubscription(chat, buildSessionChangesetUri(chat)) || !this._hasWorkingDirectory(chat)) {
+ 			return;
+ 		}
+-		this._scheduleStaticRecompute(chat, 'session', changedTurnId, false, clientContext, 'fileEditTracker');
++		this._scheduleStaticRecompute(chat, 'session', changedTurnId, false, clientContext, DEFAULT_CHANGESET_DIFF_STRATEGY);
+ 	}
+ 
+ 	/**
+@@ -536,7 +543,7 @@ export class AgentHostChangesetService extends Disposable implements IAgentHostC
+ 					break;
+ 				case ChangesetKind.Turn:
+ 					if (parsed.turnId !== undefined) {
+-						void this.computeTurnChangeset(session, parsed.turnId, 'fileEditTracker');
++						void this.computeTurnChangeset(session, parsed.turnId, DEFAULT_CHANGESET_DIFF_STRATEGY);
+ 					}
+ 					break;
+ 			}
+@@ -1376,14 +1383,14 @@ export class AgentHostChangesetService extends Disposable implements IAgentHostC
+ 		if (this._shouldScheduleBranchRecompute(session)) {
+ 			this._scheduleBranchRecompute(session, turnId, true, clientContext);
+ 		}
+-		this._scheduleStaticRecompute(this._containingSessionUri(session), 'session', turnId, true, clientContext, 'fileEditTracker');
++		this._scheduleStaticRecompute(this._containingSessionUri(session), 'session', turnId, true, clientContext, DEFAULT_CHANGESET_DIFF_STRATEGY);
+ 		this._scheduleChatChangesSummary(session, false);
+ 	}
+ 
+ 	onSessionTruncated(session: ProtocolURI): void {
+ 		// Turns were removed — recompute from scratch (no changedTurnId).
+ 		this._scheduleBranchRecompute(session, undefined, true);
+-		this._scheduleStaticRecompute(session, 'session', undefined, true, undefined, 'fileEditTracker');
++		this._scheduleStaticRecompute(session, 'session', undefined, true, undefined, DEFAULT_CHANGESET_DIFF_STRATEGY);
+ 		for (const chat of this._stateManager.getSessionState(session)?.chats ?? []) {
+ 			this._refreshChatSessionChangeset(chat.resource);
+ 			this._scheduleChatChangesSummary(chat.resource, false);
+@@ -1514,7 +1521,7 @@ export class AgentHostChangesetService extends Disposable implements IAgentHostC
+ 		if (this._shouldScheduleBranchRecompute(owner)) {
+ 			this._scheduleBranchRecompute(owner, undefined, false);
+ 		}
+-		this._scheduleStaticRecompute(this._containingSessionUri(owner), 'session', undefined, false, undefined, 'fileEditTracker');
++		this._scheduleStaticRecompute(this._containingSessionUri(owner), 'session', undefined, false, undefined, DEFAULT_CHANGESET_DIFF_STRATEGY);
+ 		this._scheduleChatChangesSummary(owner, false);
+ 	}
+ 
+@@ -1556,7 +1563,7 @@ export class AgentHostChangesetService extends Disposable implements IAgentHostC
+ 		if (!this._isChatChangesSummaryOwner(chat)) {
+ 			return;
+ 		}
+-		this._scheduleStaticRecompute(this._containingSessionUri(chat), 'session', undefined, false, undefined, 'fileEditTracker');
++		this._scheduleStaticRecompute(this._containingSessionUri(chat), 'session', undefined, false, undefined, DEFAULT_CHANGESET_DIFF_STRATEGY);
+ 		if (this._chatOwnership.isRegisteredDefaultChat(chat)) {
+ 			return;
+ 		}
+@@ -1683,7 +1690,7 @@ export class AgentHostChangesetService extends Disposable implements IAgentHostC
+ 		const sessionChangesOwner = this._containingSessionUri(session);
+ 		this._debouncedSessionDiffTimers.set(sessionChangesOwner, disposableTimeout(() => {
+ 			this._debouncedSessionDiffTimers.deleteAndDispose(sessionChangesOwner);
+-			this._scheduleStaticRecompute(sessionChangesOwner, 'session', turnId, false, clientContext, 'fileEditTracker');
++			this._scheduleStaticRecompute(sessionChangesOwner, 'session', turnId, false, clientContext, DEFAULT_CHANGESET_DIFF_STRATEGY);
+ 		}, AgentHostChangesetService._DIFF_DEBOUNCE_MS));
+ 		if (isAhpChatChannel(session) && this._hasSubscription(session, buildSessionChangesetUri(session))) {
+ 			this._debouncedSessionDiffTimers.set(session, disposableTimeout(() => {
+@@ -1757,7 +1764,7 @@ export class AgentHostChangesetService extends Disposable implements IAgentHostC
+ 	 * are logged inside `computeTurnChangeset` and do not fail the turn.
+ 	 */
+ 	private _scheduleTurnRecompute(session: ProtocolURI, turnId: string, reportTelemetry: boolean = false, clientContext?: IAgentHostClientTelemetryContext): void {
+-		void this._queueTurnChangeset(session, turnId, reportTelemetry, clientContext, 'fileEditTracker');
++		void this._queueTurnChangeset(session, turnId, reportTelemetry, clientContext, DEFAULT_CHANGESET_DIFF_STRATEGY);
+ 	}
+ 
+ 	private _queueTurnChangeset(session: ProtocolURI, turnId: string, reportTelemetry: boolean, clientContext?: IAgentHostClientTelemetryContext, strategy: ChangesetDiffStrategy = 'auto'): Promise<ProtocolURI> {
+diff --git a/src/vs/platform/agentHost/test/node/agentHostChangesetService.test.ts b/src/vs/platform/agentHost/test/node/agentHostChangesetService.test.ts
+index ea6c5574..05bc2c82 100644
+--- a/src/vs/platform/agentHost/test/node/agentHostChangesetService.test.ts
++++ b/src/vs/platform/agentHost/test/node/agentHostChangesetService.test.ts
+@@ -2677,6 +2677,52 @@ suite('AgentHostChangesetService - multi-root and recomputation', () => {
+ 		assert.strictEqual(repoRootCalls, 0, 'single-folder fallback must not resolve repositories');
+ 	});
+ 
++	test('turn changesets prefer git diffs when checkpoints exist', async () => {
++		const db = new TestSessionDatabase();
++		db.addEdit({ turnId: 'turn-1', toolCallId: 'tc1', filePath: '/wd/tracked.ts', kind: FileEditKind.Edit, addedLines: undefined, removedLines: undefined, beforeContent: encodeString('1'), afterContent: encodeString('1\n2') });
++		const diffCalls: Array<{ fromRef: string; toRef: string }> = [];
++		const git = createNoopGitService();
++		git.computeFileDiffsBetweenRefs = async (_wd, opts) => {
++			diffCalls.push({ fromRef: opts.fromRef, toRef: opts.toRef });
++			return [gitDiff('/wd/git.ts')];
++		};
++		const checkpoint: IAgentHostCheckpointService = { ...NULL_CHECKPOINT_SERVICE, getTurnCheckpointPair: async () => ({ parent: 'ref-0', current: 'ref-1' }) };
++		const turnUri = buildTurnChangesetUri(sessionStr, 'turn-1');
++		const { svc, stateManager } = build({ workingDirectories: ['file:///wd'], git, checkpoint, db, subscriptions: [turnUri] });
++
++		svc.onTurnComplete(sessionStr, 'turn-1');
++		await waitForChangesetReady(stateManager, turnUri);
++
++		assert.deepStrictEqual({
++			diffCalls,
++			files: stateManager.getChangesetState(turnUri)?.files.map(f => f.id),
++		}, {
++			diffCalls: [{ fromRef: 'ref-0', toRef: 'ref-1' }],
++			files: [URI.file('/wd/git.ts').toString()],
++		});
++	});
++
++	test('turn changesets fall back to the tracker instead of failing without checkpoints', async () => {
++		const db = new TestSessionDatabase();
++		db.addEdit({ turnId: 'turn-1', toolCallId: 'tc1', filePath: '/wd/tracked.ts', kind: FileEditKind.Edit, addedLines: undefined, removedLines: undefined, beforeContent: encodeString('1'), afterContent: encodeString('1\n2') });
++		const turnUri = buildTurnChangesetUri(sessionStr, 'turn-1');
++		const { svc, stateManager } = build({ workingDirectories: ['file:///wd'], git: createNoopGitService(), checkpoint: NULL_CHECKPOINT_SERVICE, db, subscriptions: [turnUri] });
++
++		svc.onTurnComplete(sessionStr, 'turn-1');
++		await waitForChangesetReady(stateManager, turnUri);
++
++		const state = stateManager.getChangesetState(turnUri);
++		assert.deepStrictEqual({
++			status: state?.status,
++			error: state?.error,
++			files: state?.files.map(f => f.id),
++		}, {
++			status: ChangesetStatus.Ready,
++			error: undefined,
++			files: [URI.file('/wd/tracked.ts').toString()],
++		});
++	});
++
+ 	/**
+ 	 * A workspace continuation is a real provider turn even though its request
+ 	 * row is hidden; a later pure host notice must not replace it as the latest
+@@ -4389,7 +4435,7 @@ suite('AgentHostChangesetService - multi-root and recomputation', () => {
+ 			});
+ 		});
+ 
+-		test('changesetComputed (turn) omits Git fan-out fields for a tracked multi-root turn', async () => {
++		test('changesetComputed (turn) reports Git fan-out fields for a multi-root turn', async () => {
+ 			const telemetry = new CapturingTelemetryService();
+ 			const git = createNoopGitService();
+ 			git.getRepositoryRoot = async wd => URI.parse(wd.toString());
+@@ -4419,9 +4465,9 @@ suite('AgentHostChangesetService - multi-root and recomputation', () => {
+ 				outcome: 'computed',
+ 				isMultiRoot: true,
+ 				folderCount: 2,
+-				uniqueGitFolderCount: undefined,
+-				nonGitFolderCount: undefined,
+-				trackedEditFallbackFolderCount: undefined,
++				uniqueGitFolderCount: 2,
++				nonGitFolderCount: 0,
++				trackedEditFallbackFolderCount: 0,
+ 			});
+ 		});
+ 	});
