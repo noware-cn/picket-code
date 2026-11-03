@@ -126,6 +126,64 @@ index 270c9241..8d960675 100644
  	}
  
  	private _queueTurnChangeset(session: ProtocolURI, turnId: string, reportTelemetry: boolean, clientContext?: IAgentHostClientTelemetryContext, strategy: ChangesetDiffStrategy = 'auto'): Promise<ProtocolURI> {
+diff --git a/src/vs/platform/agentHost/node/chatContributions/checkpointAndChangeset/checkpointAndChangesetContribution.ts b/src/vs/platform/agentHost/node/chatContributions/checkpointAndChangeset/checkpointAndChangesetContribution.ts
+index e050e8c0..edb16bf6 100644
+--- a/src/vs/platform/agentHost/node/chatContributions/checkpointAndChangeset/checkpointAndChangesetContribution.ts
++++ b/src/vs/platform/agentHost/node/chatContributions/checkpointAndChangeset/checkpointAndChangesetContribution.ts
+@@ -11,7 +11,14 @@ import type { IAgentHostChatContribution, IAgentHostChatContributionContext, ITu
+ import { IAgentConfigurationService } from '../../agentConfigurationService.js';
+ import { URI } from '../../../../../base/common/uri.js';
+ 
+-/** Starts end-of-turn checkpoint capture and schedules tracked changeset recomputation. */
++/**
++ * Captures the end-of-turn checkpoint and then recomputes the turn's changeset.
++ *
++ * The changeset recompute deliberately waits for the checkpoint to settle: the
++ * default `auto` diff strategy diffs the turn's checkpoint pair when one exists,
++ * so recomputing first would race the capture and fall back to the (usually
++ * empty) tracked file edits.
++ */
+ export class CheckpointAndChangesetContribution extends Disposable implements IAgentHostChatContribution {
+ 
+ 	static readonly id = 'checkpointAndChangeset';
+@@ -39,13 +46,18 @@ export class CheckpointAndChangesetContribution extends Disposable implements IA
+ 			return;
+ 		}
+ 
+-		// Preserve checkpoints for compare-turns and explicit Git strategies without blocking later contributions.
++		// `onTurnEnd` must stay synchronous, so the recompute is chained rather than
++		// awaited. A failed capture still recomputes: a stale changeset is worse than
++		// one computed from the tracked edits.
+ 		const workingDirectories = this._agentConfigService.getEffectiveWorkingDirectories(turn.channel)?.map(w => URI.parse(w));
+ 		const checkpoint = this._checkpointService.captureTurnCheckpoint(URI.parse(turn.session), URI.parse(turn.channel), turn.turnId, workingDirectories);
+-		this._onTurnComplete(turn);
+-		void checkpoint.catch(err => {
+-			this._logService.warn(`[AgentSideEffects] Turn checkpoint capture failed for ${turn.session}/${turn.turnId}: ${err instanceof Error ? err.message : String(err)}`);
+-		});
++		void checkpoint.then(
++			() => this._onTurnComplete(turn),
++			err => {
++				this._logService.warn(`[AgentSideEffects] Turn checkpoint capture failed for ${turn.session}/${turn.turnId}: ${err instanceof Error ? err.message : String(err)}`);
++				this._onTurnComplete(turn);
++			},
++		);
+ 	}
+ 
+ 	private _onTurnComplete(turn: ITurnEnd): void {
+diff --git a/src/vs/platform/agentHost/test/node/agentHostChangesetCoordinator.test.ts b/src/vs/platform/agentHost/test/node/agentHostChangesetCoordinator.test.ts
+index c87ff471..ca9427cd 100644
+--- a/src/vs/platform/agentHost/test/node/agentHostChangesetCoordinator.test.ts
++++ b/src/vs/platform/agentHost/test/node/agentHostChangesetCoordinator.test.ts
+@@ -1771,7 +1771,8 @@ class TestChangesetService implements IAgentHostChangesetService {
+ 		return `${session}/changeset/uncommitted`;
+ 	}
+ 	async computeTurnChangeset(session: string, turnId: string, strategy?: ChangesetDiffStrategy): Promise<string> {
+-		assert.strictEqual(strategy, 'fileEditTracker');
++		// Subscribe/restore-triggered turn changesets use the default `auto` strategy.
++		assert.strictEqual(strategy, 'auto');
+ 		const resource = buildTurnChangesetUri(session, turnId);
+ 		this.turnRefreshes.push(resource);
+ 		return resource;
 diff --git a/src/vs/platform/agentHost/test/node/agentHostChangesetService.test.ts b/src/vs/platform/agentHost/test/node/agentHostChangesetService.test.ts
 index ea6c5574..05bc2c82 100644
 --- a/src/vs/platform/agentHost/test/node/agentHostChangesetService.test.ts
@@ -205,3 +263,174 @@ index ea6c5574..05bc2c82 100644
  			});
  		});
  	});
+diff --git a/src/vs/platform/agentHost/test/node/agentHostChangesetStrategy.test.ts b/src/vs/platform/agentHost/test/node/agentHostChangesetStrategy.test.ts
+index 56ca93cc..b4a6fa3c 100644
+--- a/src/vs/platform/agentHost/test/node/agentHostChangesetStrategy.test.ts
++++ b/src/vs/platform/agentHost/test/node/agentHostChangesetStrategy.test.ts
+@@ -314,9 +314,11 @@ suite('AgentHostChangesetStrategy', () => {
+ 		fixture.service.recomputeSubscribedChangesets(session);
+ 		await done;
+ 
++		// Session Changes keep the tracked-edit refresh (which unions peer chats);
++		// the subscribed turn changeset now diffs the turn's Git checkpoints.
+ 		assert.deepStrictEqual({ publications, gitCalls: fixture.gitCalls.length }, {
+ 			publications: [ready([trackedDiff('/repo/peer.txt', peer, 'peer-edit'), trackedDiff()])],
+-			gitCalls: 0,
++			gitCalls: 1,
+ 		});
+ 	});
+ 
+@@ -399,11 +401,7 @@ suite('AgentHostChangesetStrategy', () => {
+ 			const { publications, done } = recordSessionPublications(fixture, distinctStrategies.length);
+ 
+ 			for (const strategy of strategies) {
+-				if (strategy !== 'fileEditTracker') {
+-					fixture.service.refreshSessionChangeset(session, strategy);
+-				} else {
+-					fixture.service.onTurnComplete(session, turnId);
+-				}
++				fixture.service.refreshSessionChangeset(session, strategy);
+ 			}
+ 			await done;
+ 
+@@ -434,7 +432,7 @@ suite('AgentHostChangesetStrategy', () => {
+ 		const { publications, done } = recordSessionPublications(fixture, 3);
+ 		fixture.service.refreshSessionChangeset(session, 'git');
+ 		await started.p;
+-		fixture.service.onTurnComplete(session, turnId);
++		fixture.service.refreshSessionChangeset(session, 'fileEditTracker');
+ 		fixture.service.refreshSessionChangeset(session, 'git');
+ 		await timeout(0);
+ 		const beforeRelease = { publications: [...publications], trackerReads: fixture.db.getAllFileEditsCalls };
+@@ -795,6 +793,8 @@ suite('AgentHostChangesetStrategy', () => {
+ 
+ 	test('incremental tracker recompute excludes edits outside the working directory', async () => {
+ 		const fixture = createFixture();
++		// Without checkpoints, `auto` falls back to tracked edits.
++		fixture.results.pair = undefined;
+ 		addEdit(fixture.db);
+ 		await refresh(fixture, 'fileEditTracker');
+ 		addEdit(fixture.db, '/session-state/plan.md', 'turn-2', 'edit-2');
+@@ -905,7 +905,7 @@ suite('AgentHostChangesetStrategy', () => {
+ 			});
+ 		});
+ 
+-		test(`a lifecycle tracker recompute does not incrementally reuse a ${baseline} cache`, async () => {
++		test(`a lifecycle recompute without checkpoints does not incrementally reuse a ${baseline} cache`, async () => {
+ 			const fixture = createFixture();
+ 			addEdit(fixture.db);
+ 			if (baseline === 'git') {
+@@ -913,6 +913,8 @@ suite('AgentHostChangesetStrategy', () => {
+ 			} else {
+ 				fixture.service.restoreStaticChangeset(session, 'session', [gitOnlyDiff]);
+ 			}
++			// Without a baseline, the lifecycle `auto` recompute falls back to tracked edits.
++			fixture.results.baseline = undefined;
+ 			addEdit(fixture.db, '/repo/second.txt', 'turn-2', 'edit-2');
+ 			const published = nextPublication(fixture.state, sessionChangeset);
+ 			fixture.service.onTurnComplete(session, 'turn-2');
+@@ -943,7 +945,7 @@ suite('AgentHostChangesetStrategy', () => {
+ 	});
+ 
+ 	for (const isolation of ['folder', 'worktree']) {
+-		test(`tool edits and turn completion use tracker for ${isolation} changesets`, () => runWithFakedTimers({ useFakeTimers: true }, async () => {
++		test(`tool edits and turn completion diff Git checkpoints for ${isolation} changesets`, () => runWithFakedTimers({ useFakeTimers: true }, async () => {
+ 			const fixture = createFixture({ isolation });
+ 			addEdit(fixture.db);
+ 			let published = Promise.all([nextPublication(fixture.state, sessionChangeset), nextPublication(fixture.state, turnChangeset)]);
+@@ -962,19 +964,16 @@ suite('AgentHostChangesetStrategy', () => {
+ 				gitCalls: fixture.gitCalls.length,
+ 				trackedReads: [fixture.db.getAllFileEditsCalls, fixture.db.getFileEditsByTurnCalls],
+ 			}, {
+-				midTurn: [ready([trackedDiff()]), ready([trackedDiff()])],
+-				completed: [
+-					ready([trackedDiff('/repo/second.txt', session, 'edit-2'), trackedDiff()]),
+-					ready([trackedDiff('/repo/second.txt', session, 'edit-2'), trackedDiff()]),
+-				],
+-				gitCalls: 0,
+-				trackedReads: [2, 3],
++				midTurn: [ready([gitOnlyDiff]), ready([gitOnlyDiff])],
++				completed: [ready([gitOnlyDiff]), ready([gitOnlyDiff])],
++				gitCalls: 4,
++				trackedReads: [0, 0],
+ 			});
+ 		}));
+ 	}
+ 
+ 	for (const owner of ['default', 'peer'] as const) {
+-		test(`${owner} chat lifecycle changesets use only that chat's tracked snapshots`, () => runWithFakedTimers({ useFakeTimers: true }, async () => {
++		test(`${owner} chat lifecycle changesets diff that chat's Git checkpoints`, () => runWithFakedTimers({ useFakeTimers: true }, async () => {
+ 			const peer = buildChatUri(session, 'peer');
+ 			const peerDb = new TestSessionDatabase();
+ 			const fixture = createFixture({ peer: { resource: peer, db: peerDb, turnId: 'peer-turn' } });
+@@ -986,7 +985,13 @@ suite('AgentHostChangesetStrategy', () => {
+ 			const chatChangeset = buildSessionChangesetUri(chat);
+ 			const chatTurnChangeset = buildTurnChangesetUri(chat, id);
+ 			fixture.subscriptions.add(chatTurnChangeset);
+-			const expected = ready([owner === 'default' ? trackedDiff() : trackedDiff('/repo/peer.txt', peer, 'peer-edit')]);
++			// Each lifecycle step diffs the session's baseline→latest checkpoint pair
++			// and the chat's own turn pair.
++			const checkpointPairs = [
++				{ directory: 'file:///repo', fromRef: 'baseline', toRef: 'current' },
++				{ directory: 'file:///repo', fromRef: 'parent', toRef: 'current' },
++			];
++			const expected = ready([gitOnlyDiff]);
+ 			let published = nextPublication(fixture.state, chatTurnChangeset);
+ 			fixture.service.onToolCallEditsApplied(chat, id);
+ 			await published;
+@@ -1000,12 +1005,20 @@ suite('AgentHostChangesetStrategy', () => {
+ 				chatOwnedSessionChanges: fixture.state.getChangesetState(chatChangeset),
+ 				git: fixture.gitCalls,
+ 				checkpoints: fixture.checkpointCalls,
+-			}, { midTurn: expected, completed: expected, chatOwnedSessionChanges: undefined, git: [], checkpoints: [] });
++			}, {
++				midTurn: expected,
++				completed: expected,
++				chatOwnedSessionChanges: undefined,
++				git: [...checkpointPairs, ...checkpointPairs],
++				checkpoints: ['baseline', turnId, id, 'baseline', turnId, id],
++			});
+ 		}));
+ 	}
+ 
+ 	test('truncation drops removed edits instead of reusing the previous tracker baseline', async () => {
+ 		const fixture = createFixture({ isolation: 'folder' });
++		// Without a baseline, the lifecycle `auto` recompute falls back to tracked edits.
++		fixture.results.baseline = undefined;
+ 		addEdit(fixture.db);
+ 		addEdit(fixture.db, '/repo/deleted-turn.txt', 'turn-2', 'edit-2');
+ 		await refresh(fixture, 'fileEditTracker');
+@@ -1034,7 +1047,7 @@ suite('AgentHostChangesetStrategy', () => {
+ 			turn: snapshot(fixture.state, turnChangeset),
+ 			gitCalls: fixture.gitCalls.length,
+ 			reads: [fixture.db.getAllFileEditsCalls, fixture.db.getFileEditsByTurnCalls],
+-		}, { session: ready([trackedDiff()]), turn: ready([trackedDiff()]), gitCalls: 1, reads: [2, 1] });
++		}, { session: ready([trackedDiff()]), turn: ready([gitOnlyDiff]), gitCalls: 2, reads: [2, 0] });
+ 	});
+ 
+ 	test('main branch changes retain the persisted baseline while using the session folder', async () => {
+diff --git a/src/vs/platform/agentHost/test/node/chatContributions.test.ts b/src/vs/platform/agentHost/test/node/chatContributions.test.ts
+index 4a8de315..bbc10ff7 100644
+--- a/src/vs/platform/agentHost/test/node/chatContributions.test.ts
++++ b/src/vs/platform/agentHost/test/node/chatContributions.test.ts
+@@ -2501,7 +2501,7 @@ suite('AgentHostChatContributions', () => {
+ 	] satisfies ITurnEnd['reason'][]) {
+ 		for (const rejected of [false, true]) {
+ 			for (const owner of ['session', 'defaultChat', 'peerChat'] as const) {
+-				test(`${owner} ${reason.kind} schedules tracked changes without waiting for checkpoint capture that ${rejected ? 'rejects' : 'resolves'}`, async () => {
++				test(`${owner} ${reason.kind} recomputes changes only after the checkpoint capture ${rejected ? 'rejects' : 'resolves'}`, async () => {
+ 					const contributions = createBuiltInContributions(disposables);
+ 					const checkpoint = new DeferredPromise<void>();
+ 					const captures: { session: string; chat: string; turnId: string }[] = [];
+@@ -2537,9 +2537,10 @@ suite('AgentHostChatContributions', () => {
+ 						[channel, turn.turnId, turn.clientContext],
+ 						...(channel === turn.session ? [] : [[turn.session, turn.turnId, turn.clientContext]]),
+ 					];
++					// The recompute waits for the checkpoint so `auto` can diff its pair.
+ 					assert.deepStrictEqual({ captures, whilePending, recomputes, refreshes, warnings }, {
+ 						captures: [{ session: turn.session, chat: channel, turnId: turn.turnId }],
+-						whilePending: { recomputes: expected, refreshes: [] },
++						whilePending: { recomputes: [], refreshes: [] },
+ 						recomputes: expected,
+ 						refreshes: [],
+ 						warnings: rejected ? [`[AgentSideEffects] Turn checkpoint capture failed for ${turn.session}/${turn.turnId}: checkpoint failed`] : [],
