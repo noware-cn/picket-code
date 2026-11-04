@@ -998,58 +998,31 @@ The resolver gains `endpointFor()`: a `direct` record yields the VM port, a `std
 
 ---
 
-### Task 12: Packaging — two flavors, catalog, offline bundle, contract checks
+### Task 12: Packaging — two flavors, catalog, offline bundle, contract checks ✅
+
+**Status:** implemented. Extension side (install-from-file zip branch + `src/offline.js`) landed in vscode `b2473741`; packaging side in the main repo Task 12 commit. Extension suites 144 passing, `build/wsl` suites 15 passing, gate 6/6.
 
 **Files:**
-- Create: `build/wsl/assemble.mjs`
-- Create: `build/wsl/check.mjs`
-- Create: `build/wsl/offline-bundle.mjs`
-- Create: `build/wsl/fetch-payload.sh`
-- Create: `build/wsl/test/assemble.test.mjs`, `build/wsl/test/check.test.mjs`, `build/wsl/test/offline-bundle.test.mjs`
-- Modify: `build/build.sh`, `build/win32/package.sh`, `build/check-contract.sh`, `.github/workflows/release.yml`
-- Modify: `docs/testing.md`
+- Create: `build/wsl/lib/common.mjs` (shared `payloadName` / `parseSha256Sums` / `componentFor` / `sha256File` / `parseArgs` / `runCli`), `build/wsl/assemble.mjs`, `build/wsl/check.mjs`, `build/wsl/offline-bundle.mjs`, `build/wsl/fetch-payload.sh`
+- Create: `build/wsl/test/assemble.test.mjs` (5), `build/wsl/test/check.test.mjs` (7), `build/wsl/test/offline-bundle.test.mjs` (3)
+- Create: `vscode/extensions/picket-remote-wsl/src/offline.js` + `test/offline.test.js` — `unpackOfflineBundle` (Task 3 leftover, landed here): expands the bundle zip (unzip / PowerShell `Expand-Archive` via env-passed paths), verifies the payload against the bundle's own SHA256SUMS and catalog, returns `{dir, payloadPath, payloadSha256, payloadSize, catalog, sums}`; `commands.js` "从文件安装…" accepts `*.zip` and routes through it, temp dir always removed
+- Modify: `build/build.sh`, `build/win32/package.sh`, `build/linux/package.sh`, `build/check-contract.sh`, `build/wsl/gate.sh` (item 6), `.github/workflows/release.yml`, `.gitignore` (`build/wsl/download/`)
 
-**Interfaces:**
-- Consumes: the built app directory (`VSCode-win32-x64/resources/app`), the payload `*.tar.gz`, the tag.
-- Produces: `assemble({ appDir, tag, flavor, payloadPath, sha256sumsPath }): Promise<void>` — writes `product.json.picketTag`, writes `<app>/extensions/picket-remote-wsl/payloads/catalog.json`, copies the payload for `embedded`, deletes any `*.tar.gz` for `ondemand`, and throws when the payload file name does not contain the tag.
-- Produces: `check({ appDir, flavor, maxEmbeddedBytes }): string[]` — returns violation strings (empty = pass).
-- Produces: `offlineBundle({ payloadPath, sha256sumsPath, catalogPath, outFile }): Promise<void>`.
-- CLI shapes: `node build/wsl/assemble.mjs --app <dir> --tag <tag> --flavor <embedded|ondemand> [--payload <file> --sums <file>]`, `node build/wsl/check.mjs --app <dir> --flavor <f> [--max-embedded-mb 110]`, `node build/wsl/offline-bundle.mjs --payload <f> --sums <f> --catalog <f> --out <zip>`.
+**Implemented CLIs** (plan's object-returning shapes became plain CLIs — packaging has no caller that needs a library):
+- `assemble.mjs --app <resources/app> --tag <server-tag> --flavor embedded|ondemand [--payload f] [--sums f] [--size n]` — writes `<app>/extensions/picket-remote-wsl/payloads/catalog.json`, stamps `product.json.picketTag`, copies the payload to `resources/wsl-payloads/` for embedded (the directory `extension.js` actually reads — the plan's `payloads/` was wrong), refuses payload names without the tag, cross-checks `--sums` when given, asserts no `*.tar.gz` leaks into ondemand apps.
+- `check.mjs --app <resources/app> --flavor f [--max-embedded-mb 110]` — exit 1 + stderr message on: missing proposal key, catalog.tag ≠ picketTag, catalog.flavor ≠ `--flavor`, no component for the payload name, embedded payload missing / sha / size mismatch, extension tree over budget (`embedded payload exceeds N MB`), ondemand app containing a payload.
+- `offline-bundle.mjs --dir <download> --tag <tag> --out <zip>` — validates the staged trio (payload present, SHA256SUMS has the entry, digest matches, catalog.tag matches, catalog has the component), then zips the three files flat (`zip -j -X`, or `Compress-Archive` on win32 runners).
+- `fetch-payload.sh <server-tag> [--metadata-only]` — `gh release download` from `noware-cn/picket-code-server` (`PICKET_SERVER_REPO` overridable, `PICKET_SERVER_TOKEN`→`GH_TOKEN`); the sums asset is named `picket-code-server-<tag>-SHA256SUMS` and is renamed to `SHA256SUMS` locally; always writes `payload-size.txt` (via the releases API) and derives `catalog.json` (single writer); full mode also downloads the payload and verifies its digest before staging.
 
-- [ ] **Step 1: Write the failing tests**
+**Wiring (deviations from the original step text):**
+- `--tag` is the **server** tag from `PICKET_SERVER_TAG` (the payload repo versions independently), not the client `$2`; `picketTag` therefore identifies the shipped server payload, which is what resolver/components/diagnose key on.
+- assemble runs for **both** platforms in `build.sh` (linux gets `--flavor ondemand` too), with `--app` pointing at `VSCode-$PLATFORM-$ARCH/resources/app` — product.json and extensions/ live under `resources/app`, not the product root.
+- Flavor comes from workflow-level env `PICKET_WSL_PAYLOAD` (public releases: `ondemand`; the internal distribution overrides to `embedded`); `PICKET_SERVER_TAG` from repo variables, `PICKET_SERVER_TOKEN` from secrets.
+- The offline bundle is built **once, in the win32 package job** (platform-independent content; duplicate artifact names would collide), uploaded as `picket-code-<ref>-offline-wsl.zip`; the release job's `picket-code-*` glob publishes it.
+- `check-contract.sh` §5: proposal key present in `build/product.json` + the four `build/wsl` tools exist + all three package paths call `check.mjs`.
+- `docs/testing.md` was left alone (it is the iCode ACP matrix); the WSL verification story lands in `docs/wsl-verification.md` in Task 14.
 
-`build/wsl/test/check.test.mjs` — a fixture app directory built in `tmpdir()` with a fake extension folder: passes when catalog matches `picketTag`; fails with `ondemand build contains a payload` when a `.tar.gz` is present; fails with `catalog version X does not match picketTag Y`; fails with `embedded payload missing`; fails with `sha256 mismatch`; fails with `extensionEnabledApiProposals is missing noware.picket-remote-wsl`; fails with `embedded app exceeds 110 MB` when the fake payload exceeds the threshold.
-
-`build/wsl/test/assemble.test.mjs` — `ondemand` leaves no `*.tar.gz` and writes `embedded: false`; `embedded` copies and records size/sha256; a payload whose name lacks the tag throws `payload file name does not contain tag`.
-
-`build/wsl/test/offline-bundle.test.mjs` — the produced zip contains exactly `*.tar.gz`, `SHA256SUMS`, `catalog.json`, and unzipping it through the extension's `unpackOfflineBundle` yields a tar.gz whose sha matches.
-
-- [ ] **Step 2: Run the tests to verify they fail**
-
-Run: `node --test build/wsl/test/`
-Expected: FAIL — modules not found.
-
-- [ ] **Step 3: Implement the three scripts**
-
-`assemble.mjs` copies via `fs.cp`, computes the digest with `node:crypto`, and writes JSON with `JSON.stringify(…, null, '\t')`. `check.mjs` reads `<app>/product.json` and the extension's `catalog.json`, and measures the extension directory recursively. Both are pure Node, no dependencies.
-
-- [ ] **Step 4: Run the tests to verify they pass**
-
-Run: `node --test build/wsl/test/`
-Expected: PASS, 12 tests.
-
-- [ ] **Step 5: Wire it into the build, then verify end to end**
-
-`build/build.sh`: after `npm run gulp "vscode-$PLATFORM-$ARCH-min"`, when `$PLATFORM = win32`, run `node build/wsl/assemble.mjs --app "VSCode-win32-x64/resources/app" --tag "$2" --flavor "${PICKET_WSL_PAYLOAD:-embedded}" --payload "build/wsl/download/<file>.tar.gz" --sums "build/wsl/download/SHA256SUMS"` when the flavor is `embedded`. Pass the **original** tag argument (`$2`, e.g. `v1.143.1-picket.1-rc.4`), not the `v`-stripped `$PICKET_VERSION`, because the payload file name carries the `v`; for Linux run it with `--flavor ondemand` and no payload. `build/win32/package.sh` runs `node build/wsl/check.mjs --app "$OUT_DIR/resources/app" --flavor "${PICKET_WSL_PAYLOAD:-embedded}" --max-embedded-mb 110` before zipping and aborts on any violation. `build/check-contract.sh` gains a case asserting `build/product.json` contains `"noware.picket-remote-wsl": ["resolvers"]`. `.github/workflows/release.yml` (windows job): add a step that runs `build/wsl/fetch-payload.sh "$GITHUB_REF_NAME"` when the flavor is `embedded`, and a step after packaging that uploads `picket-code-<tag>-offline-wsl.zip` produced by `offline-bundle.mjs`. `docs/testing.md`: add the L3 manual checklist from the spec §6 twice — once per flavor — plus the tunnel cases.
-
-`build/wsl/fetch-payload.sh` creates `build/wsl/download/` and leaves the `*.tar.gz` plus `SHA256SUMS` there; `assemble.mjs` reads from that directory. Run the whole path on a Windows machine: `PICKET_WSL_PAYLOAD=embedded bash build/build.sh 1.143.1 1.143.1-picket.1-rc.4 win32 x64` then `bash build/win32/package.sh`; expect the zip to contain `picket-code-win32-x64/resources/app/extensions/picket-remote-wsl/payloads/picket-code-server-<tag>-linux-x64.tar.gz` and `catalog.json` with `"embedded": true`. Repeat with `PICKET_WSL_PAYLOAD=ondemand`: no `*.tar.gz`, `check.mjs` passes.
-
-- [ ] **Step 6: Commit**
-
-```bash
-git add build/wsl build/build.sh build/win32/package.sh build/check-contract.sh .github/workflows/release.yml docs/testing.md
-git commit -m "build(wsl): assemble catalog for both flavors, offline bundle, and contract checks"
-```
+**Verified end to end against the real release** `v1.143.1-picket.1-rc.4`: metadata-only fetch (size 87754427 from the API, catalog derived from sums), full fetch with digest verification (87754427 bytes), embedded assemble into a fixture app → `check.mjs` pass → offline bundle → `unzip -l` shows exactly the payload + SHA256SUMS + catalog.json → the extension's `unpackOfflineBundle` round-trips the real bundle (digest match, temp dir removed).
 
 ---
 

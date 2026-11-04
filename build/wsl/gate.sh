@@ -88,5 +88,16 @@ else
 	printf '%s\n' "$dirty" | head -10
 fi
 
+# 6. Packaging-script suites (build/wsl/*.mjs: assemble / check / offline-bundle)
+out=$(cd "$ROOT_DIR" && node --test "build/wsl/test/*.test.mjs" 2>&1)
+rc=$?
+tail_of_log=$(printf '%s\n' "$out" | grep -E '^# (pass|fail)' | tr '\n' ' ')
+if [ $rc -eq 0 ]; then
+	report ok "build/wsl tests" "${tail_of_log:-all suites passed}"
+else
+	report fail "build/wsl tests" "${tail_of_log:-see output above}"
+	printf '%s\n' "$out" | tail -40
+fi
+
 echo "==> $pass passed, $fail failed, $skip skipped"
 [ $fail -eq 0 ]

@@ -638,10 +638,10 @@ index 00000000..f612ff0a
 +module.exports = { loadCatalog };
 diff --git a/extensions/picket-remote-wsl/src/commands.js b/extensions/picket-remote-wsl/src/commands.js
 new file mode 100644
-index 00000000..23e0345a
+index 00000000..f8d8e405
 --- /dev/null
 +++ b/extensions/picket-remote-wsl/src/commands.js
-@@ -0,0 +1,367 @@
+@@ -0,0 +1,382 @@
 +'use strict';
 +
 +const { listDistros, distroHome, visibleDistros } = require('./distro.js');
@@ -649,6 +649,7 @@ index 00000000..23e0345a
 +const { manageDistro } = require('./manage.js');
 +const { buildDiagnostics } = require('./diagnose.js');
 +const { selectGallery, installVsix } = require('./marketplace.js');
++const { unpackOfflineBundle, removeBundle } = require('./offline.js');
 +
 +const LAST_DISTRO = 'picket.wsl.lastDistro';
 +const SERVER_COMPONENT = 'wsl-server';
@@ -756,13 +757,27 @@ index 00000000..23e0345a
 +			const picked = await host.showOpenDialog({
 +				canSelectFiles: true,
 +				canSelectMany: false,
-+				title: '选择服务器载荷 tar.gz',
-+				filters: { '服务器载荷': ['gz', 'tgz'] }
++				title: '选择服务器载荷 tar.gz 或离线组件包 zip',
++				filters: { '服务器载荷': ['gz', 'tgz'], '离线组件包': ['zip'] }
 +			});
 +			const file = Array.isArray(picked) ? picked[0] : picked;
 +			const path = file?.fsPath ?? file?.path ?? (typeof file === 'string' ? file : '');
 +			if (!path) {
 +				return false;
++			}
++			if (/\.zip$/i.test(path)) {
++				let bundle;
++				try {
++					bundle = await unpackOfflineBundle({ bundlePath: path });
++				} catch (error) {
++					await host.showErrorMessage(`离线组件包无法使用：${error.message}`);
++					return false;
++				}
++				try {
++					return await install(createComponents({ distro: target.distro, home: target.home, explicitPath: bundle.payloadPath }));
++				} finally {
++					await removeBundle(bundle.dir);
++				}
 +			}
 +			return install(createComponents({ distro: target.distro, home: target.home, explicitPath: path }));
 +		}
@@ -2343,6 +2358,146 @@ index 00000000..f1756287
 +}
 +
 +module.exports = { maybeNudge, NUDGE_KEY };
+diff --git a/extensions/picket-remote-wsl/src/offline.js b/extensions/picket-remote-wsl/src/offline.js
+new file mode 100644
+index 00000000..5a909a32
+--- /dev/null
++++ b/extensions/picket-remote-wsl/src/offline.js
+@@ -0,0 +1,134 @@
++'use strict';
++
++const { execFile } = require('node:child_process');
++const { mkdtemp, readFile, readdir, rm, stat } = require('node:fs/promises');
++const { tmpdir } = require('node:os');
++const { join } = require('node:path');
++const { createHash } = require('node:crypto');
++const { promisify } = require('node:util');
++
++const run = promisify(execFile);
++
++/**
++ * A Windows path with spaces arrives through argv, so neither tool ever sees a
++ * shell string: `unzip` takes argv directly and PowerShell reads the two paths
++ * from the environment, which no quoting rule can mangle.
++ * @param {string} zipPath
++ * @param {string} destDir
++ * @returns {Promise<void>}
++ */
++async function defaultExpand(zipPath, destDir) {
++	if (process.platform === 'win32') {
++		await run('powershell.exe', [
++			'-NoProfile', '-NonInteractive', '-Command',
++			'Expand-Archive -LiteralPath $env:PICKET_ZIP -DestinationPath $env:PICKET_DEST -Force'
++		], { env: { ...process.env, PICKET_ZIP: zipPath, PICKET_DEST: destDir } });
++		return;
++	}
++	await run('unzip', ['-o', '-q', zipPath, '-d', destDir]);
++}
++
++/** @param {string} dir @returns {Promise<string[]>} every file below dir */
++async function walk(dir) {
++	const entries = await readdir(dir, { withFileTypes: true });
++	const files = [];
++	for (const entry of entries) {
++		const path = join(dir, entry.name);
++		if (entry.isDirectory()) {
++			files.push(...await walk(path));
++		} else if (entry.isFile()) {
++			files.push(path);
++		}
++	}
++	return files;
++}
++
++/**
++ * Everything a bundle claims must hold before the installer touches the distro:
++ * the payload exists, its digest is the one SHA256SUMS records, and the catalog
++ * describes exactly that file.
++ * @param {{
++ *   bundlePath: string,
++ *   destDir?: string,
++ *   expand?: (zipPath: string, destDir: string) => Promise<void>
++ * }} options
++ * @returns {Promise<{ dir: string, payloadPath: string, payloadSha256: string, payloadSize: number, catalog: any, sums: Map<string, string> }>}
++ */
++async function unpackOfflineBundle(options) {
++	const dir = options.destDir ?? await mkdtemp(join(tmpdir(), 'picket-wsl-bundle-'));
++	try {
++		await (options.expand ?? defaultExpand)(options.bundlePath, dir);
++
++		const files = await walk(dir);
++		const payload = files.find(file => /\.t(?:ar\.)?gz$/i.test(file) && !file.includes('picket-wsl-offline'));
++		if (!payload) {
++			throw new Error('The offline bundle contains no *.tar.gz server payload');
++		}
++		const catalogFile = files.find(file => file.endsWith('catalog.json'));
++		if (!catalogFile) {
++			throw new Error('The offline bundle contains no catalog.json');
++		}
++		const sumsFile = files.find(file => file.endsWith('SHA256SUMS'));
++		if (!sumsFile) {
++			throw new Error('The offline bundle contains no SHA256SUMS');
++		}
++
++		const sums = parseSha256Sums(await readFile(sumsFile, 'utf8'));
++		const name = payload.slice(payload.lastIndexOf('/') + 1).replace(/\\/g, '/');
++		const expected = sums.get(name);
++		if (!expected) {
++			throw new Error(`SHA256SUMS has no entry for ${name}`);
++		}
++
++		const bytes = await readFile(payload);
++		const actual = createHash('sha256').update(bytes).digest('hex');
++		if (actual !== expected.toLowerCase()) {
++			throw new Error(`sha256 mismatch for ${name}: expected ${expected.toLowerCase()}, got ${actual}`);
++		}
++
++		const catalog = JSON.parse(await readFile(catalogFile, 'utf8'));
++		const component = Array.isArray(catalog?.components)
++			? catalog.components.find((/** @type {any} */ c) => c.file === name)
++			: undefined;
++		if (!component) {
++			throw new Error(`The bundle's catalog has no component for ${name}`);
++		}
++
++		return {
++			dir,
++			payloadPath: payload,
++			payloadSha256: actual,
++			payloadSize: bytes.length,
++			catalog,
++			sums
++		};
++	} catch (error) {
++		if (!options.destDir) {
++			await rm(dir, { recursive: true, force: true }).catch(() => { });
++		}
++		throw error;
++	}
++}
++
++/**
++ * @param {string} text
++ * @returns {Map<string, string>}
++ */
++function parseSha256Sums(text) {
++	/** @type {Map<string, string>} */
++	const sums = new Map();
++	for (const line of String(text ?? '').split(/\r?\n/)) {
++		const match = /^([0-9a-fA-F]{64})\s+\*?(.+)$/.exec(line.trim());
++		if (match) {
++			sums.set(match[2].trim(), match[1].toLowerCase());
++		}
++	}
++	return sums;
++}
++
++/** @param {string} dir */
++async function removeBundle(dir) {
++	await rm(dir, { recursive: true, force: true });
++}
++
++module.exports = { unpackOfflineBundle, removeBundle, parseSha256Sums, defaultExpand };
 diff --git a/extensions/picket-remote-wsl/src/payload.js b/extensions/picket-remote-wsl/src/payload.js
 new file mode 100644
 index 00000000..62602222
@@ -3403,15 +3558,23 @@ index 00000000..350ec874
 +});
 diff --git a/extensions/picket-remote-wsl/test/commands.test.js b/extensions/picket-remote-wsl/test/commands.test.js
 new file mode 100644
-index 00000000..275145dc
+index 00000000..fc07775f
 --- /dev/null
 +++ b/extensions/picket-remote-wsl/test/commands.test.js
-@@ -0,0 +1,195 @@
+@@ -0,0 +1,240 @@
 +// RED first: this file must fail until src/commands.js exists.
 +const test = require('node:test');
 +const assert = require('node:assert');
++const { execFile } = require('node:child_process');
++const { promisify } = require('node:util');
++const { mkdtemp, mkdir, writeFile, readdir, rm } = require('node:fs/promises');
++const { tmpdir } = require('node:os');
++const { join } = require('node:path');
++const { createHash } = require('node:crypto');
 +const { createCommands } = require('../src/commands.js');
 +const { createFakeHost, createFakeComponents, createCatalog } = require('./fixtures/fake-host.js');
++
++const run = promisify(execFile);
 +
 +const TABLE = '* Ubuntu-24.04    Running         2\n  Debian          Stopped         2';
 +
@@ -3601,6 +3764,43 @@ index 00000000..275145dc
 +	const ctx = harness({ state: 'installed', host: { quickPick: 'Debian', openDialog: [{ path: '/home/u/src' }] } });
 +	await ctx.commands.openFolder();
 +	assert.strictEqual(ctx.memento.get('picket.wsl.lastDistro'), 'Debian');
++});
++
++test('a picked offline bundle zip installs its payload and cleans the temp dir up', async () => {
++	const work = await mkdtemp(join(tmpdir(), 'picket-wsl-cmd-'));
++	try {
++		const payload = Buffer.from('payload-bytes');
++		const sha = createHash('sha256').update(payload).digest('hex');
++		const name = 'picket-code-server-v1.0.0-linux-x64.tar.gz';
++		const inner = join(work, 'inner');
++		await mkdir(inner, { recursive: true });
++		await writeFile(join(inner, name), payload);
++		await writeFile(join(inner, 'SHA256SUMS'), `${sha}  ${name}\n`);
++		await writeFile(join(inner, 'catalog.json'), JSON.stringify({
++			version: 1, tag: 'v1.0.0', flavor: 'ondemand',
++			components: [{ id: 'wsl-server', kind: 'server', version: 'v1.0.0', file: name, size: payload.length, sha256: sha, embedded: false }]
++		}));
++		const zip = join(work, 'bundle.zip');
++		await run('zip', ['-j', '-q', zip, join(inner, name), join(inner, 'SHA256SUMS'), join(inner, 'catalog.json')]);
++
++		const ctx = harness({
++			flavor: 'ondemand',
++			host: {
++				quickPick: 'Ubuntu-24.04',
++				openDialog: (opts) => (opts.canSelectFolders ? [{ path: '/home/u/project' }] : zip),
++				info: ['从文件安装…']
++			}
++		});
++		await ctx.commands.openFolder();
++
++		assert.strictEqual(ctx.ensured.length, 1);
++		assert.match(ctx.ensured[0].config.explicitPath, /picket-code-server-v1\.0\.0-linux-x64\.tar\.gz$/);
++		assert.strictEqual(ctx.host.opened.length, 1);
++		const tempRoots = (await readdir(work)).filter(entry => entry.startsWith('picket-wsl-bundle-'));
++		assert.deepStrictEqual(tempRoots, [], 'the unpacked bundle must not outlive the install');
++	} finally {
++		await rm(work, { recursive: true, force: true });
++	}
 +});
 diff --git a/extensions/picket-remote-wsl/test/components.test.js b/extensions/picket-remote-wsl/test/components.test.js
 new file mode 100644
@@ -4437,7 +4637,7 @@ index 00000000..118dde5d
 +});
 diff --git a/extensions/picket-remote-wsl/test/manifest.test.js b/extensions/picket-remote-wsl/test/manifest.test.js
 new file mode 100644
-index 00000000..ea81f5d3
+index 00000000..484966ce
 --- /dev/null
 +++ b/extensions/picket-remote-wsl/test/manifest.test.js
 @@ -0,0 +1,66 @@
@@ -4491,7 +4691,7 @@ index 00000000..ea81f5d3
 +	// log.js is the one vscode-bound helper: it owns an OutputChannel.
 +	const sources = ['catalog.js', 'distro.js', 'components.js', 'payload.js', 'launch.js', 'probe.js',
 +		'remoteUri.js', 'resolver.js', 'icode.js', 'preflight.js', 'tree.js', 'manage.js', 'diagnose.js',
-+		'nudge.js', 'commands.js', 'marketplace.js'];
++		'nudge.js', 'commands.js', 'marketplace.js', 'offline.js'];
 +	for (const name of sources) {
 +		const text = readFileSync(join(root, 'src', name), 'utf8');
 +		assert.doesNotMatch(text, /require\(['"]vscode['"]\)/, `${name} must stay testable without an extension host`);
@@ -4686,6 +4886,115 @@ index 00000000..1ae6d0d9
 +	const host = createFakeHost();
 +	assert.strictEqual(await maybeNudge({ host, memento: memento(), folders: [] }), false);
 +	assert.deepStrictEqual(host.messages, []);
++});
+diff --git a/extensions/picket-remote-wsl/test/offline.test.js b/extensions/picket-remote-wsl/test/offline.test.js
+new file mode 100644
+index 00000000..55696e9f
+--- /dev/null
++++ b/extensions/picket-remote-wsl/test/offline.test.js
+@@ -0,0 +1,103 @@
++'use strict';
++
++const test = require('node:test');
++const assert = require('node:assert/strict');
++const { createHash } = require('node:crypto');
++const { mkdtemp, mkdir, writeFile, readFile, rm } = require('node:fs/promises');
++const { tmpdir } = require('node:os');
++const { join } = require('node:path');
++const { execFile } = require('node:child_process');
++const { promisify } = require('node:util');
++const run = promisify(execFile);
++
++const { unpackOfflineBundle, removeBundle } = require('../src/offline.js');
++
++const NAME = 'picket-code-server-v1.0.0-linux-x64.tar.gz';
++const PAYLOAD = Buffer.from([0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03]);
++const SHA = createHash('sha256').update(PAYLOAD).digest('hex');
++
++/** Builds a real zip with the Info-ZIP CLI, the same tool CI has. */
++async function buildBundle(dir) {
++	const inner = join(dir, 'bundle-src');
++	await mkdir(inner, { recursive: true });
++	await writeFile(join(inner, NAME), PAYLOAD);
++	await writeFile(join(inner, 'SHA256SUMS'), `${SHA}  ${NAME}\n`);
++	await writeFile(join(inner, 'catalog.json'), JSON.stringify({
++		version: 1,
++		tag: 'v1.0.0',
++		flavor: 'ondemand',
++		components: [{
++			id: 'wsl-server',
++			kind: 'server',
++			version: 'v1.0.0',
++			file: NAME,
++			size: 10,
++			sha256: SHA,
++			embedded: false
++		}]
++	}, null, '\t'));
++	const zip = join(dir, 'picket-wsl-offline.zip');
++	await run('zip', ['-j', '-q', zip, join(inner, NAME), join(inner, 'SHA256SUMS'), join(inner, 'catalog.json')]);
++	return zip;
++}
++
++test('an offline bundle unpacks to a verified payload, sums and catalog', async () => {
++	const work = await mkdtemp(join(tmpdir(), 'picket-wsl-test-'));
++	try {
++		const zip = await buildBundle(work);
++		const unpacked = await unpackOfflineBundle({ bundlePath: zip });
++
++		assert.equal(unpacked.catalog.tag, 'v1.0.0');
++		assert.equal(unpacked.sums.get(NAME), SHA);
++		assert.equal(unpacked.payloadSha256, SHA, 'the payload digest is checked before anything is installed');
++		assert.match(unpacked.payloadPath, /picket-code-server-v1\.0\.0-linux-x64\.tar\.gz$/);
++
++		const bytes = await readFile(unpacked.payloadPath);
++		assert.equal(bytes.length, 10);
++	} finally {
++		await rm(work, { recursive: true, force: true });
++	}
++});
++
++test('a payload whose digest disagrees with SHA256SUMS is refused', async () => {
++	const work = await mkdtemp(join(tmpdir(), 'picket-wsl-test-'));
++	try {
++		const zip = await buildBundle(work);
++		// Corrupt the archive's payload by rebuilding it with different bytes.
++		const unpacked = await unpackOfflineBundle({ bundlePath: zip });
++		await writeFile(unpacked.payloadPath, Buffer.from('tampered'));
++		await assert.rejects(
++			() => unpackOfflineBundle({
++				bundlePath: zip,
++				expand: async (bundle, dest) => {
++					const { defaultExpand } = require('../src/offline.js');
++					await defaultExpand(bundle, dest);
++					await writeFile(join(dest, NAME), Buffer.from('tampered'));
++				}
++			}),
++			/sha256 mismatch/
++		);
++	} finally {
++		await rm(work, { recursive: true, force: true });
++	}
++});
++
++test('a bundle without a catalog is refused before any file is installed', async () => {
++	const work = await mkdtemp(join(tmpdir(), 'picket-wsl-test-'));
++	try {
++		const inner = join(work, 'inner');
++		await mkdir(inner, { recursive: true });
++		await writeFile(join(inner, NAME), 'x');
++		const zip = join(work, 'bare.zip');
++		await run('zip', ['-j', '-q', zip, join(inner, NAME)]);
++		await assert.rejects(() => unpackOfflineBundle({ bundlePath: zip }), /catalog\.json/);
++	} finally {
++		await rm(work, { recursive: true, force: true });
++	}
++});
++
++test('removeBundle deletes the temporary directory', async () => {
++	const dir = await mkdtemp(join(tmpdir(), 'picket-wsl-test-'));
++	await removeBundle(dir);
++	await assert.rejects(() => readFile(join(dir, 'x')), /ENOENT/);
 +});
 diff --git a/extensions/picket-remote-wsl/test/payload.test.js b/extensions/picket-remote-wsl/test/payload.test.js
 new file mode 100644

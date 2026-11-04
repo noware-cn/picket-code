@@ -18,6 +18,19 @@ on:
 permissions:
   contents: write
 
+# WSL server component (docs/superpowers/plans/2026-11-04-picket-wsl.md Task 12).
+# Public builds ship the ondemand flavor: the app carries only the component
+# catalog and downloads the payload on first use. Embedded builds (payload
+# inside the app, zero first-use download) are cut by the internal
+# distribution from a checkout that overrides PICKET_WSL_PAYLOAD=embedded.
+# PICKET_SERVER_TAG pins the noware-cn/picket-code-server release whose
+# payload ships; set it in the repo variables. PICKET_SERVER_TOKEN is a PAT
+# that can read that private repository.
+env:
+  PICKET_WSL_PAYLOAD: ondemand
+  PICKET_SERVER_TAG: ${{ vars.PICKET_SERVER_TAG }}
+  PICKET_SERVER_TOKEN: ${{ secrets.PICKET_SERVER_TOKEN }}
+
 # Gate order (docs/testing.md §3.1): the automated test layers run before anything is
 # compiled, packaged or published, so a red layer means no artifacts and no release.
 #   tests     → L1 (iCode + agentHostChangeset) and L2 (fake ACP CLI) + contract checks
@@ -178,6 +191,18 @@ jobs:
         run: |
           bash build/${{ matrix.platform }}/package.sh "${{ matrix.platform }}" "${{ matrix.arch }}"
 
+      # The offline component bundle is platform-independent (a Linux server
+      # payload plus metadata), so it is built once, in the win32 job only —
+      # WSL is a Windows-host scenario and duplicate artifact names collide.
+      - name: Offline WSL component bundle
+        if: matrix.platform == 'win32'
+        shell: bash
+        run: |
+          bash build/wsl/fetch-payload.sh "$PICKET_SERVER_TAG"
+          node build/wsl/offline-bundle.mjs \
+            --dir build/wsl/download --tag "$PICKET_SERVER_TAG" \
+            --out "picket-code-${{ github.ref_name }}-offline-wsl.zip"
+
       # The archives leave package.sh under a version-less name so the checks below
       # can address one stable directory. Published files, however, carry the tag:
       # mirror URLs stay immutable, so they can be cached forever and three versions
@@ -299,6 +324,7 @@ jobs:
           name: picket-code-${{ matrix.platform }}-${{ matrix.arch }}
           path: |
             picket-code-${{ github.ref_name }}-${{ matrix.platform }}-${{ matrix.arch }}.*
+            picket-code-${{ github.ref_name }}-offline-wsl.zip
             SHA256SUMS-${{ matrix.platform }}-${{ matrix.arch }}
           if-no-files-found: error
 

@@ -78,6 +78,20 @@ else
   echo "ok: artifacts fetched from GitHub Releases + verified against SHA256SUMS"
 fi
 
+# ---- 5. the WSL server component stays wired into the packaging pipeline ----
+grep -q '"noware.picket-remote-wsl"' "$ROOT_DIR/build/product.json" \
+  || fail "build/product.json lost the picket-remote-wsl API proposal"
+for f in build.sh win32/package.sh linux/package.sh; do
+  grep -q 'wsl/check.mjs' "$SCRIPT_DIR/$f" \
+    || fail "$f no longer verifies the WSL component before packaging"
+done
+for f in wsl/assemble.mjs wsl/check.mjs wsl/offline-bundle.mjs wsl/fetch-payload.sh; do
+  [ -f "$SCRIPT_DIR/$f" ] || fail "build/$f is missing"
+done
+if [ "$FAILED" -eq 0 ]; then
+  echo "ok: picket-remote-wsl proposal enabled and WSL component packaging wired"
+fi
+
 if [ "$FAILED" -ne 0 ]; then
   echo "==> [picket-code] release contract check FAILED" >&2
   exit 1

@@ -94,6 +94,32 @@ if [ ! -d "$ROOT_DIR/VSCode-$PLATFORM-$ARCH" ]; then
   exit 1
 fi
 
+echo "==> [picket-code] Assembling the WSL server component (flavor: ${PICKET_WSL_PAYLOAD:-ondemand})"
+FLAVOR="${PICKET_WSL_PAYLOAD:-ondemand}"
+case "$FLAVOR" in
+  embedded|ondemand) ;;
+  *) echo "PICKET_WSL_PAYLOAD must be embedded or ondemand (got: $FLAVOR)" >&2; exit 1 ;;
+esac
+SERVER_TAG="${PICKET_SERVER_TAG:-}"
+if [ -z "$SERVER_TAG" ]; then
+  echo "PICKET_SERVER_TAG is required: set it to the noware-cn/picket-code-server release tag whose payload this build ships" >&2
+  exit 1
+fi
+DOWNLOAD="$SCRIPT_DIR/wsl/download"
+mkdir -p "$DOWNLOAD"
+APP_DIR="$ROOT_DIR/VSCode-$PLATFORM-$ARCH/resources/app"
+if [ "$FLAVOR" = "embedded" ]; then
+  bash "$SCRIPT_DIR/wsl/fetch-payload.sh" "$SERVER_TAG"
+  node "$SCRIPT_DIR/wsl/assemble.mjs" --app "$APP_DIR" --tag "$SERVER_TAG" \
+    --flavor embedded --payload "$DOWNLOAD/picket-code-server-$SERVER_TAG-linux-x64.tar.gz" \
+    --sums "$DOWNLOAD/SHA256SUMS"
+else
+  bash "$SCRIPT_DIR/wsl/fetch-payload.sh" "$SERVER_TAG" --metadata-only
+  node "$SCRIPT_DIR/wsl/assemble.mjs" --app "$APP_DIR" --tag "$SERVER_TAG" \
+    --flavor ondemand --sums "$DOWNLOAD/SHA256SUMS" --size "$(cat "$DOWNLOAD/payload-size.txt")"
+fi
+node "$SCRIPT_DIR/wsl/check.mjs" --app "$APP_DIR" --flavor "$FLAVOR"
+
 echo "==> [picket-code] Compressing vscode/ + VSCode-$PLATFORM-$ARCH for the package stage"
 cd "$ROOT_DIR"
 tar -czf vscode.tar.gz \
