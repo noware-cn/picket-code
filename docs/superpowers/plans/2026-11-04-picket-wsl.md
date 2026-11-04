@@ -173,12 +173,21 @@ Also in the manifest, because discovery is the difference between "works" and "f
 Run: `cd vscode/extensions/picket-remote-wsl && node --test test/catalog.test.js`
 Expected: PASS, 4 tests.
 
+- [ ] **Step 4.5: Check the contributions render, before building on them**
+
+Temporarily register a tree data provider whose `getChildren` logs one line, plus a command `picket.wsl.verify` that writes `vscode.commands.getCommands()` filtered to `picket.wsl.`, `vscode.env.remoteName`, and `vscode.workspace.workspaceFolders?.length` to the `Picket WSL` output channel. Drop `isWindows` from the view's and the command's `when` clause for this run only, then `cd vscode && ./scripts/code.sh --agents` and open the empty window:
+
+- run `Picket: 验证` and read the channel: the command list must match the manifest exactly, `remoteName` must be `''`, `workspaceFolders` must be `undefined`;
+- find `WSL 目标` in the Remote Explorer container. **If the channel has no `getChildren` line, the container hid the view** — `viewsExtensionPoint.ts:537` forces `workspace: true` on views contributed to `remote`, and Task 8 must then target `explorer` or a custom container instead.
+
+Remove the temporary provider and command, restore the `when` clauses, and record both observations in the ledger — this is the cheapest possible moment to learn them.
+
 - [ ] **Step 5: Add the API proposal entry and export the patch**
 
-Add to `build/product.json`, inside the existing `extensionEnabledApiProposals` object, alongside the `ms-vscode-remote.remote-wsl` entry: `"noware.picket-remote-wsl": ["resolvers"]`. Then in `vscode/`:
+Add to `build/product.json`, inside the existing `extensionEnabledApiProposals` object, alongside the `ms-vscode-remote.remote-wsl` entry: `"noware.picket-remote-wsl": ["resolvers", "contribViewsRemote"]`. Then in `vscode/`:
 
 ```bash
-git tag -f wsl-baseline HEAD          # once; marks the tree with patches 52-65 applied
+git rev-parse --verify wsl-baseline   # set during setup; marks the tree with patches 52-65 applied
 git add extensions/picket-remote-wsl
 git status --short                    # only extension files may be listed
 git commit -m "feat(wsl): picket-remote-wsl skeleton with catalog contract"
@@ -1100,7 +1109,55 @@ Run `Picket: 在 WSL 中安装命令行…` in a WSL window, then in that distro
 
 ---
 
-### Task 14: User documentation and release notes
+### Task 14: Automated acceptance — remote-window UI, in-process behaviour, scripts
+
+**Files:**
+- Create: `vscode/test/wsl-harness/package.json`, `vscode/test/wsl-harness/extension.js` (acceptance extension, never shipped)
+- Create: `vscode/test/smoke/src/areas/wsl/remote.test.ts`
+- Modify: `vscode/test/automation/src/electron.ts` (authority override for the remote launch)
+- Create: `build/wsl/acceptance.sh`
+- Create: `docs/wsl-verification.md`
+
+**Interfaces:**
+- Consumes: Tasks 2–13; on Linux the in-tree `vscode-reh-linux-x64/` payload, on Windows a real distro.
+- Produces: `build/wsl/acceptance.sh` with `--l2`, `--remote`, `--ui`, `--lifecycle`, `--icode`, `--all`; each check prints `PASS <name>` or `FAIL <name>: <detail>`, and the script exits non-zero if any failed.
+- Produces (harness): `WSL-ASSERT ok <name>` / `WSL-ASSERT fail <name>: <detail>` lines from inside the remote extension host, covering B2 (opened path equals `/home/<user>/我的 项目`), B3 (`uname -a` contains `Linux`, `node -v` equals the login-shell value), B4 (a `workspace.fs` write produces a watcher event within 2 s), B5 (10 MB round-trip, sha256 equal).
+
+- [ ] **Step 1: Write the failing acceptance first**
+
+Nothing launches the harness yet, so the first run must fail loudly rather than pass vacuously.
+
+```bash
+bash build/wsl/acceptance.sh --all   # expect FAIL remote / FAIL ui / FAIL lifecycle
+```
+
+- [ ] **Step 2: Run to verify it fails**
+
+Expected: `FAIL remote: harness not wired`, `FAIL ui: area wsl/remote not found`, `FAIL lifecycle: no runtime.json tool`, exit 1.
+
+- [ ] **Step 3: Implement the three plumbing pieces**
+
+`electron.ts` gains `options.remoteAuthority` (default `'test+test'`) so the existing `remote: true` path can target `picket-wsl+<distro>`; the smoke area reads `PICKET_WSL_DISTRO` and skips cleanly when it is unset, so the shared CI matrix is unaffected. The Playwright area asserts A5 (`viewlet` contains `WSL 目标`), A6 (title bar ends with `WSL`, not the raw authority) and B1 (clicking the distro node; the dialog's default path is asserted through the harness command, never the native dialog). `acceptance.sh --remote` launches the dev workbench with `--extensionDevelopmentPath` at the harness and a `--folder-uri`, waits for the `WSL-ASSERT` lines, then kills the window. `--lifecycle` opens and closes the window 20 times and asserts one server process; `--icode` points `PICKET_ICODE_BIN` at a missing path and asserts the diagnostics output.
+
+- [ ] **Step 4: Run to verify it passes**
+
+Run: `bash build/wsl/acceptance.sh --remote --ui --lifecycle --icode`
+Expected: PASS for all four on Linux; on Windows the same command with `PICKET_WSL_DISTRO` set. CI keeps running only `--l2` until a Windows runner with a working WSL2 distro is proven.
+
+- [ ] **Step 5: Write the four-item manual checklist, commit and gate**
+
+`docs/wsl-verification.md` records exactly four human checks, each with the command that sets the scene so the person only looks:
+
+1. **The native folder dialog** — the only unreachable one: `showOpenDialog` is an OS window outside the renderer and its return value has no observable API. Look where it opens (must be `/home/<user>`, not `C:\Users\…`) and select a folder whose name contains a space; cancelling is enough if the default path is right.
+2. **A real `picket-code .`** — the shim's logic is covered by L2 argv assertions, but only the real Windows client proves upstream `server.cli.ts` honours `VSCODE_CLIENT_COMMAND` + `VSCODE_CLI_AUTHORITY`. One command, close the window.
+3. **One look at the layout** — automation asserts strings, not that the icon looks native, the title is not truncated, or the empty state is not a blank panel.
+4. **A 15-minute end-to-end pass at M4** — automation checks the inputs it was told about; nobody asserted "does a reload keep my editor", "does dropping a folder work", "do two windows interfere".
+
+Then commit as in Task 7 with message `test(wsl): automated acceptance harness and the four-item manual checklist` and run `bash build/wsl/gate.sh`.
+
+---
+
+### Task 15: User documentation and release notes
 
 **Files:**
 - Create: `docs/wsl.md`
@@ -1109,7 +1166,7 @@ Run `Picket: 在 WSL 中安装命令行…` in a WSL window, then in that distro
 - Modify: `docs/release-checklist.md`
 
 **Interfaces:**
-- Consumes: the behavior implemented in Tasks 1–13; no new code.
+- Consumes: the behavior implemented in Tasks 1–14; no new code.
 
 - [ ] **Step 1: Write `docs/wsl.md`**
 
@@ -1134,7 +1191,7 @@ git commit -m "docs(wsl): user guide, roadmap and release checklist for built-in
 
 ## Self-Review
 
-**Spec coverage:** §4.2 architecture → File Structure + Tasks 1–11; §4.3 catalog/flavors → Tasks 1, 12; §4.4 payload install → Task 3; §4.5 resolver semantics → Task 6; §4.6 tunnel → Task 11; §4.7 iCode → Task 7; §4.8 gallery → Tasks 9, 10; §4.9 UX commands → Task 8; §4.10 first-use interception → Task 8; §4.11 failure copy → Task 8 (diagnose + messages); §4.12 patch numbering → Tasks 1, 9; §4.13 tree view and distro management → Task 8; §4.14 login shell and `server-env-setup` → Tasks 5, 7; §4.15 CLI shim → Task 13; §5 components → File Structure; §6 test layers → Tasks 2–13 and `docs/testing.md`; §7 milestones → M1 ends after Task 7, M2 after Task 8, M3 after Task 13, M4 after Tasks 11–12 and 14. Gaps found and closed while writing: `unpackOfflineBundle` was in the spec's offline bundle but had no owner (added to Task 3); the first-start lock had no owner (Task 5); `picketTag` stamping needed a concrete place, now `build/wsl/assemble.mjs` rather than a core patch.
+**Spec coverage:** §4.2 architecture → File Structure + Tasks 1–11; §4.3 catalog/flavors → Tasks 1, 12; §4.4 payload install → Task 3; §4.5 resolver semantics → Task 6; §4.6 tunnel → Task 11; §4.7 iCode → Task 7; §4.8 gallery → Tasks 9, 10; §4.9 UX commands → Task 8; §4.10 first-use interception → Task 8; §4.11 failure copy → Task 8 (diagnose + messages); §4.12 patch numbering → Tasks 1, 9; §4.13 tree view and distro management → Task 8; §4.14 login shell and `server-env-setup` → Tasks 5, 7; §4.15 CLI shim → Task 13; §6 acceptance automation → Task 14; §5 components → File Structure; §6 test layers → Tasks 2–13 and `docs/testing.md`; §7 milestones → M1 ends after Task 7, M2 after Task 8, M3 after Task 13, M4 after Tasks 11–12, 14, 15. Gaps found and closed while writing: `unpackOfflineBundle` was in the spec's offline bundle but had no owner (added to Task 3); the first-start lock had no owner (Task 5); `picketTag` stamping needed a concrete place, now `build/wsl/assemble.mjs` rather than a core patch.
 
 **Type consistency:** `ICatalogComponent` (Task 1) is consumed unchanged in Tasks 3, 4, 12. `IWslRunner` (Task 2) is the only process boundary in Tasks 3–8 and 11–13. `IDistro` (Task 2) is the single shape consumed by `visibleDistros`, `buildDistroNodes` and `defaultDistro`; `toPosixPath`/`toWindowsPath` (Task 6) are the only path translators, used by Task 8's folder dialog and Task 13's `clientPath`. `serverPaths`/`buildServerArgs` (Task 5) are the only places that compose in-distro paths. `probeServer` returns the three-value union used verbatim by Task 6. `chooseTunnelMode` (Task 7) is consumed only by Task 11.
 
