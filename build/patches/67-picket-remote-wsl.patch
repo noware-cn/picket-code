@@ -475,6 +475,236 @@ index 00000000..f612ff0a
 +}
 +
 +module.exports = { loadCatalog };
+diff --git a/extensions/picket-remote-wsl/src/distro.js b/extensions/picket-remote-wsl/src/distro.js
+new file mode 100644
+index 00000000..5d068b16
+--- /dev/null
++++ b/extensions/picket-remote-wsl/src/distro.js
+@@ -0,0 +1,224 @@
++'use strict';
++
++const { spawn: spawnChild } = require('node:child_process');
++
++/**
++ * @typedef {{ name: string, isDefault: boolean, version: '1' | '2', state: string }} IDistro
++ * @typedef {{ code: number, stdout: Buffer | string, stderr: Buffer | string }} IWslResult
++ * @typedef {{ exec(args: string[], opts?: { input?: string | Buffer, timeoutMs?: number }): Promise<IWslResult>, spawn(args: string[]): { child: import('node:child_process').ChildProcess, stdout: import('node:stream').Readable | null, stderr: import('node:stream').Readable | null } }} IWslRunner
++ */
++
++/**
++ * wsl.exe writes --list output as UTF-16LE with a BOM and CRLF, and everything
++ * else as UTF-8. A NUL byte is the discriminator: no UTF-8 text we consume
++ * contains one, and every UTF-16LE ASCII string does.
++ * @param {Buffer | string} buffer
++ * @returns {string}
++ */
++function decodeWslOutput(buffer) {
++	const text = typeof buffer === 'string'
++		? buffer
++		: buffer.includes(0) ? buffer.toString('utf16le') : buffer.toString('utf8');
++	return text
++		.replace(/^\uFEFF/, '')
++		.split(/\r?\n/)
++		.map(line => line.trim())
++		.filter(line => line.length > 0)
++		.join('\n');
++}
++
++/**
++ * @param {string} distro
++ * @param {string[]} args
++ */
++function distroExec(distro, args) {
++	return ['-d', distro, '-e', ...args];
++}
++
++/**
++ * @param {{ wslPath?: string, spawn?: typeof spawnChild, cwd?: string, timeoutMs?: number }} [options]
++ * @returns {IWslRunner}
++ */
++function createWslRunner(options = {}) {
++	const wslPath = options.wslPath ?? 'wsl.exe';
++	const spawn = options.spawn ?? spawnChild;
++	const defaultTimeout = options.timeoutMs ?? 30000;
++
++	return {
++		exec(args, opts = {}) {
++			const timeoutMs = opts.timeoutMs ?? defaultTimeout;
++			return new Promise((resolve, reject) => {
++				const child = spawn(wslPath, args, { cwd: options.cwd, windowsHide: true });
++				/** @type {Buffer[]} */
++				const out = [];
++				/** @type {Buffer[]} */
++				const err = [];
++				let settled = false;
++				const timer = setTimeout(() => {
++					if (settled) {
++						return;
++					}
++					settled = true;
++					child.kill();
++					reject(new Error(`Timed out after ${timeoutMs} ms: wsl.exe ${args.join(' ')}`));
++				}, timeoutMs);
++				timer.unref?.();
++
++				child.stdout?.on('data', (chunk) => out.push(chunk));
++				child.stderr?.on('data', (chunk) => err.push(chunk));
++				child.on('error', (error) => {
++					if (settled) {
++						return;
++					}
++					settled = true;
++					clearTimeout(timer);
++					reject(error);
++				});
++				child.on('close', (code) => {
++					if (settled) {
++						return;
++					}
++					settled = true;
++					clearTimeout(timer);
++					resolve({ code: code ?? -1, stdout: Buffer.concat(out), stderr: Buffer.concat(err) });
++				});
++
++				if (opts.input !== undefined) {
++					child.stdin?.end(opts.input);
++				} else {
++					child.stdin?.end();
++				}
++			});
++		},
++		spawn(args) {
++			const child = spawn(wslPath, args, { cwd: options.cwd, windowsHide: true });
++			return { child, stdout: child.stdout, stderr: child.stderr };
++		}
++	};
++}
++
++/**
++ * @param {string} stdout
++ * @returns {IDistro[]}
++ */
++function parseDistroTable(stdout) {
++	/** @type {IDistro[]} */
++	const distros = [];
++	for (const line of stdout.split(/\r?\n/).map(l => l.trim())) {
++		// Lines arrive trimmed, so the leading space of a non-default row is gone.
++		const match = /^(\*)?\s*(.+?)\s+(\w+)\s+([12])$/.exec(line);
++		if (!match) {
++			continue;
++		}
++		const [, marker, name, state, version] = match;
++		distros.push({ name: name.trim(), isDefault: marker === '*', version: version === '1' ? '1' : '2', state });
++	}
++	return distros;
++}
++
++/**
++ * @param {IWslRunner} runner
++ * @returns {Promise<IDistro[]>}
++ */
++async function listDistros(runner) {
++	const result = await runner.exec(['--list', '--verbose']);
++	if (result.code !== 0) {
++		throw new Error(`wsl --list --verbose failed (${result.code}): ${decodeWslOutput(result.stderr)}`);
++	}
++	return parseDistroTable(decodeWslOutput(result.stdout));
++}
++
++/**
++ * @param {IDistro[]} list
++ * @returns {string}
++ */
++function defaultDistro(list) {
++	const marked = list.find(d => d.isDefault);
++	if (marked) {
++		return marked.name;
++	}
++	if (list.length === 0) {
++		throw new Error('No WSL distro is installed');
++	}
++	return list[0].name;
++}
++
++/**
++ * docker-desktop / docker-desktop-data are plumbing distros; offering them as
++ * places to open a folder is noise, unless the user made one the default.
++ * @param {IDistro[]} list
++ * @returns {IDistro[]}
++ */
++function visibleDistros(list) {
++	return list.filter(d => d.isDefault || !/^docker-desktop/i.test(d.name));
++}
++
++/**
++ * @param {IWslRunner} runner
++ * @param {string} distro
++ * @returns {Promise<string>}
++ */
++async function distroHome(runner, distro) {
++	const result = await runner.exec(distroExec(distro, ['printenv', 'HOME']));
++	const home = decodeWslOutput(result.stdout);
++	if (result.code !== 0 || home.length === 0) {
++		throw new Error(`Could not read $HOME in ${distro} (${result.code}): ${decodeWslOutput(result.stderr)}`);
++	}
++	return home.split('\n')[0];
++}
++
++/**
++ * @param {IWslRunner} runner
++ * @param {string} distro
++ * @returns {Promise<boolean>}
++ */
++async function isWsl1(runner, distro) {
++	const list = await listDistros(runner);
++	const found = list.find(d => d.name === distro);
++	return found?.version === '1';
++}
++
++/**
++ * @param {IWslRunner} runner
++ * @param {string} distro
++ * @returns {Promise<'missing' | 'ok'>}
++ */
++async function distroStatus(runner, distro) {
++	try {
++		const result = await runner.exec(distroExec(distro, ['true']));
++		return result.code === 0 ? 'ok' : 'missing';
++	} catch {
++		return 'missing';
++	}
++}
++
++/**
++ * @param {IWslRunner} runner
++ * @returns {Promise<{ installed: boolean, kernelUpdateRequired: boolean }>}
++ */
++async function wslStatus(runner) {
++	let result;
++	try {
++		result = await runner.exec(['--status']);
++	} catch (error) {
++		return { installed: false, kernelUpdateRequired: /kernel/i.test(String(error)) };
++	}
++	const stderr = decodeWslOutput(result.stderr);
++	if (result.code !== 0 && /not installed|not enabled/i.test(stderr)) {
++		return { installed: false, kernelUpdateRequired: false };
++	}
++	return { installed: true, kernelUpdateRequired: /kernel/i.test(stderr) };
++}
++
++module.exports = {
++	decodeWslOutput,
++	createWslRunner,
++	parseDistroTable,
++	listDistros,
++	defaultDistro,
++	visibleDistros,
++	distroHome,
++	isWsl1,
++	distroStatus,
++	wslStatus
++};
 diff --git a/extensions/picket-remote-wsl/src/log.js b/extensions/picket-remote-wsl/src/log.js
 new file mode 100644
 index 00000000..918896a0
@@ -600,3 +830,148 @@ index 00000000..350ec874
 +	const catalog = await loadCatalog(dir);
 +	assert.deepStrictEqual(catalog.components.map(c => c.id), ['wsl-server']);
 +});
+diff --git a/extensions/picket-remote-wsl/test/distro.test.js b/extensions/picket-remote-wsl/test/distro.test.js
+new file mode 100644
+index 00000000..99a9dc23
+--- /dev/null
++++ b/extensions/picket-remote-wsl/test/distro.test.js
+@@ -0,0 +1,83 @@
++// RED first: this file must fail until src/distro.js exists.
++const test = require('node:test');
++const assert = require('node:assert');
++const { join } = require('node:path');
++const { decodeWslOutput, createWslRunner, parseDistroTable, listDistros, visibleDistros, distroHome, distroStatus, wslStatus } = require('../src/distro.js');
++
++const FAKE_WSL = join(__dirname, 'fixtures', 'fake-wsl.js');
++
++function runner(responses) {
++	return { exec: async (args) => {
++		const key = args.join(' ');
++		const hit = responses[key];
++		if (!hit) { throw new Error(`unexpected wsl args: ${key}`); }
++		return hit;
++	}, spawn: () => { throw new Error('not used'); } };
++}
++
++const TABLE = [
++	'  NAME            STATE           VERSION',
++	'* Ubuntu-24.04    Running         2',
++	'  Ubuntu 22.04 LTS Stopped        1',
++	'  docker-desktop  Running         2',
++	''
++].join('\r\n');
++
++test('decodes a UTF-16LE verbose table with marker and version', () => {
++	const list = parseDistroTable(decodeWslOutput(Buffer.from(TABLE, 'utf16le')));
++	assert.deepStrictEqual(list, [
++		{ name: 'Ubuntu-24.04', isDefault: true, version: '2', state: 'Running' },
++		{ name: 'Ubuntu 22.04 LTS', isDefault: false, version: '1', state: 'Stopped' },
++		{ name: 'docker-desktop', isDefault: false, version: '2', state: 'Running' }
++	]);
++});
++
++test('decodes UTF-8 output without NUL bytes', () => {
++	assert.strictEqual(decodeWslOutput(Buffer.from('Ubuntu 22.04 LTS\r\n')), 'Ubuntu 22.04 LTS');
++});
++
++test('hides docker-managed distros unless they are the default', () => {
++	const list = parseDistroTable(TABLE);
++	assert.deepStrictEqual(visibleDistros(list).map(d => d.name), ['Ubuntu-24.04', 'Ubuntu 22.04 LTS']);
++	const promoted = parseDistroTable(TABLE.replace('* Ubuntu-24.04', '  Ubuntu-24.04').replace('  docker-desktop', '* docker-desktop'));
++	assert.ok(visibleDistros(promoted).some(d => d.name === 'docker-desktop'));
++});
++
++test('lists distros through the runner', async () => {
++	const r = runner({ '--list --verbose': { code: 0, stdout: Buffer.from(TABLE, 'utf16le'), stderr: '' } });
++	const list = await listDistros(r);
++	assert.strictEqual(list[0].name, 'Ubuntu-24.04');
++	assert.strictEqual(list[0].isDefault, true);
++});
++
++test('reports a missing distro from a non-zero exit', async () => {
++	const r = runner({ '-d Nope -e true': { code: 1, stdout: '', stderr: '' } });
++	assert.strictEqual(await distroStatus(r, 'Nope'), 'missing');
++});
++
++test('reports WSL as not installed from --status', async () => {
++	const r = runner({ '--status': { code: 1, stdout: '', stderr: 'WSL is not installed. Run wsl --install.' } });
++	assert.deepStrictEqual(await wslStatus(r), { installed: false, kernelUpdateRequired: false });
++});
++
++test('reads $HOME from the distro', async () => {
++	const r = runner({ '-d Debian -e printenv HOME': { code: 0, stdout: '/home/ds\r\n', stderr: '' } });
++	assert.strictEqual(await distroHome(r, 'Debian'), '/home/ds');
++});
++
++test('spawns a real child process and parses its output', async () => {
++	const runner = createWslRunner({ wslPath: FAKE_WSL });
++	const list = await listDistros(runner);
++	assert.deepStrictEqual(list.map(d => d.name), ['Ubuntu-24.04', 'Ubuntu 22.04 LTS', 'docker-desktop']);
++	assert.strictEqual(await distroHome(runner, 'Ubuntu-24.04'), '/home/ubuntu-24');
++	assert.strictEqual(await distroStatus(runner, 'Nope'), 'missing');
++	assert.deepStrictEqual(await wslStatus(runner), { installed: false, kernelUpdateRequired: false });
++});
++
++test('rejects with a timeout instead of hanging', async () => {
++	const runner = createWslRunner({ wslPath: FAKE_WSL });
++	await assert.rejects(
++		() => runner.exec(['--hang'], { timeoutMs: 200 }),
++		/Timed out after 200 ms/
++	);
++});
+diff --git a/extensions/picket-remote-wsl/test/fixtures/fake-wsl.js b/extensions/picket-remote-wsl/test/fixtures/fake-wsl.js
+new file mode 100755
+index 00000000..ac0353a7
+--- /dev/null
++++ b/extensions/picket-remote-wsl/test/fixtures/fake-wsl.js
+@@ -0,0 +1,50 @@
++#!/usr/bin/env node
++'use strict';
++
++// A wsl.exe stand-in so the spawn path, the UTF-16LE decoding and the timeout
++// handling can be exercised on Linux. Keep the table identical to the one in
++// test/distro.test.js: the real wsl.exe writes exactly this shape.
++
++const TABLE = [
++	'  NAME            STATE           VERSION',
++	'* Ubuntu-24.04    Running         2',
++	'  Ubuntu 22.04 LTS Stopped        1',
++	'  docker-desktop  Running         2',
++	''
++].join('\r\n');
++
++const args = process.argv.slice(2);
++
++if (args[0] === '--list' && args[1] === '--verbose') {
++	process.stdout.write(Buffer.from(TABLE, 'utf16le'));
++	process.exit(0);
++}
++
++if (args[0] === '--status') {
++	process.stderr.write('WSL is not installed. Run wsl --install.\r\n');
++	process.exit(1);
++}
++
++if (args[0] === '--hang') {
++	setTimeout(() => process.exit(0), 60000);
++} else if (args[0] === '-d' && args.length >= 3) {
++	const distro = args[1];
++	const known = /^(Ubuntu-24\.04|Ubuntu 22\.04 LTS|docker-desktop)$/.test(distro);
++	if (!known) {
++		process.stderr.write(`There is no distribution with the supplied name.\r\n`);
++		process.exit(1);
++	}
++	const command = args.slice(3).join(' ');
++	if (command === 'printenv HOME') {
++		process.stdout.write(`/home/${distro.split(/[ .]/)[0].toLowerCase()}\r\n`);
++		process.exit(0);
++	}
++	if (command === 'true') {
++		process.exit(0);
++	}
++	process.stderr.write(`unknown command: ${command}\r\n`);
++	process.exit(1);
++} else {
++	process.stderr.write(`fake-wsl: unsupported arguments: ${args.join(' ')}\r\n`);
++	process.exit(1);
++}
