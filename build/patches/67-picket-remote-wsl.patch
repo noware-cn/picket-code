@@ -756,6 +756,169 @@ index 00000000..918896a0
 +}
 +
 +module.exports = { createLog };
+diff --git a/extensions/picket-remote-wsl/src/payload.js b/extensions/picket-remote-wsl/src/payload.js
+new file mode 100644
+index 00000000..62602222
+--- /dev/null
++++ b/extensions/picket-remote-wsl/src/payload.js
+@@ -0,0 +1,157 @@
++'use strict';
++
++const { createHash, randomBytes } = require('node:crypto');
++const { readFile, stat } = require('node:fs/promises');
++
++/**
++ * @typedef {{ kind: 'file', path: string } | { kind: 'embedded', path: string } | { kind: 'url', url: string }} ISource
++ * @typedef {{ id: string, kind: 'server' | 'extensions', version: string, file: string, size: number, sha256: string, embedded: boolean, embeddedPath?: string }} IComponent
++ */
++
++/**
++ * `sha256sum` writes two spaces, `shasum -a 256` writes one; some tools add a
++ * binary marker. Anything else on the line is junk from a merged log.
++ * @param {string} text
++ * @returns {Map<string, string>}
++ */
++function parseSha256Sums(text) {
++	/** @type {Map<string, string>} */
++	const sums = new Map();
++	for (const line of text.split(/\r?\n/)) {
++		const match = /^([0-9a-fA-F]{64})\s+\*?(.+)$/.exec(line.trim());
++		if (match) {
++			sums.set(match[2].trim(), match[1].toLowerCase());
++		}
++	}
++	return sums;
++}
++
++/**
++ * Three sources, in the order a user would expect them to win: a file they
++ * pointed at, the copy shipped inside the build, then the configured mirror.
++ * @param {IComponent} component
++ * @param {{ explicitPath?: string, embeddedDir?: string, baseUrl?: string, exists?: (path: string) => Promise<boolean> }} options
++ * @returns {Promise<ISource>}
++ */
++async function chooseSource(component, options) {
++	const exists = options.exists ?? (async (path) => {
++		try {
++			return (await stat(path)).isFile();
++		} catch {
++			return false;
++		}
++	});
++
++	if (options.explicitPath && await exists(options.explicitPath)) {
++		return { kind: 'file', path: options.explicitPath };
++	}
++	if (options.embeddedDir) {
++		const embedded = joinPath(options.embeddedDir, component.file);
++		if (await exists(embedded)) {
++			return { kind: 'embedded', path: embedded };
++		}
++	}
++	if (options.baseUrl) {
++		return { kind: 'url', url: `${options.baseUrl.replace(/\/+$/, '')}/${component.file}` };
++	}
++	throw new Error(`No source for ${component.id}: explicit path missing, no embedded payload, and no base URL configured`);
++}
++
++/** @param {string} a @param {string} b */
++function joinPath(a, b) {
++	return `${a.replace(/[\\/]+$/, '')}/${b}`;
++}
++
++/**
++ * @param {string} path
++ * @returns {Promise<string>}
++ */
++async function sha256OfFile(path) {
++	return createHash('sha256').update(await readFile(path)).digest('hex');
++}
++
++/**
++ * @param {Buffer} bytes
++ * @returns {string}
++ */
++function sha256OfBuffer(bytes) {
++	return createHash('sha256').update(bytes).digest('hex');
++}
++
++/**
++ * Downloads a payload, reporting progress without flooding the caller.
++ * @param {string} url
++ * @param {{ fetchImpl?: typeof fetch, onProgress?: (progress: { downloaded: number, total: number }) => void }} options
++ * @returns {Promise<Buffer>}
++ */
++async function download(url, options) {
++	const fetchImpl = options.fetchImpl ?? globalThis.fetch;
++	const response = await fetchImpl(url);
++	if (!response.ok) {
++		throw new Error(`Download failed for ${url}: HTTP ${response.status}`);
++	}
++	const total = Number(response.headers.get('content-length') ?? 0);
++	const onProgress = options.onProgress;
++	let downloaded = 0;
++	let lastReport = 0;
++	/** @type {Buffer[]} */
++	const chunks = [];
++	if (response.body) {
++		for await (const chunk of /** @type {any} */ (response.body)) {
++			const buf = Buffer.from(chunk);
++			chunks.push(buf);
++			downloaded += buf.length;
++			const now = Date.now();
++			if (onProgress && now - lastReport >= 100) {
++				lastReport = now;
++				onProgress({ downloaded, total });
++			}
++		}
++	} else {
++		const buf = Buffer.from(await response.arrayBuffer());
++		chunks.push(buf);
++		downloaded = buf.length;
++	}
++	onProgress?.({ downloaded, total: total || downloaded });
++	return Buffer.concat(chunks);
++}
++
++/**
++ * Verifies on the Windows side, then extracts inside the distro by piping the
++ * archive to `tar -xzf -` over stdin: no temporary copy inside the VM, and a
++ * half-written directory can never be mistaken for an install.
++ *
++ * The archive must be flat at its root (`bin/`, `out/`, `product.json`), which
++ * Task 12 asserts when it packages the payload.
++ * @param {{ runner: any, distro: string, component: IComponent, source: ISource, payloadRoot: string, fetchImpl?: typeof fetch, onProgress?: (progress: { downloaded: number, total: number }) => void }} options
++ * @returns {Promise<{ payloadDir: string, source: ISource }>}
++ */
++async function installPayload(options) {
++	const { runner, distro, component, source, payloadRoot } = options;
++	const bytes = source.kind === 'url'
++		? await download(source.url, { fetchImpl: options.fetchImpl, onProgress: options.onProgress })
++		: await readFile(source.path);
++
++	const actual = sha256OfBuffer(bytes);
++	if (actual !== component.sha256.toLowerCase()) {
++		throw new Error(`Checksum mismatch for ${component.file}: expected ${component.sha256.toLowerCase()}, got ${actual}`);
++	}
++
++	const finalDir = `${payloadRoot}/server-${component.version}`;
++	const tmpDir = `${payloadRoot}/.tmp-${randomBytes(4).toString('hex')}`;
++
++	const prepare = await runner.exec(['-d', distro, '-e', 'sh', '-c', 'mkdir -p "$1" && rm -rf "$2"', 'sh', payloadRoot, tmpDir]);
++	if (prepare.code !== 0) {
++		throw new Error(`Could not prepare ${payloadRoot} in ${distro}: ${prepare.stderr}`);
++	}
++	const unpack = await runner.exec(
++		['-d', distro, '-e', 'sh', '-c', 'rm -rf "$2" && tar -xzf - -C "$1" && mv "$1" "$2"', 'sh', tmpDir, finalDir],
++		{ input: bytes }
++	);
++	if (unpack.code !== 0) {
++		throw new Error(`Could not unpack ${component.file} in ${distro}: ${unpack.stderr}`);
++	}
++	return { payloadDir: finalDir, source };
++}
++
++module.exports = { parseSha256Sums, chooseSource, sha256OfFile, installPayload };
 diff --git a/extensions/picket-remote-wsl/test/catalog.test.js b/extensions/picket-remote-wsl/test/catalog.test.js
 new file mode 100644
 index 00000000..350ec874
@@ -975,3 +1138,66 @@ index 00000000..ac0353a7
 +	process.stderr.write(`fake-wsl: unsupported arguments: ${args.join(' ')}\r\n`);
 +	process.exit(1);
 +}
+diff --git a/extensions/picket-remote-wsl/test/payload.test.js b/extensions/picket-remote-wsl/test/payload.test.js
+new file mode 100644
+index 00000000..93dac3fe
+--- /dev/null
++++ b/extensions/picket-remote-wsl/test/payload.test.js
+@@ -0,0 +1,57 @@
++// RED first: this file must fail until src/payload.js exists.
++const test = require('node:test');
++const assert = require('node:assert');
++const { createHash } = require('node:crypto');
++const { mkdtempSync, writeFileSync, readdirSync } = require('node:fs');
++const { tmpdir } = require('node:os');
++const { join } = require('node:path');
++const { parseSha256Sums, chooseSource, installPayload } = require('../src/payload.js');
++
++const COMPONENT = { id: 'wsl-server', kind: 'server', version: 'v1.143.1-picket.1-rc.4',
++	file: 'picket-code-server-v1.143.1-picket.1-rc.4-linux-x64.tar.gz', size: 3, sha256: '', embedded: false };
++
++test('parses SHA256SUMS with both separators', () => {
++	const sums = parseSha256Sums(`${'a'.repeat(64)}  a.tar.gz\n${'b'.repeat(64)} *b.tar.gz\nnot a line\n`);
++	assert.strictEqual(sums.get('a.tar.gz'), 'a'.repeat(64));
++	assert.strictEqual(sums.get('b.tar.gz'), 'b'.repeat(64));
++	assert.strictEqual(sums.size, 2);
++});
++
++test('source precedence is explicit, embedded, url', async () => {
++	const exists = async () => true;
++	assert.deepStrictEqual(await chooseSource(COMPONENT, { explicitPath: 'C:\\p.tar.gz', embeddedDir: 'E', baseUrl: 'https://x/', exists }), { kind: 'file', path: 'C:\\p.tar.gz' });
++	assert.deepStrictEqual(await chooseSource(COMPONENT, { embeddedDir: 'E', baseUrl: 'https://x/', exists }), { kind: 'embedded', path: join('E', COMPONENT.file) });
++	assert.deepStrictEqual(await chooseSource(COMPONENT, { baseUrl: 'https://x/', exists }), { kind: 'url', url: `https://x/${COMPONENT.file}` });
++});
++
++test('no source at all throws with every reason', async () => {
++	await assert.rejects(() => chooseSource(COMPONENT, { exists: async () => false }),
++		/explicit path missing, no embedded payload, and no base URL configured/);
++});
++
++test('a checksum mismatch aborts and leaves no payload directory', async () => {
++	const dir = mkdtempSync(join(tmpdir(), 'picket-payload-'));
++	const file = join(dir, 'bad.tar.gz');
++	writeFileSync(file, 'nope');
++	const calls = [];
++	const runner = { exec: async (args) => { calls.push(args.join(' ')); return { code: 0, stdout: '', stderr: '' }; } };
++	await assert.rejects(() => installPayload({ runner, distro: 'D', component: { ...COMPONENT, sha256: 'c'.repeat(64) },
++		source: { kind: 'file', path: file }, payloadRoot: '/home/u/.picket-code-server/payloads', onProgress: () => { } }), /checksum mismatch/i);
++	assert.deepStrictEqual(calls, []);
++});
++
++test('a successful install extracts via stdin and leaves no temp directory', async () => {
++	const dir = mkdtempSync(join(tmpdir(), 'picket-payload-'));
++	const file = join(dir, 'ok.tar.gz');
++	writeFileSync(file, 'abc');
++	const sha = createHash('sha256').update('abc').digest('hex');
++	const calls = [];
++	const runner = { exec: async (args, opts) => { calls.push({ args, hasInput: !!(opts && opts.input) }); return { code: 0, stdout: '', stderr: '' }; } };
++	const result = await installPayload({ runner, distro: 'D', component: { ...COMPONENT, sha256: sha },
++		source: { kind: 'file', path: file }, payloadRoot: '/home/u/.picket-code-server/payloads', onProgress: () => { } });
++	assert.strictEqual(result.payloadDir, '/home/u/.picket-code-server/payloads/server-v1.143.1-picket.1-rc.4');
++	assert.strictEqual(calls.length, 2);
++	assert.match(calls[0].args.join(' '), /mkdir -p/);
++	assert.ok(calls[1].hasInput, 'tar receives the archive on stdin');
++	assert.deepStrictEqual(readdirSync(dir), ['ok.tar.gz']);
++});
