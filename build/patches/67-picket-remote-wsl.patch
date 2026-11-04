@@ -9,10 +9,10 @@ index 00000000..96fab092
 +tsconfig.json
 diff --git a/extensions/picket-remote-wsl/extension.js b/extensions/picket-remote-wsl/extension.js
 new file mode 100644
-index 00000000..38b5fd4a
+index 00000000..4d78f4f1
 --- /dev/null
 +++ b/extensions/picket-remote-wsl/extension.js
-@@ -0,0 +1,78 @@
+@@ -0,0 +1,80 @@
 +'use strict';
 +
 +const { join } = require('node:path');
@@ -43,6 +43,7 @@ index 00000000..38b5fd4a
 +		get serverPayloadPath() { return config().get('serverPayloadPath', ''); },
 +		get serverPayloadBaseUrl() { return config().get('serverPayloadBaseUrl', ''); },
 +		get icodePath() { return config().get('icodePath', ''); },
++		get tunnelMode() { return config().get('tunnelMode', 'auto'); },
 +		get startTimeoutSeconds() { return config().get('startTimeoutSeconds', 90); }
 +	};
 +
@@ -52,6 +53,7 @@ index 00000000..38b5fd4a
 +		catalog,
 +		settings,
 +		log,
++		warn: (message) => void vscode.window.showWarningMessage(message),
 +		components: ({ distro, home }) => createComponentManager({
 +			catalog,
 +			runner,
@@ -950,9 +952,53 @@ index 00000000..5d068b16
 +	distroStatus,
 +	wslStatus
 +};
+diff --git a/extensions/picket-remote-wsl/src/icode.js b/extensions/picket-remote-wsl/src/icode.js
+new file mode 100644
+index 00000000..cf40b908
+--- /dev/null
++++ b/extensions/picket-remote-wsl/src/icode.js
+@@ -0,0 +1,38 @@
++'use strict';
++
++const { decodeWslOutput } = require('./distro.js');
++
++/**
++ * iCode is optional: a distro without it is a working window with no AI, so a
++ * miss is a normal answer (`missing`), never an error. Detection runs in the
++ * same login shell the server is started in, because that shell is what decides
++ * whether `~/.local/bin` is on `PATH` — detecting in a bare `sh -c` would find
++ * nothing on machines where the server would have found it.
++ * @param {{ runner: any, distro: string, configuredPath?: string }} options
++ * @returns {Promise<{ path: string | null, source: 'setting' | 'path' | 'missing' }>}
++ */
++async function detectIcode(options) {
++	const { runner, distro } = options;
++	const configuredPath = options.configuredPath ?? '';
++	if (configuredPath) {
++		const tested = await runner.exec(['-d', distro, '-e', 'test', '-x', configuredPath]);
++		if (tested.code === 0) {
++			return { path: configuredPath, source: 'setting' };
++		}
++	}
++	const found = await runner.exec(['-d', distro, '-e', 'sh', '-lc', 'command -v icode']);
++	if (found.code === 0) {
++		// A login shell may print a profile banner before the answer; the path is
++		// the last absolute line it wrote.
++		const line = decodeWslOutput(found.stdout)
++			.split('\n')
++			.filter(text => text.startsWith('/'))
++			.pop();
++		if (line) {
++			return { path: line, source: 'path' };
++		}
++	}
++	return { path: null, source: 'missing' };
++}
++
++module.exports = { detectIcode };
 diff --git a/extensions/picket-remote-wsl/src/launch.js b/extensions/picket-remote-wsl/src/launch.js
 new file mode 100644
-index 00000000..f89c3013
+index 00000000..dd4076d3
 --- /dev/null
 +++ b/extensions/picket-remote-wsl/src/launch.js
 @@ -0,0 +1,290 @@
@@ -960,7 +1006,7 @@ index 00000000..f89c3013
 +
 +const { randomBytes } = require('node:crypto');
 +
-+/** @typedef {{ port: number, token: string, tag: string, pid: number, startedAt: string }} IRuntimeInfo */
++/** @typedef {{ port: number, token: string, tag: string, pid: number, startedAt: string, tunnelMode?: string, icode?: string }} IRuntimeInfo */
 +
 +/**
 + * Sourced inside the distro before the binary starts: the login shell has by
@@ -1110,7 +1156,7 @@ index 00000000..f89c3013
 +}
 +
 +/**
-+ * @param {{ runner: any, distro: string, args: string[], runtimeFile: string, timeoutMs?: number, log?: { info(...parts: unknown[]): void, error(...parts: unknown[]): void }, writeRuntime?: typeof writeRuntime }} options
++ * @param {{ runner: any, distro: string, args: string[], runtimeFile: string, timeoutMs?: number, extra?: Record<string, unknown>, log?: { info(...parts: unknown[]): void, error(...parts: unknown[]): void }, writeRuntime?: typeof writeRuntime }} options
 + * @returns {Promise<IRuntimeInfo>}
 + */
 +async function startServer(options) {
@@ -1156,7 +1202,7 @@ index 00000000..f89c3013
 +				settled = true;
 +				clearTimeout(timer);
 +				/** @type {IRuntimeInfo} */
-+				const info = { port: parser.port, token, tag, pid: child.pid ?? -1, startedAt: new Date().toISOString() };
++				const info = { port: parser.port, token, tag, pid: child.pid ?? -1, startedAt: new Date().toISOString(), ...(options.extra ?? {}) };
 +				void persist(runner, runtimeFile, info, distro).catch((error) => log.error(`Could not write ${runtimeFile}: ${error.message}`));
 +				resolve(info);
 +			}
@@ -1460,6 +1506,93 @@ index 00000000..62602222
 +}
 +
 +module.exports = { parseSha256Sums, chooseSource, sha256OfFile, installPayload };
+diff --git a/extensions/picket-remote-wsl/src/preflight.js b/extensions/picket-remote-wsl/src/preflight.js
+new file mode 100644
+index 00000000..8450e077
+--- /dev/null
++++ b/extensions/picket-remote-wsl/src/preflight.js
+@@ -0,0 +1,81 @@
++'use strict';
++
++const { readFile } = require('node:fs/promises');
++const { homedir } = require('node:os');
++const { join } = require('node:path');
++
++/**
++ * Only `[wsl2]` matters here, and only two keys of it. Everything else in the
++ * file belongs to other WSL features; reading more would invite acting on
++ * settings this extension does not own.
++ * @param {string} text
++ * @returns {{ localhostForwarding?: boolean, networkingMode?: string }}
++ */
++function parseWslConfig(text) {
++	/** @type {{ localhostForwarding?: boolean, networkingMode?: string }} */
++	const config = {};
++	let section = '';
++	for (const raw of String(text ?? '').split(/\r?\n/)) {
++		const line = raw.trim();
++		if (line.length === 0 || line.startsWith('#') || line.startsWith(';')) {
++			continue;
++		}
++		const header = /^\[(.+)\]$/.exec(line);
++		if (header) {
++			section = header[1].trim().toLowerCase();
++			continue;
++		}
++		if (section !== 'wsl2') {
++			continue;
++		}
++		const separator = line.indexOf('=');
++		if (separator === -1) {
++			continue;
++		}
++		const key = line.slice(0, separator).trim().toLowerCase();
++		const value = line.slice(separator + 1).trim();
++		if (key === 'localhostforwarding') {
++			config.localhostForwarding = /^true$/i.test(value);
++		} else if (key === 'networkingmode') {
++			config.networkingMode = value.toLowerCase();
++		}
++	}
++	return config;
++}
++
++/**
++ * Direct is the fast path and the normal case. It stops working exactly when
++ * Windows no longer owns `127.0.0.1` for the VM — disabled localhost forwarding
++ * or mirrored networking — and then a pipe is the only way in.
++ * @param {{ configured?: string, wslConfig?: { localhostForwarding?: boolean, networkingMode?: string }, platform?: string }} options
++ * @returns {'direct' | 'stdio'}
++ */
++function chooseTunnelMode(options) {
++	const configured = options.configured ?? 'auto';
++	if (configured === 'direct' || configured === 'stdio') {
++		return configured;
++	}
++	if ((options.platform ?? process.platform) !== 'win32') {
++		return 'direct';
++	}
++	const config = options.wslConfig ?? {};
++	if (config.localhostForwarding === false || config.networkingMode === 'mirrored') {
++		return 'stdio';
++	}
++	return 'direct';
++}
++
++/** @param {string} path */
++async function readWslConfigFile(path) {
++	try {
++		return parseWslConfig(await readFile(path, 'utf8'));
++	} catch {
++		return {};
++	}
++}
++
++function wslConfigPath() {
++	return join(homedir(), '.wslconfig');
++}
++
++module.exports = { parseWslConfig, chooseTunnelMode, readWslConfigFile, wslConfigPath };
 diff --git a/extensions/picket-remote-wsl/src/probe.js b/extensions/picket-remote-wsl/src/probe.js
 new file mode 100644
 index 00000000..59ade20e
@@ -1588,22 +1721,24 @@ index 00000000..f736d42b
 +module.exports = { AUTHORITY_PREFIX, parseAuthority, remoteUriFor, parseUncPath, toPosixPath, toWindowsPath };
 diff --git a/extensions/picket-remote-wsl/src/resolver.js b/extensions/picket-remote-wsl/src/resolver.js
 new file mode 100644
-index 00000000..ccbf00d6
+index 00000000..8b60870a
 --- /dev/null
 +++ b/extensions/picket-remote-wsl/src/resolver.js
-@@ -0,0 +1,141 @@
+@@ -0,0 +1,168 @@
 +'use strict';
 +
 +const { listDistros, defaultDistro, visibleDistros, distroHome } = require('./distro.js');
 +const { serverPaths, runtimeFileFor, buildServerArgs, newConnectionToken, lockAndRead, clearRuntime, startServer, stopServer } = require('./launch.js');
 +const { probeServer } = require('./probe.js');
 +const { parseAuthority } = require('./remoteUri.js');
++const { detectIcode } = require('./icode.js');
++const { chooseTunnelMode, readWslConfigFile, wslConfigPath } = require('./preflight.js');
 +
 +/** @typedef {{ port: number, token: string, tag: string, pid: number, startedAt: string }} IRuntimeInfo */
 +/** @typedef {{ host: string, port: number, connectionToken: string }} IResolverResult */
 +/** @typedef {{ info(...parts: unknown[]): void, error(...parts: unknown[]): void }} ILog */
 +/** @typedef {{ ensure(id: string): Promise<{ payloadDir: string }> }} IComponentManager */
-+/** @typedef {{ startTimeoutSeconds?: number }} ISettings */
++/** @typedef {{ startTimeoutSeconds?: number, icodePath?: string, tunnelMode?: string }} ISettings */
 +
 +/**
 + * A remote authority names a distro and nothing else; everything a connection
@@ -1615,6 +1750,9 @@ index 00000000..ccbf00d6
 + *   components: (ctx: { distro: string, home: string, runner: any }) => IComponentManager,
 + *   settings: ISettings,
 + *   log: ILog,
++ *   platform?: string,
++ *   readWslConfig?: () => Promise<{ localhostForwarding?: boolean, networkingMode?: string }>,
++ *   warn?: (message: string) => void,
 + *   startServer?: typeof startServer,
 + *   stopServer?: typeof stopServer,
 + *   probe?: (target: { host: string, port: number, token: string }) => Promise<'alive' | 'bad-token' | 'dead'>
@@ -1626,8 +1764,22 @@ index 00000000..ccbf00d6
 +	const start = options.startServer ?? startServer;
 +	const stop = options.stopServer ?? stopServer;
 +	const probe = options.probe ?? (target => probeServer(target));
++	const platform = options.platform ?? process.platform;
++	const readWslConfig = options.readWslConfig ?? (() => readWslConfigFile(wslConfigPath()));
++	const warn = options.warn ?? (() => { });
 +	/** @type {Map<string, Promise<IResolverResult>>} */
 +	const inFlight = new Map();
++	/** @type {Set<string>} */
++	const warned = new Set();
++
++	/** @param {string} key @param {string} message */
++	function warnOnce(key, message) {
++		if (warned.has(key)) {
++			return;
++		}
++		warned.add(key);
++		warn(message);
++	}
 +
 +	function serverVersion() {
 +		const component = Array.isArray(catalog?.components) ? catalog.components.find((/** @type {any} */ c) => c.id === 'wsl-server') : undefined;
@@ -1681,14 +1833,22 @@ index 00000000..ccbf00d6
 +		const manager = components({ distro, home, runner });
 +		await manager.ensure('wsl-server');
 +
++		const icode = await detectIcode({ runner, distro, configuredPath: settings.icodePath ?? '' });
++		if (icode.source === 'missing') {
++			warnOnce(`${distro}:icode`, 'WSL 里未找到 iCode：AI 功能不可用。设置 Picket: WSL › ICode Path 可指定路径。');
++		}
++		const tunnelMode = chooseTunnelMode({ configured: settings.tunnelMode ?? 'auto', wslConfig: await readWslConfig(), platform });
++		log.info(`Starting ${paths.binary}: tunnel=${tunnelMode}, icode=${icode.path ?? 'missing'} (${icode.source})`);
++
 +		const connectionToken = newConnectionToken();
-+		const args = buildServerArgs({ paths, connectionToken, distro });
++		const args = buildServerArgs({ paths, connectionToken, distro, icodeBin: icode.path ?? '' });
 +		const info = await start({
 +			runner,
 +			distro,
 +			args,
 +			runtimeFile,
 +			timeoutMs: (settings.startTimeoutSeconds ?? 90) * 1000,
++			extra: { tunnelMode, icode: icode.source },
 +			log
 +		});
 +		return coordinates(info);
@@ -2051,6 +2211,71 @@ index 00000000..ac0353a7
 +	process.stderr.write(`fake-wsl: unsupported arguments: ${args.join(' ')}\r\n`);
 +	process.exit(1);
 +}
+diff --git a/extensions/picket-remote-wsl/test/icode.test.js b/extensions/picket-remote-wsl/test/icode.test.js
+new file mode 100644
+index 00000000..5e31eaaa
+--- /dev/null
++++ b/extensions/picket-remote-wsl/test/icode.test.js
+@@ -0,0 +1,59 @@
++// RED first: this file must fail until src/icode.js exists.
++const test = require('node:test');
++const assert = require('node:assert');
++const { detectIcode } = require('../src/icode.js');
++
++/** @param {{ configured?: string, executable?: boolean, onPath?: string, pathExit?: number, scripts?: string[] }} [options] */
++function makeRunner(options = {}) {
++	const scripts = [];
++	const runner = {
++		scripts,
++		async exec(args) {
++			const script = args.slice(args.indexOf('-e') + 1).join(' ');
++			scripts.push(script);
++			if (script.startsWith('test -x')) {
++				return { code: options.executable ? 0 : 1, stdout: '', stderr: '' };
++			}
++			if (script.includes('command -v icode')) {
++				return { code: options.pathExit ?? (options.onPath ? 0 : 1), stdout: options.onPath ? `${options.onPath}\n` : '', stderr: '' };
++			}
++			throw new Error(`unexpected script: ${script}`);
++		}
++	};
++	return runner;
++}
++
++test('a configured path that is executable wins', async () => {
++	const runner = makeRunner({ configured: '/opt/icode/bin/icode', executable: true, onPath: '/home/u/.local/bin/icode' });
++	assert.deepStrictEqual(await detectIcode({ runner, distro: 'Ubuntu', configuredPath: '/opt/icode/bin/icode' }), { path: '/opt/icode/bin/icode', source: 'setting' });
++	assert.ok(runner.scripts[0].startsWith('test -x'));
++});
++
++test('a configured path that is not executable falls through to PATH', async () => {
++	const runner = makeRunner({ executable: false, onPath: '/home/u/.local/bin/icode' });
++	assert.deepStrictEqual(await detectIcode({ runner, distro: 'Ubuntu', configuredPath: '/opt/gone/icode' }), { path: '/home/u/.local/bin/icode', source: 'path' });
++});
++
++test('nothing configured and nothing on PATH means missing', async () => {
++	const runner = makeRunner({});
++	assert.deepStrictEqual(await detectIcode({ runner, distro: 'Ubuntu', configuredPath: '' }), { path: null, source: 'missing' });
++	assert.deepStrictEqual(runner.scripts, ['sh -lc command -v icode'], 'detection must use the same login shell the server starts in');
++});
++
++test('a failing command -v is missing, not an error', async () => {
++	const runner = makeRunner({ onPath: '/home/u/.local/bin/icode', pathExit: 1 });
++	assert.deepStrictEqual(await detectIcode({ runner, distro: 'Ubuntu', configuredPath: '' }), { path: null, source: 'missing' });
++});
++
++test('profile banners do not become the detected path', async () => {
++	const runner = {
++		async exec(args) {
++			const script = args.slice(args.indexOf('-e') + 1).join(' ');
++			if (script.includes('command -v icode')) {
++				return { code: 0, stdout: 'Welcome to Ubuntu!\n/home/u/.local/bin/icode\n', stderr: '' };
++			}
++			return { code: 1, stdout: '', stderr: '' };
++		}
++	};
++	assert.deepStrictEqual(await detectIcode({ runner, distro: 'Ubuntu', configuredPath: '' }), { path: '/home/u/.local/bin/icode', source: 'path' });
++});
 diff --git a/extensions/picket-remote-wsl/test/launch.test.js b/extensions/picket-remote-wsl/test/launch.test.js
 new file mode 100644
 index 00000000..3642dbef
@@ -2236,6 +2461,63 @@ index 00000000..93dac3fe
 +	assert.ok(calls[1].hasInput, 'tar receives the archive on stdin');
 +	assert.deepStrictEqual(readdirSync(dir), ['ok.tar.gz']);
 +});
+diff --git a/extensions/picket-remote-wsl/test/preflight.test.js b/extensions/picket-remote-wsl/test/preflight.test.js
+new file mode 100644
+index 00000000..c4c29112
+--- /dev/null
++++ b/extensions/picket-remote-wsl/test/preflight.test.js
+@@ -0,0 +1,51 @@
++// RED first: this file must fail until src/preflight.js exists.
++const test = require('node:test');
++const assert = require('node:assert');
++const { tmpdir } = require('node:os');
++const { join } = require('node:path');
++const { writeFile, mkdtemp } = require('node:fs/promises');
++const { parseWslConfig, chooseTunnelMode, readWslConfigFile, wslConfigPath } = require('../src/preflight.js');
++
++test('a disabled localhost forwarding is read as a boolean', () => {
++	assert.deepStrictEqual(parseWslConfig('[wsl2]\nlocalhostForwarding=false\n'), { localhostForwarding: false });
++	assert.deepStrictEqual(parseWslConfig('[wsl2]\nlocalhostforwarding = TRUE\n'), { localhostForwarding: true });
++});
++
++test('keys outside [wsl2] are ignored', () => {
++	assert.deepStrictEqual(parseWslConfig('[experimental]\nnetworkingMode=mirrored\nlocalhostForwarding=false\n'), {});
++	assert.deepStrictEqual(parseWslConfig('# comment\n[wsl2]\n; another\nnetworkingMode=mirrored\n'), { networkingMode: 'mirrored' });
++});
++
++test('a disabled localhost forwarding selects the tunnel', () => {
++	assert.strictEqual(chooseTunnelMode({ configured: 'auto', wslConfig: parseWslConfig('[wsl2]\nlocalhostForwarding=false\n'), platform: 'win32' }), 'stdio');
++});
++
++test('a mirrored network selects the tunnel', () => {
++	assert.strictEqual(chooseTunnelMode({ configured: 'auto', wslConfig: parseWslConfig('[wsl2]\nnetworkingMode=mirrored\n'), platform: 'win32' }), 'stdio');
++});
++
++test('auto on a non-Windows host is a plain direct connection', () => {
++	assert.strictEqual(chooseTunnelMode({ configured: 'auto', wslConfig: {}, platform: 'linux' }), 'direct');
++});
++
++test('an explicit mode wins over the config', () => {
++	assert.strictEqual(chooseTunnelMode({ configured: 'direct', wslConfig: parseWslConfig('[wsl2]\nlocalhostForwarding=false\n'), platform: 'win32' }), 'direct');
++	assert.strictEqual(chooseTunnelMode({ configured: 'stdio', wslConfig: parseWslConfig('[wsl2]\nlocalhostForwarding=true\n'), platform: 'win32' }), 'stdio');
++});
++
++test('a default config means a plain direct connection', () => {
++	assert.strictEqual(chooseTunnelMode({ configured: 'auto', wslConfig: parseWslConfig(''), platform: 'win32' }), 'direct');
++});
++
++test('an unreadable .wslconfig degrades to an empty config', async () => {
++	const dir = await mkdtemp(join(tmpdir(), 'picket-wsl-'));
++	const missing = join(dir, '.wslconfig');
++	assert.deepStrictEqual(await readWslConfigFile(missing), {});
++	const present = join(dir, 'present.wslconfig');
++	await writeFile(present, '[wsl2]\r\nnetworkingMode=mirrored\r\n');
++	assert.deepStrictEqual(await readWslConfigFile(present), { networkingMode: 'mirrored' });
++});
++
++test('the default config location is the Windows user profile', () => {
++	assert.ok(/\.wslconfig$/.test(wslConfigPath()));
++});
 diff --git a/extensions/picket-remote-wsl/test/probe.test.js b/extensions/picket-remote-wsl/test/probe.test.js
 new file mode 100644
 index 00000000..56079fa9
@@ -2341,10 +2623,10 @@ index 00000000..69414920
 +});
 diff --git a/extensions/picket-remote-wsl/test/resolver.test.js b/extensions/picket-remote-wsl/test/resolver.test.js
 new file mode 100644
-index 00000000..13ad0cb2
+index 00000000..8b2180f8
 --- /dev/null
 +++ b/extensions/picket-remote-wsl/test/resolver.test.js
-@@ -0,0 +1,244 @@
+@@ -0,0 +1,286 @@
 +// RED first: this file must fail until src/resolver.js exists.
 +const test = require('node:test');
 +const assert = require('node:assert');
@@ -2381,7 +2663,7 @@ index 00000000..13ad0cb2
 + * Answers the three shapes the resolver sends through `sh -c`: the lock probe,
 + * the runtime read, and (for the component manager) `ls -1t` plus marker and
 + * removal writes.
-+ * @param {{ runtime?: any, payloadDirs?: string[], home?: string, table?: string }} [options]
++ * @param {{ runtime?: any, payloadDirs?: string[], home?: string, table?: string, icode?: string }} [options]
 + */
 +function makeRunner(options = {}) {
 +	const calls = [];
@@ -2408,6 +2690,12 @@ index 00000000..13ad0cb2
 +			if (script.includes('rm -rf')) {
 +				state.removed.push(args[args.length - 1]);
 +				return { code: 0, stdout: '', stderr: '' };
++			}
++			if (script.includes('command -v icode')) {
++				return { code: options.icode === undefined ? 1 : 0, stdout: options.icode ?? '', stderr: '' };
++			}
++			if (script.startsWith('test -x')) {
++				return { code: 1, stdout: '', stderr: '' };
 +			}
 +			if (script.includes('if [ -e')) {
 +				return { code: 0, stdout: '0', stderr: '' };
@@ -2588,4 +2876,40 @@ index 00000000..13ad0cb2
 +	assert.strictEqual(stopped[0].info.port, 41234);
 +	assert.strictEqual(stopped[0].runtimeFile, '/home/u/.picket-code-server/runtime/Ubuntu.json');
 +	assert.strictEqual(stopped[0].dataDir, '/home/u/.picket-code-server/data');
++});
++
++test('the detected iCode path and the tunnel mode reach the started server', async () => {
++	const runner = makeRunner({ icode: '/home/u/.local/bin/icode\n' });
++	const { starts, startServer } = startsRecording();
++	const resolver = createResolver({
++		runner, catalog: catalog(), settings: { tunnelMode: 'stdio' }, log: silentLog(), startServer,
++		components: () => ({ ensure: async () => ({ payloadDir: `/home/u/.picket-code-server/payloads/server-${VERSION}` }) }),
++		readWslConfig: async () => ({}),
++		platform: 'win32'
++	});
++
++	await resolver.resolve('picket-wsl+Ubuntu');
++	assert.strictEqual(starts[0].args[8], '/home/u/.local/bin/icode');
++	assert.deepStrictEqual(starts[0].extra, { tunnelMode: 'stdio', icode: 'path' });
++});
++
++test('a missing iCode warns once per distro and still connects', async () => {
++	const runner = makeRunner();
++	const { starts, startServer } = startsRecording();
++	const warnings = [];
++	const resolver = createResolver({
++		runner, catalog: catalog(), settings: {}, log: silentLog(), startServer,
++		components: () => ({ ensure: async () => ({ payloadDir: `/home/u/.picket-code-server/payloads/server-${VERSION}` }) }),
++		readWslConfig: async () => ({}),
++		platform: 'win32',
++		warn: (message) => warnings.push(message)
++	});
++
++	await resolver.resolve('picket-wsl+Ubuntu');
++	await resolver.resolve('picket-wsl+Ubuntu');
++	assert.strictEqual(starts.length, 2);
++	assert.strictEqual(warnings.length, 1);
++	assert.match(warnings[0], /iCode/);
++	assert.strictEqual(starts[0].extra.icode, 'missing');
++	assert.strictEqual(starts[0].args[8], '', 'an empty argv entry, never an unset variable, keeps the launch script simple');
 +});
