@@ -909,6 +909,291 @@ index 00000000..5d068b16
 +	distroStatus,
 +	wslStatus
 +};
+diff --git a/extensions/picket-remote-wsl/src/launch.js b/extensions/picket-remote-wsl/src/launch.js
+new file mode 100644
+index 00000000..ce7ec2a8
+--- /dev/null
++++ b/extensions/picket-remote-wsl/src/launch.js
+@@ -0,0 +1,279 @@
++'use strict';
++
++const { randomBytes } = require('node:crypto');
++
++/** @typedef {{ port: number, token: string, tag: string, pid: number, startedAt: string }} IRuntimeInfo */
++
++/**
++ * Sourced inside the distro before the binary starts: the login shell has by
++ * then applied the user's profile, so `PATH`, `NVM_DIR`, `BUN_INSTALL` and
++ * friends are what an interactive shell would see. Every value arrives as an
++ * argv entry, so nothing here is ever re-parsed by a shell.
++ */
++const LAUNCH_SCRIPT = 'setup="$1"; icode="$2"; shift 2; [ -f "$setup" ] && . "$setup"; [ -n "$icode" ] && export PICKET_ICODE_BIN="$icode"; exec "$0" "$@"';
++
++/** @type {readonly string[]} */
++const SERVER_FLAGS = [
++	'--host=127.0.0.1',
++	'--port=0',
++	'--use-host-proxy',
++	'--without-browser-env-var',
++	'--disable-websocket-compression',
++	'--accept-server-license-terms'
++];
++
++/**
++ * @param {string} home
++ * @param {string} tag
++ */
++function serverPaths(home, tag) {
++	const root = `${home}/.picket-code-server`;
++	const payloadDir = `${root}/payloads/server-${tag}`;
++	return {
++		root,
++		payloadDir,
++		binary: `${payloadDir}/bin/picket-code-server`,
++		remoteCli: `${payloadDir}/bin/remote-cli/picket-code`,
++		cliLink: `${home}/.local/bin/picket-code`,
++		dataDir: `${root}/data`,
++		extensionsDir: `${root}/extensions`,
++		logDir: `${root}/logs`,
++		runtimeFile: `${root}/runtime.json`,
++		envSetupFile: `${root}/server-env-setup`
++	};
++}
++
++/**
++ * @param {{ paths: ReturnType<typeof serverPaths>, connectionToken: string, icodeBin?: string, distro: string }} options
++ * @returns {string[]}
++ */
++function buildServerArgs(options) {
++	const { paths, connectionToken, icodeBin, distro } = options;
++	const flags = SERVER_FLAGS.flatMap(flag => flag === '--port=0' ? [flag, `--connection-token=${connectionToken}`] : [flag]);
++	return [
++		'-d', distro, '-e', 'sh', '-lc', LAUNCH_SCRIPT, paths.binary, paths.envSetupFile, icodeBin ?? '',
++		...flags,
++		`--user-data-dir=${paths.dataDir}`,
++		`--extensions-dir=${paths.extensionsDir}`,
++		'--log=trace'
++	];
++}
++
++/**
++ * The server picks its own port (`--port=0`) and announces it once. Profile
++ * banners and warnings are expected around the line, so only an exact match
++ * to the first announcement counts.
++ */
++function createPortParser() {
++	return {
++		port: /** @type {number | undefined} */ (undefined),
++		/** @param {string} text */
++		feed(text) {
++			if (this.port !== undefined) {
++				return;
++			}
++			const match = /Extension host agent listening on (\d+)/.exec(text);
++			if (match) {
++				this.port = Number(match[1]);
++			}
++		}
++	};
++}
++
++function newConnectionToken() {
++	return randomBytes(32).toString('base64url');
++}
++
++/**
++ * One round trip decides reuse: is a start in progress (lock), and if not, what
++ * did the last one leave behind. A read of the runtime file only happens when
++ * the lock is absent, so two windows racing at startup cannot both spawn.
++ * @param {any} runner
++ * @param {string} distro
++ * @param {string} runtimeFile
++ * @returns {Promise<IRuntimeInfo | undefined>}
++ */
++async function lockAndRead(runner, distro, runtimeFile) {
++	const lock = await runner.exec(['-d', distro, '-e', 'sh', '-c', 'if [ -e "$1" ]; then printf 1; else printf 0; fi', 'sh', `${runtimeFile}.lock`]);
++	if (String(lock.stdout).trim() !== '0') {
++		return undefined;
++	}
++	const read = await runner.exec(['-d', distro, '-e', 'sh', '-c', 'cat "$1" 2>/dev/null || true', 'sh', runtimeFile]);
++	const text = String(read.stdout).trim();
++	if (!text) {
++		return undefined;
++	}
++	try {
++		const info = JSON.parse(text);
++		return typeof info?.port === 'number' ? info : undefined;
++	} catch {
++		return undefined;
++	}
++}
++
++/**
++ * @param {any} runner
++ * @param {string} runtimeFile
++ * @param {IRuntimeInfo} info
++ * @param {string} distro
++ */
++async function writeRuntime(runner, runtimeFile, info, distro) {
++	const json = JSON.stringify(info);
++	await runner.exec(['-d', distro, '-e', 'sh', '-c', 'mkdir -p "$(dirname "$1")" && printf %s "$2" > "$1.tmp" && mv "$1.tmp" "$1"', 'sh', runtimeFile, json]);
++}
++
++/**
++ * @param {any} runner
++ * @param {string} runtimeFile
++ * @param {string} distro
++ */
++async function clearRuntime(runner, runtimeFile, distro) {
++	await runner.exec(['-d', distro, '-e', 'sh', '-c', 'rm -f "$1" "$1.lock"', 'sh', runtimeFile]);
++}
++
++/**
++ * @param {string[]} args
++ * @param {string} prefix
++ * @returns {string | undefined}
++ */
++function argValue(args, prefix) {
++	const index = args.findIndex(a => a.startsWith(prefix));
++	return index === -1 ? undefined : args[index].slice(prefix.length);
++}
++
++/**
++ * @param {{ runner: any, distro: string, args: string[], runtimeFile: string, timeoutMs?: number, log?: { info(...parts: unknown[]): void, error(...parts: unknown[]): void }, writeRuntime?: typeof writeRuntime }} options
++ * @returns {Promise<IRuntimeInfo>}
++ */
++async function startServer(options) {
++	const { runner, distro, args, runtimeFile } = options;
++	const timeoutMs = options.timeoutMs ?? 90000;
++	const log = options.log ?? { info() { }, error() { } };
++	const persist = options.writeRuntime ?? writeRuntime;
++	const token = argValue(args, '--connection-token=') ?? '';
++	const tag = /payloads\/server-([^/]+)\/bin\//.exec(args[6] ?? args.join(' '))?.[1] ?? '';
++
++	return new Promise((resolve, reject) => {
++		const { child, stdout, stderr } = runner.spawn(args);
++		const parser = createPortParser();
++		/** @type {string[]} */
++		const tail = [];
++		let settled = false;
++
++		const timer = setTimeout(() => {
++			if (settled) {
++				return;
++			}
++			settled = true;
++			child.kill();
++			const last = tail.slice(-40).join('\n');
++			reject(new Error(`Start timed out after ${formatMs(timeoutMs)}${last ? `:\n${last}` : ''}`));
++		}, timeoutMs);
++		timer.unref?.();
++
++		/** @param {Buffer | string} chunk */
++		const onChunk = (chunk) => {
++			const text = String(chunk);
++			for (const line of text.split(/\r?\n/)) {
++				if (line.trim()) {
++					tail.push(line.trim());
++					if (tail.length > 40) {
++						tail.shift();
++					}
++					log.info(`[server] ${line.trim()}`);
++				}
++			}
++			parser.feed(text);
++			if (parser.port !== undefined && !settled) {
++				settled = true;
++				clearTimeout(timer);
++				/** @type {IRuntimeInfo} */
++				const info = { port: parser.port, token, tag, pid: child.pid ?? -1, startedAt: new Date().toISOString() };
++				void persist(runner, runtimeFile, info, distro).catch((error) => log.error(`Could not write ${runtimeFile}: ${error.message}`));
++				resolve(info);
++			}
++		};
++		stdout?.on('data', onChunk);
++		stderr?.on('data', onChunk);
++
++		child.on('error', (error) => {
++			if (settled) {
++				return;
++			}
++			settled = true;
++			clearTimeout(timer);
++			reject(error);
++		});
++		child.on('close', ( /** @type {number | null} */ code) => {
++			if (settled) {
++				return;
++			}
++			settled = true;
++			clearTimeout(timer);
++			const last = tail.slice(-40).join('\n');
++			if (code === 99) {
++				reject(new Error(`WSL 1 or an unsupported distro cannot run the server (exit 99). Convert with "wsl --set-version <distro> 2".${last ? `\n${last}` : ''}`));
++				return;
++			}
++			reject(new Error(`Server exited with code ${code}${last ? `:\n${last}` : ''}`));
++		});
++	});
++}
++
++/** @param {number} ms */
++function formatMs(ms) {
++	return ms % 1000 === 0 ? `${ms / 1000} s` : `${ms} ms`;
++}
++
++/**
++ * Best effort and in a fixed order: TERM, wait, probe, KILL, sweep, forget.
++ * A failure at one step must not stop the next — a stale server is worse than
++ * a noisy log.
++ * @param {{ runner: any, distro: string, runtimeFile: string, info: IRuntimeInfo, log?: any, probe?: (info: IRuntimeInfo) => Promise<string>, waitMs?: number, dataDir?: string }} options
++ */
++async function stopServer(options) {
++	const { runner, distro, runtimeFile, info } = options;
++	const log = options.log ?? { info() { }, error() { } };
++	const probe = options.probe;
++	const waitMs = options.waitMs ?? 5000;
++
++	const step = async (name, fn) => {
++		try {
++			await fn();
++			log.info(`stop: ${name} ok`);
++		} catch (error) {
++			log.error(`stop: ${name} failed: ${error.message}`);
++		}
++	};
++
++	await step('SIGTERM', () => runner.exec(['-d', distro, '-e', 'kill', '-TERM', String(info.pid)]));
++	await step('wait', () => new Promise(resolve => setTimeout(resolve, waitMs)));
++	if (probe) {
++		await step('probe', async () => {
++			if (await probe(info) === 'dead') {
++				log.info('stop: server is gone');
++				return;
++			}
++			throw new Error('still answering');
++		});
++	}
++	await step('SIGKILL', () => runner.exec(['-d', distro, '-e', 'sh', '-c', 'kill -9 "$1" 2>/dev/null || true', 'sh', String(info.pid)]));
++	if (options.dataDir) {
++		await step('sweep', () => runner.exec(['-d', distro, '-e', 'sh', '-c', 'pkill -f "picket-code-server.*--user-data-dir=$1" 2>/dev/null || true', 'sh', options.dataDir]));
++	}
++	await step('clear runtime', () => clearRuntime(runner, runtimeFile, distro));
++}
++
++module.exports = {
++	LAUNCH_SCRIPT,
++	SERVER_FLAGS,
++	serverPaths,
++	buildServerArgs,
++	createPortParser,
++	newConnectionToken,
++	lockAndRead,
++	writeRuntime,
++	clearRuntime,
++	startServer,
++	stopServer
++};
 diff --git a/extensions/picket-remote-wsl/src/log.js b/extensions/picket-remote-wsl/src/log.js
 new file mode 100644
 index 00000000..918896a0
@@ -1123,6 +1408,45 @@ index 00000000..62602222
 +}
 +
 +module.exports = { parseSha256Sums, chooseSource, sha256OfFile, installPayload };
+diff --git a/extensions/picket-remote-wsl/src/probe.js b/extensions/picket-remote-wsl/src/probe.js
+new file mode 100644
+index 00000000..59ade20e
+--- /dev/null
++++ b/extensions/picket-remote-wsl/src/probe.js
+@@ -0,0 +1,33 @@
++'use strict';
++
++/**
++ * The server has no health endpoint; asking for a resource without a valid
++ * token is the cheapest question it answers. A 400 means "reachable and the
++ * token was accepted" (the request itself is malformed on purpose), a 4xx
++ * auth status means the token is wrong, and anything else is dead.
++ * @param {{ host: string, port: number, token: string, timeoutMs?: number, fetchImpl?: typeof fetch }} options
++ * @returns {Promise<'alive' | 'bad-token' | 'dead'>}
++ */
++async function probeServer(options) {
++	const timeoutMs = options.timeoutMs ?? 2000;
++	const fetchImpl = options.fetchImpl ?? globalThis.fetch;
++	const controller = new AbortController();
++	const timer = setTimeout(() => controller.abort(), timeoutMs);
++	timer.unref?.();
++	try {
++		const response = await fetchImpl(`http://${options.host}:${options.port}/vscode-remote-resource?tkn=${encodeURIComponent(options.token)}`, { signal: controller.signal });
++		if (response.status === 400 || response.status === 200) {
++			return 'alive';
++		}
++		if (response.status === 401 || response.status === 403) {
++			return 'bad-token';
++		}
++		return 'dead';
++	} catch {
++		return 'dead';
++	} finally {
++		clearTimeout(timer);
++	}
++}
++
++module.exports = { probeServer };
 diff --git a/extensions/picket-remote-wsl/test/catalog.test.js b/extensions/picket-remote-wsl/test/catalog.test.js
 new file mode 100644
 index 00000000..350ec874
@@ -1441,6 +1765,127 @@ index 00000000..ac0353a7
 +	process.stderr.write(`fake-wsl: unsupported arguments: ${args.join(' ')}\r\n`);
 +	process.exit(1);
 +}
+diff --git a/extensions/picket-remote-wsl/test/launch.test.js b/extensions/picket-remote-wsl/test/launch.test.js
+new file mode 100644
+index 00000000..ae669503
+--- /dev/null
++++ b/extensions/picket-remote-wsl/test/launch.test.js
+@@ -0,0 +1,115 @@
++// RED first: this file must fail until src/launch.js exists.
++const test = require('node:test');
++const assert = require('node:assert');
++const { serverPaths, buildServerArgs, createPortParser, lockAndRead, LAUNCH_SCRIPT } = require('../src/launch.js');
++
++test('serverPaths composes the documented layout', () => {
++	const p = serverPaths('/home/u', 'v1.143.1-picket.1-rc.4');
++	assert.strictEqual(p.binary, '/home/u/.picket-code-server/payloads/server-v1.143.1-picket.1-rc.4/bin/picket-code-server');
++	assert.strictEqual(p.dataDir, '/home/u/.picket-code-server/data');
++	assert.strictEqual(p.extensionsDir, '/home/u/.picket-code-server/extensions');
++	assert.strictEqual(p.runtimeFile, '/home/u/.picket-code-server/runtime.json');
++});
++
++test('buildServerArgs launches through a login shell with argv-passed values', () => {
++	const p = serverPaths('/home/u', 'T');
++	const args = buildServerArgs({ paths: p, connectionToken: 'a-b-c-d', icodeBin: '/usr/local/bin/icode', distro: 'Ubuntu' });
++	assert.deepStrictEqual(args.slice(0, 9), ['-d', 'Ubuntu', '-e', 'sh', '-lc', LAUNCH_SCRIPT, p.binary, p.envSetupFile, '/usr/local/bin/icode']);
++	assert.ok(!args.includes('env'));   // PICKET_ICODE_BIN travels inside the launch script, not a second binary
++	assert.ok(args.includes('--without-browser-env-var'));
++	assert.ok(args.includes('--port=0'));
++	assert.ok(args.includes(`--user-data-dir=${p.dataDir}`));
++	assert.ok(args.includes('--connection-token=a-b-c-d'));
++	assert.ok(args.includes(`--extensions-dir=${p.extensionsDir}`));
++	assert.ok(args.includes('--host=127.0.0.1'));
++	assert.ok(args.includes('--use-host-proxy'));
++	assert.ok(args.includes('--disable-websocket-compression'));
++	assert.ok(args.includes('--accept-server-license-terms'));
++	assert.ok(args.includes('--log=trace'));
++});
++
++test('a space and a quote inside the icode path stay one argv entry', () => {
++	const p = serverPaths('/home/u', 'T');
++	const args = buildServerArgs({ paths: p, connectionToken: 'x', icodeBin: "/home/u/my tools/it's icode", distro: 'Ubuntu 22.04 LTS' });
++	assert.strictEqual(args[1], 'Ubuntu 22.04 LTS');
++	assert.strictEqual(args[8], "/home/u/my tools/it's icode");
++});
++
++test('the port parser ignores banners and trailing noise', () => {
++	const parser = createPortParser();
++	parser.feed('Your Windows build is out of date.\n');
++	parser.feed('Extension host agent listening on 41234\n');
++	parser.feed('another line\n');
++	assert.strictEqual(parser.port, 41234);
++});
++
++test('a lock that already exists keeps the second caller from spawning', async () => {
++	const calls = [];
++	const runner = { exec: async (args) => { calls.push(args.join(' ')); return { code: 0, stdout: '1', stderr: '' }; }, spawn: () => { throw new Error('not used'); } };
++	assert.strictEqual(await lockAndRead(runner, 'Ubuntu', '/home/u/.picket-code-server/runtime.json'), undefined);
++	assert.ok(!calls.some(c => c.includes('cat')));
++});
++
++test('a free lock reads the runtime file', async () => {
++	const info = { port: 41234, token: 't', tag: 'T', pid: 7, startedAt: 'now' };
++	const runner = { exec: async (args) => {
++		const script = args.slice(args.indexOf('-e') + 1).join(' ');
++		return script.includes('cat')
++			? { code: 0, stdout: JSON.stringify(info), stderr: '' }
++			: { code: 0, stdout: '0', stderr: '' };
++	}, spawn: () => { throw new Error('not used'); } };
++	assert.deepStrictEqual(await lockAndRead(runner, 'Ubuntu', '/home/u/.picket-code-server/runtime.json'), info);
++});
++
++const { EventEmitter } = require('node:events');
++const { newConnectionToken, startServer } = require('../src/launch.js');
++
++function spawnEmitting(script) {
++	return () => {
++		const child = new EventEmitter();
++		child.stdout = new EventEmitter();
++		child.stderr = new EventEmitter();
++		child.stdin = { end() { } };
++		child.kill = () => { };
++		child.pid = 4242;
++		setImmediate(() => script(child));
++		return { child, stdout: child.stdout, stderr: child.stderr };
++	};
++}
++
++test('a start resolves with the parsed port and a runtime record', async () => {
++	const paths = serverPaths('/home/u', 'T');
++	const args = buildServerArgs({ paths, connectionToken: 'tok', icodeBin: undefined, distro: 'Ubuntu' });
++	const info = await startServer({
++		runner: { spawn: spawnEmitting(child => child.stdout.emit('data', Buffer.from('banner line\nExtension host agent listening on 51234\n'))) },
++		distro: 'Ubuntu', args, runtimeFile: '/dev/null/runtime.json', timeoutMs: 500, writeRuntime: async () => { }
++	});
++	assert.strictEqual(info.port, 51234);
++	assert.strictEqual(info.token, 'tok');
++	assert.strictEqual(info.tag, 'T');
++	assert.strictEqual(info.pid, 4242);
++});
++
++test('a silent server fails with the timeout and keeps the last output line', async () => {
++	const paths = serverPaths('/home/u', 'T');
++	const args = buildServerArgs({ paths, connectionToken: 'tok', icodeBin: undefined, distro: 'Ubuntu' });
++	await assert.rejects(() => startServer({
++		runner: { spawn: spawnEmitting(child => child.stderr.emit('data', Buffer.from('loading extensions...\n'))) },
++		distro: 'Ubuntu', args, runtimeFile: '/dev/null/runtime.json', timeoutMs: 80, writeRuntime: async () => { }
++	}), (error) => /Start timed out after 80 ms/.test(error.message) && /loading extensions/.test(error.message));
++});
++
++test('exit code 99 names the distro as unsupported', async () => {
++	const paths = serverPaths('/home/u', 'T');
++	const args = buildServerArgs({ paths, connectionToken: 'tok', icodeBin: undefined, distro: 'Ubuntu' });
++	await assert.rejects(() => startServer({
++		runner: { spawn: spawnEmitting(child => child.emit('close', 99)) },
++		distro: 'Ubuntu', args, runtimeFile: '/dev/null/runtime.json', timeoutMs: 500, writeRuntime: async () => { }
++	}), /WSL 1|unsupported|not supported/i);
++});
++
++test('the token is url-safe and long enough to be unguessable', () => {
++	const token = newConnectionToken();
++	assert.match(token, /^[A-Za-z0-9_-]{32,}$/);
++	assert.notStrictEqual(token, newConnectionToken());
++});
 diff --git a/extensions/picket-remote-wsl/test/payload.test.js b/extensions/picket-remote-wsl/test/payload.test.js
 new file mode 100644
 index 00000000..93dac3fe
@@ -1503,4 +1948,45 @@ index 00000000..93dac3fe
 +	assert.match(calls[0].args.join(' '), /mkdir -p/);
 +	assert.ok(calls[1].hasInput, 'tar receives the archive on stdin');
 +	assert.deepStrictEqual(readdirSync(dir), ['ok.tar.gz']);
++});
+diff --git a/extensions/picket-remote-wsl/test/probe.test.js b/extensions/picket-remote-wsl/test/probe.test.js
+new file mode 100644
+index 00000000..56079fa9
+--- /dev/null
++++ b/extensions/picket-remote-wsl/test/probe.test.js
+@@ -0,0 +1,35 @@
++// RED first: this file must fail until src/probe.js exists.
++const test = require('node:test');
++const assert = require('node:assert');
++const { probeServer } = require('../src/probe.js');
++
++test('HTTP 400 means the server answered and the token was accepted', async () => {
++	const fetchImpl = async () => ({ status: 400, ok: false });
++	assert.strictEqual(await probeServer({ host: '127.0.0.1', port: 1, token: 't', fetchImpl }), 'alive');
++});
++
++test('HTTP 403 means the token was rejected', async () => {
++	const fetchImpl = async () => ({ status: 403, ok: false });
++	assert.strictEqual(await probeServer({ host: '127.0.0.1', port: 1, token: 't', fetchImpl }), 'bad-token');
++});
++
++test('a refused connection is dead', async () => {
++	const fetchImpl = async () => { throw Object.assign(new Error('connect ECONNREFUSED'), { code: 'ECONNREFUSED' }); };
++	assert.strictEqual(await probeServer({ host: '127.0.0.1', port: 1, token: 't', fetchImpl }), 'dead');
++});
++
++test('a fetch that never settles is dead once the timeout elapses', async () => {
++	const fetchImpl = (url, init) => new Promise((resolve, reject) => {
++		init.signal.addEventListener('abort', () => reject(new Error('aborted')));
++	});
++	const started = Date.now();
++	assert.strictEqual(await probeServer({ host: '127.0.0.1', port: 1, token: 't', timeoutMs: 50, fetchImpl }), 'dead');
++	assert.ok(Date.now() - started < 1000);
++});
++
++test('the request carries the token', async () => {
++	let seen;
++	const fetchImpl = async (url) => { seen = String(url); return { status: 400, ok: false }; };
++	await probeServer({ host: '127.0.0.1', port: 41234, token: 'abc', fetchImpl });
++	assert.strictEqual(seen, 'http://127.0.0.1:41234/vscode-remote-resource?tkn=abc');
 +});
