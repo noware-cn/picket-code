@@ -9,10 +9,10 @@ index 00000000..96fab092
 +tsconfig.json
 diff --git a/extensions/picket-remote-wsl/extension.js b/extensions/picket-remote-wsl/extension.js
 new file mode 100644
-index 00000000..f1df2956
+index 00000000..9c235613
 --- /dev/null
 +++ b/extensions/picket-remote-wsl/extension.js
-@@ -0,0 +1,181 @@
+@@ -0,0 +1,173 @@
 +'use strict';
 +
 +const { join } = require('node:path');
@@ -172,14 +172,6 @@ index 00000000..f1df2956
 +		currentAuthority: () => vscode.env.remoteAuthority ?? '',
 +		register: (id, run) => vscode.commands.registerCommand(id, run)
 +	}));
-+
-+	// Until the CLI shim lands, its commands exist so the palette and the remote indicator do
-+	// not offer dead entries.
-+	for (const id of ['picket.wsl.installCli', 'picket.wsl.removeCli']) {
-+		context.subscriptions.push(vscode.commands.registerCommand(id, () => {
-+			log.info(`${id} is not implemented yet`);
-+		}));
-+	}
 +
 +	if (!(vscode.env.remoteAuthority ?? '')) {
 +		void maybeNudge({
@@ -638,10 +630,10 @@ index 00000000..f612ff0a
 +module.exports = { loadCatalog };
 diff --git a/extensions/picket-remote-wsl/src/commands.js b/extensions/picket-remote-wsl/src/commands.js
 new file mode 100644
-index 00000000..f8d8e405
+index 00000000..4c58be0e
 --- /dev/null
 +++ b/extensions/picket-remote-wsl/src/commands.js
-@@ -0,0 +1,382 @@
+@@ -0,0 +1,449 @@
 +'use strict';
 +
 +const { listDistros, distroHome, visibleDistros } = require('./distro.js');
@@ -650,6 +642,7 @@ index 00000000..f8d8e405
 +const { buildDiagnostics } = require('./diagnose.js');
 +const { selectGallery, installVsix } = require('./marketplace.js');
 +const { unpackOfflineBundle, removeBundle } = require('./offline.js');
++const { installShim, removeShim } = require('./shim.js');
 +
 +const LAST_DISTRO = 'picket.wsl.lastDistro';
 +const SERVER_COMPONENT = 'wsl-server';
@@ -672,7 +665,8 @@ index 00000000..f8d8e405
 + *   appRoot?: string,
 + *   gallery?: { get(key: string): any, update(key: string, value: any): Promise<void> },
 + *   currentFolders?: () => readonly any[],
-+ *   currentAuthority?: () => string
++ *   currentAuthority?: () => string,
++ *   clientPath?: string
 + * }} options
 + */
 +function createCommands(options) {
@@ -964,6 +958,67 @@ index 00000000..f8d8e405
 +		await host.refreshTargets();
 +	}
 +
++	/** The distro a command acts on: the current window's, else a picker. */
++	async function targetDistro(title) {
++		return parseAuthority(options.currentAuthority?.() ?? '') || await pickDistro(title);
++	}
++
++	/**
++	 * `picket-code .` inside the distro. The shim needs the installed server's
++	 * remote CLI plus this Windows client's POSIX path, so the component must
++	 * be in place first — `ensureComponentInteractive` is a no-op when it is.
++	 */
++	async function installCli() {
++		const distro = await targetDistro('选择要安装 picket-code 命令行的发行版');
++		if (!distro) {
++			return;
++		}
++		let home;
++		try {
++			home = await distroHomeOf(runner, distro);
++		} catch (error) {
++			await host.showErrorMessage(`无法进入 ${distro}：${error.message}`);
++			return;
++		}
++		if (!await ensureComponentInteractive({ distro, home })) {
++			return;
++		}
++		const tag = catalog?.tag;
++		if (!tag) {
++			await host.showErrorMessage('这个构建没有 WSL 服务器组件，无法安装命令行。');
++			return;
++		}
++		let clientPath;
++		try {
++			clientPath = await toPosixPath(runner, distro, options.clientPath ?? process.execPath);
++		} catch (error) {
++			await host.showErrorMessage(`无法把客户端路径转换成 WSL 路径：${error.message}`);
++			return;
++		}
++		const result = await installShim({ runner, distro, home, tag, clientPath });
++		if (result.status === 'installed') {
++			await host.showInformationMessage(`picket-code 命令行已就绪：${result.linkPath}`);
++		} else if (result.status === 'foreign-link') {
++			await host.showErrorMessage(`${result.linkPath} 已存在且不是 Picket Code 的（${result.message}），未做改动。`);
++		} else {
++			await host.showErrorMessage(`picket-code 命令行未通过验证：${result.message}`);
++		}
++	}
++
++	async function removeCli() {
++		const distro = await targetDistro('选择要移除 picket-code 命令行的发行版');
++		if (!distro) {
++			return;
++		}
++		try {
++			const home = await distroHomeOf(runner, distro);
++			await removeShim({ runner, distro, home });
++			await host.showInformationMessage('已移除 picket-code 命令行（~/.local/bin/picket-code）。');
++		} catch (error) {
++			await host.showErrorMessage(`移除 picket-code 命令行失败：${error.message}`);
++		}
++	}
++
 +	return {
 +		openFolder,
 +		reopenInWsl,
@@ -977,6 +1032,8 @@ index 00000000..f8d8e405
 +		deleteDistro: (distro) => manage('delete', distro),
 +		selectGallery: galleryCommand,
 +		installVsix: vsixCommand,
++		installCli,
++		removeCli,
 +		ensureComponentInteractive,
 +		pickDistro
 +	};
@@ -1009,7 +1066,9 @@ index 00000000..f8d8e405
 +	'picket.wsl.setDefaultDistro': (api) => (node) => api.setDefaultDistro(distroOf(node)),
 +	'picket.wsl.deleteDistro': (api) => (node) => api.deleteDistro(distroOf(node)),
 +	'picket.wsl.selectGallery': (api) => () => api.selectGallery(),
-+	'picket.wsl.installVsix': (api) => () => api.installVsix()
++	'picket.wsl.installVsix': (api) => () => api.installVsix(),
++	'picket.wsl.installCli': (api) => () => api.installCli(),
++	'picket.wsl.removeCli': (api) => () => api.removeCli()
 +};
 +
 +/**
@@ -3204,6 +3263,118 @@ index 00000000..0a6bcf5c
 +}
 +
 +module.exports = { createResolver };
+diff --git a/extensions/picket-remote-wsl/src/shim.js b/extensions/picket-remote-wsl/src/shim.js
+new file mode 100644
+index 00000000..abcd60ed
+--- /dev/null
++++ b/extensions/picket-remote-wsl/src/shim.js
+@@ -0,0 +1,106 @@
++'use strict';
++
++// The in-distro `picket-code` shim: a small shell script that points the
++// payload's remote CLI at this Windows client and the current window's
++// authority, so `picket-code .` inside a distro opens a Picket WSL window.
++
++const { AUTHORITY_PREFIX } = require('./remoteUri.js');
++const { serverPaths } = require('./launch.js');
++
++/** @typedef {{ code: number, stdout: Buffer | string, stderr: Buffer | string }} IWslResult */
++
++/**
++ * POSIX single quoting: the only way to put an arbitrary string into one
++ * shell word. `'` becomes `'\''`, closing and reopening the quotes.
++ * @param {string} value
++ */
++function shQuote(value) {
++	return `'${String(value).replace(/'/g, `'\\''`)}'`;
++}
++
++/**
++ * @param {{ clientPath: string, authority: string, remoteCliPath: string }} options
++ * @returns {string}
++ */
++function shimScript({ clientPath, authority, remoteCliPath }) {
++	return [
++		'#!/bin/sh',
++		'# Generated by the Picket Code WSL extension — reinstall it from there.',
++		`export VSCODE_CLIENT_COMMAND=${shQuote(clientPath)}`,
++		`export VSCODE_CLI_AUTHORITY=${shQuote(authority)}`,
++		`exec ${shQuote(remoteCliPath)} "$@"`
++	].join('\n');
++}
++
++// One constant script per step; every value travels as a positional argument,
++// so nothing the distro reports can turn into shell syntax here.
++const INSPECT_SCRIPT = 'mkdir -p "$1" "$2"; if [ -L "$3" ]; then readlink -f "$3"; elif [ -e "$3" ]; then printf file; else printf none; fi';
++const WRITE_SCRIPT = 'cat > "$1" && chmod 755 "$1"';
++const LINK_SCRIPT = 'ln -sfn "$2" "$1"';
++const PROBE_SCRIPT = '"$1" --version >/dev/null 2>&1';
++const REMOVE_SCRIPT = 'rm -rf "$1" "$2"';
++
++/**
++ * Installs `<home>/.picket-code-server/bin/<tag>/bin/picket-code` and links it
++ * to `<home>/.local/bin/picket-code`. An existing link that resolves inside
++ * our shim root is an upgrade; anything else is never overwritten. The last
++ * step probes that the Windows client is startable from inside the distro at
++ * all — with `[interop] enabled=false` in /etc/wsl.conf it never is, and no
++ * amount of reinstalling fixes that.
++ * @param {{
++ *   runner: { exec(args: string[], opts?: { input?: string | Buffer }): Promise<IWslResult> },
++ *   distro: string, home: string, tag: string, clientPath: string
++ * }} options
++ * @returns {Promise<{ status: 'installed' | 'foreign-link' | 'failed', scriptPath: string, linkPath: string, message?: string }>}
++ */
++async function installShim({ runner, distro, home, tag, clientPath }) {
++	const paths = serverPaths(home, tag);
++	const scriptPath = `${paths.root}/bin/${tag}/bin/picket-code`;
++	const linkPath = paths.cliLink;
++	const shimRoot = `${paths.root}/bin`;
++
++	const inspect = await runner.exec(
++		['-d', distro, '-e', 'sh', '-c', INSPECT_SCRIPT, 'sh', `${shimRoot}/${tag}/bin`, `${home}/.local/bin`, linkPath]);
++	const current = String(inspect.stdout).trim();
++	if (current === 'file') {
++		return { status: 'foreign-link', scriptPath, linkPath, message: `${linkPath} 已存在且不是符号链接` };
++	}
++	if (current !== 'none' && !current.startsWith(`${shimRoot}/`)) {
++		return { status: 'foreign-link', scriptPath, linkPath, message: current || `${linkPath} 状态未知` };
++	}
++
++	const script = shimScript({
++		clientPath,
++		authority: `${AUTHORITY_PREFIX}+${distro}`,
++		remoteCliPath: paths.remoteCli
++	});
++	await runner.exec(['-d', distro, '-e', 'sh', '-c', WRITE_SCRIPT, 'sh', scriptPath], { input: script });
++	await runner.exec(['-d', distro, '-e', 'sh', '-c', LINK_SCRIPT, 'sh', linkPath, scriptPath]);
++
++	const probe = await runner.exec(['-d', distro, '-e', 'sh', '-c', PROBE_SCRIPT, 'sh', clientPath]);
++	if (probe.code === 126 || probe.code === 127) {
++		return {
++			status: 'failed',
++			scriptPath,
++			linkPath,
++			message: `无法从 ${distro} 内启动 Windows 程序（exit ${probe.code}）。检查 /etc/wsl.conf 是否设置了 [interop] enabled=false。`
++		};
++	}
++	return { status: 'installed', scriptPath, linkPath };
++}
++
++/**
++ * Removes the link and every shim script we ever wrote (all tags). The shim
++ * root is ours alone — payloads, runtime and data live in sibling directories.
++ * @param {{
++ *   runner: { exec(args: string[], opts?: { input?: string | Buffer }): Promise<IWslResult> },
++ *   distro: string, home: string
++ * }} options
++ * @returns {Promise<void>}
++ */
++async function removeShim({ runner, distro, home }) {
++	const root = serverPaths(home, '').root;
++	await runner.exec(['-d', distro, '-e', 'sh', '-c', REMOVE_SCRIPT, 'sh', `${root}/bin`, `${home}/.local/bin/picket-code`]);
++}
++
++module.exports = { shQuote, shimScript, installShim, removeShim };
 diff --git a/extensions/picket-remote-wsl/src/tree.js b/extensions/picket-remote-wsl/src/tree.js
 new file mode 100644
 index 00000000..83dc02a7
@@ -3558,10 +3729,10 @@ index 00000000..350ec874
 +});
 diff --git a/extensions/picket-remote-wsl/test/commands.test.js b/extensions/picket-remote-wsl/test/commands.test.js
 new file mode 100644
-index 00000000..fc07775f
+index 00000000..0a8c071d
 --- /dev/null
 +++ b/extensions/picket-remote-wsl/test/commands.test.js
-@@ -0,0 +1,240 @@
+@@ -0,0 +1,261 @@
 +// RED first: this file must fail until src/commands.js exists.
 +const test = require('node:test');
 +const assert = require('node:assert');
@@ -3616,6 +3787,9 @@ index 00000000..fc07775f
 +			}
 +			if (key.includes('wslpath -u')) {
 +				return { code: 0, stdout: '/mnt/c/project\n', stderr: '' };
++			}
++			if (key.includes('readlink -f')) {
++				return { code: 0, stdout: 'none\n', stderr: '' };
 +			}
 +			return { code: 0, stdout: '', stderr: '' };
 +		}
@@ -3801,6 +3975,24 @@ index 00000000..fc07775f
 +	} finally {
 +		await rm(work, { recursive: true, force: true });
 +	}
++});
++
++test('installCli reports the link path after a successful shim install', async () => {
++	const ctx = harness({ flavor: 'ondemand', state: 'installed', host: { quickPick: 'Ubuntu-24.04' } });
++	await ctx.commands.installCli();
++
++	assert.ok(ctx.host.messages.some(message => /picket-code 命令行已就绪/.test(String(message))), `messages: ${ctx.host.messages.join(' | ')}`);
++	const write = ctx.calls.find(args => args.join(' ').includes('chmod 755'));
++	assert.ok(write, 'the shim script write never happened');
++});
++
++test('removeCli removes the shim and tells the user', async () => {
++	const ctx = harness({ flavor: 'ondemand', host: { quickPick: 'Ubuntu-24.04' } });
++	await ctx.commands.removeCli();
++
++	assert.ok(ctx.host.messages.some(message => /已移除 picket-code 命令行/.test(String(message))), `messages: ${ctx.host.messages.join(' | ')}`);
++	const removed = ctx.calls.find(args => args.join(' ').includes('rm -rf'));
++	assert.ok(removed && removed.join(' ').includes('/home/u/.local/bin/picket-code'));
 +});
 diff --git a/extensions/picket-remote-wsl/test/components.test.js b/extensions/picket-remote-wsl/test/components.test.js
 new file mode 100644
@@ -4637,10 +4829,10 @@ index 00000000..118dde5d
 +});
 diff --git a/extensions/picket-remote-wsl/test/manifest.test.js b/extensions/picket-remote-wsl/test/manifest.test.js
 new file mode 100644
-index 00000000..484966ce
+index 00000000..dfb4be44
 --- /dev/null
 +++ b/extensions/picket-remote-wsl/test/manifest.test.js
-@@ -0,0 +1,66 @@
+@@ -0,0 +1,68 @@
 +// RED first: the manifest and the code must agree about which commands exist.
 +const test = require('node:test');
 +const assert = require('node:assert');
@@ -4670,15 +4862,17 @@ index 00000000..484966ce
 +	assert.deepStrictEqual(stray, [], `registered but not in the manifest: ${stray.join(', ')}`);
 +});
 +
-+test('the command layer owns the twelve commands of this milestone', () => {
++test('the command layer owns the fourteen commands of this milestone', () => {
 +	assert.deepStrictEqual(Object.keys(COMMANDS).sort(), [
 +		'picket.wsl.addDistro',
 +		'picket.wsl.components',
 +		'picket.wsl.deleteDistro',
 +		'picket.wsl.diagnose',
++		'picket.wsl.installCli',
 +		'picket.wsl.installVsix',
 +		'picket.wsl.openFolder',
 +		'picket.wsl.refreshTargets',
++		'picket.wsl.removeCli',
 +		'picket.wsl.reopenInWindows',
 +		'picket.wsl.reopenInWsl',
 +		'picket.wsl.selectGallery',
@@ -4691,7 +4885,7 @@ index 00000000..484966ce
 +	// log.js is the one vscode-bound helper: it owns an OutputChannel.
 +	const sources = ['catalog.js', 'distro.js', 'components.js', 'payload.js', 'launch.js', 'probe.js',
 +		'remoteUri.js', 'resolver.js', 'icode.js', 'preflight.js', 'tree.js', 'manage.js', 'diagnose.js',
-+		'nudge.js', 'commands.js', 'marketplace.js', 'offline.js'];
++		'nudge.js', 'commands.js', 'marketplace.js', 'offline.js', 'shim.js'];
 +	for (const name of sources) {
 +		const text = readFileSync(join(root, 'src', name), 'utf8');
 +		assert.doesNotMatch(text, /require\(['"]vscode['"]\)/, `${name} must stay testable without an extension host`);
@@ -5693,6 +5887,127 @@ index 00000000..c1a5d499
 +	assert.strictEqual(result.port, 5555);
 +	assert.strictEqual(attempts, 1);
 +	assert.strictEqual(starts.length, 1, 'an unreachable tunnel means the recorded server is gone');
++});
+diff --git a/extensions/picket-remote-wsl/test/shim.test.js b/extensions/picket-remote-wsl/test/shim.test.js
+new file mode 100644
+index 00000000..45380ac8
+--- /dev/null
++++ b/extensions/picket-remote-wsl/test/shim.test.js
+@@ -0,0 +1,115 @@
++'use strict';
++
++// RED first: this file must fail until src/shim.js exists.
++
++const test = require('node:test');
++const assert = require('node:assert');
++const { shQuote, shimScript, installShim, removeShim } = require('../src/shim.js');
++
++const HOME = '/home/u';
++const TAG = 'v1.143.1-picket.1-rc.4';
++
++/**
++ * A runner that records every exec and answers them from a list.
++ * @param {Array<{ code?: number, stdout?: string, stderr?: string }>} responses
++ */
++function recordingRunner(responses) {
++	/** @type {Array<{ args: string[], input?: string | Buffer }>} */
++	const calls = [];
++	return {
++		calls,
++		async exec(args, opts) {
++			calls.push({ args, input: opts?.input });
++			const answer = responses[calls.length - 1] ?? { code: 0, stdout: '', stderr: '' };
++			return { code: answer.code ?? 0, stdout: answer.stdout ?? '', stderr: answer.stderr ?? '' };
++		}
++	};
++}
++
++const BASE = { distro: 'Ubuntu', home: HOME, tag: TAG, clientPath: '/mnt/c/Programs/Picket Code.exe' };
++
++test('quotes single quotes so the script cannot break out', () => {
++	assert.strictEqual(shQuote("it's"), "'it'\\''s'");
++});
++
++test('the shim exports the client command and authority, then execs the payload CLI', () => {
++	const script = shimScript({
++		clientPath: '/mnt/c/Users/u/AppData/Local/Programs/Picket Code/Picket Code.exe',
++		authority: 'picket-wsl+Ubuntu 22.04 LTS',
++		remoteCliPath: '/home/u/.picket-code-server/payloads/server-T/bin/remote-cli/picket-code'
++	});
++	assert.match(script, /VSCODE_CLIENT_COMMAND='\/mnt\/c\/Users\/u\/AppData\/Local\/Programs\/Picket Code\/Picket Code\.exe'/);
++	assert.match(script, /VSCODE_CLI_AUTHORITY='picket-wsl\+Ubuntu 22\.04 LTS'/);
++	assert.match(script, /exec '\/home\/u\/\.picket-code-server\/payloads\/server-T\/bin\/remote-cli\/picket-code' "\$@"$/);
++});
++
++test('installShim writes the script, links it and verifies interop', async () => {
++	const r = recordingRunner([{ code: 0, stdout: 'none\n' }]);
++	const result = await installShim({ runner: r, ...BASE });
++	assert.strictEqual(result.status, 'installed');
++	assert.strictEqual(result.scriptPath, `${HOME}/.picket-code-server/bin/${TAG}/bin/picket-code`);
++	assert.strictEqual(result.linkPath, `${HOME}/.local/bin/picket-code`);
++	assert.strictEqual(r.calls.length, 4);
++
++	const [inspect, write, link, probe] = r.calls;
++	for (const call of [inspect, write, link, probe]) {
++		assert.deepStrictEqual(call.args.slice(0, 4), ['-d', 'Ubuntu', '-e', 'sh']);
++	}
++	// inspect: one round trip that creates the directories and reads the link
++	assert.ok(inspect.args.includes(`${HOME}/.picket-code-server/bin/${TAG}/bin`), 'inspect must create the script directory');
++	assert.ok(inspect.args.includes(`${HOME}/.local/bin`), 'inspect must create the link directory too');
++	assert.ok(inspect.args.includes(result.linkPath), 'inspect reads the current link target');
++	// write: the shim content travels on stdin, never through a shell word
++	assert.ok(write.args.includes(result.scriptPath));
++	assert.match(String(write.input), /VSCODE_CLIENT_COMMAND='\/mnt\/c\/Programs\/Picket Code\.exe'/);
++	assert.match(String(write.input), /VSCODE_CLI_AUTHORITY='picket-wsl\+Ubuntu'/);
++	assert.match(String(write.input), new RegExp(`exec '${HOME.replace(/\./g, '\\.')}/\\.picket-code-server/payloads/server-${TAG}/bin/remote-cli/picket-code' "\\$@"`));
++	// link: both paths as positional args
++	assert.ok(link.args.includes(result.scriptPath) && link.args.includes(result.linkPath));
++	// probe: the Windows client must be startable from inside the distro
++	assert.ok(probe.args.includes('/mnt/c/Programs/Picket Code.exe'));
++	assert.match(probe.args[5], /--version/);
++});
++
++test('a symlink that points somewhere else is reported and left alone', async () => {
++	const r = recordingRunner([{ code: 0, stdout: '/usr/bin/fzf\n' }]);
++	const result = await installShim({ runner: r, ...BASE });
++	assert.strictEqual(result.status, 'foreign-link');
++	assert.match(result.message ?? '', /\/usr\/bin\/fzf/);
++	assert.strictEqual(r.calls.length, 1, 'nothing may be written over a foreign link');
++});
++
++test('a regular file where the link would go is reported and left alone', async () => {
++	const r = recordingRunner([{ code: 0, stdout: 'file\n' }]);
++	const result = await installShim({ runner: r, ...BASE });
++	assert.strictEqual(result.status, 'foreign-link');
++	assert.strictEqual(r.calls.length, 1);
++});
++
++test('a link into our own shim root is upgraded in place', async () => {
++	const r = recordingRunner([{ code: 0, stdout: `${HOME}/.picket-code-server/bin/older-tag/bin/picket-code\n` }]);
++	const result = await installShim({ runner: r, ...BASE });
++	assert.strictEqual(result.status, 'installed');
++	assert.strictEqual(r.calls.length, 4);
++});
++
++test('a 126 from the interop probe reports failed with the wsl.conf hint', async () => {
++	const r = recordingRunner([
++		{ code: 0, stdout: 'none\n' },
++		{ code: 0 },
++		{ code: 0 },
++		{ code: 126 }
++	]);
++	const result = await installShim({ runner: r, ...BASE });
++	assert.strictEqual(result.status, 'failed');
++	assert.match(result.message ?? '', /wsl\.conf/);
++	assert.match(result.message ?? '', /interop/);
++});
++
++test('removeShim removes the shim root and the link', async () => {
++	const r = recordingRunner([]);
++	await removeShim({ runner: r, distro: 'Ubuntu', home: HOME });
++	assert.strictEqual(r.calls.length, 1);
++	assert.ok(r.calls[0].args.includes(`${HOME}/.picket-code-server/bin`));
++	assert.ok(r.calls[0].args.includes(`${HOME}/.local/bin/picket-code`));
 +});
 diff --git a/extensions/picket-remote-wsl/test/tree.test.js b/extensions/picket-remote-wsl/test/tree.test.js
 new file mode 100644

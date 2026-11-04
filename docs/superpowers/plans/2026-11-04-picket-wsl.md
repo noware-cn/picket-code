@@ -1026,61 +1026,30 @@ The resolver gains `endpointFor()`: a `direct` record yields the VM port, a `std
 
 ---
 
-### Task 13: In-distro CLI shim (`picket-code .`)
+### Task 13: In-distro CLI shim (`picket-code .`) ✅
 
-**Files:**
-- Create: `vscode/extensions/picket-remote-wsl/src/shim.js`
-- Modify: `vscode/extensions/picket-remote-wsl/src/commands.js` (two commands)
+Implemented in vscode-subtree commit `581ff108`; patch 67 re-exported (6257 lines) and reverse-check OK. `test/shim.test.js` 8 cases + 2 command-level cases; extension total **155 pass / 0 fail**, gate 6/6.
+
+**Files (actual):**
+- Create: `vscode/extensions/picket-remote-wsl/src/shim.js` (106 lines)
+- Modify: `src/commands.js` (`installCli` / `removeCli` wiring), `extension.js` (stub loop removed — `registerCommands` now registers all 14 commands), `test/manifest.test.js` (14-command list), `test/commands.test.js` (+2 cases, harness `readlink -f` branch)
 - Test: `vscode/extensions/picket-remote-wsl/test/shim.test.js`
 
-**Interfaces:**
-- Consumes: `IWslRunner` (Task 2), `serverPaths` (Task 5), `toPosixPath` (Task 6).
-- Produces: `shQuote(value: string): string` — POSIX single-quoting (`'` becomes `'\''`).
-- Produces: `shimScript({ clientPath, authority, remoteCliPath }): string` — a `#!/bin/sh` script that exports `VSCODE_CLIENT_COMMAND=<clientPath>`, `VSCODE_CLI_AUTHORITY=<authority>`, then `exec <remoteCliPath> "$@"`; all three interpolations go through `shQuote`.
-- Produces: `installShim({ runner, distro, home, tag, clientPath }): Promise<{ status: 'installed' | 'foreign-link' | 'failed', scriptPath, linkPath, message? }>` and `removeShim({ runner, distro, home, tag }): Promise<void>`. Writes land through `runner.exec(['-d', distro, '-e', 'sh', '-c', SCRIPT, 'sh', ...args])` — one constant script, values as positional arguments.
+**Interfaces (as implemented):**
+- Consumes: `IWslRunner` (Task 2), `serverPaths` (Task 5), `toPosixPath` (Task 6), `AUTHORITY_PREFIX` (remoteUri.js).
+- `shQuote(value)` — POSIX single-quoting, `'` → `'\''`.
+- `shimScript({ clientPath, authority, remoteCliPath })` — `#!/bin/sh`, a generated-by comment, `export VSCODE_CLIENT_COMMAND=…`, `export VSCODE_CLI_AUTHORITY=…`, then `exec '<remoteCli>' "$@"`; all three values through `shQuote`. No trailing newline (the test's non-multiline `$` anchors at end of input).
+- `installShim({ runner, distro, home, tag, clientPath }) → { status: 'installed' | 'foreign-link' | 'failed', scriptPath, linkPath, message? }`. Paths from `serverPaths(home, tag)`: script at `${root}/bin/<tag>/bin/picket-code`, link at `cliLink` (`~/.local/bin/picket-code`), authority `${AUTHORITY_PREFIX}+<distro>`.
+- `removeShim({ runner, distro, home })` — **no `tag` parameter (deviation)**: one `rm -rf` removes `${root}/bin` (every tag we ever wrote) plus the link; old-tag scripts would otherwise linger, and the shim root is ours alone (payloads, runtime and data are sibling directories).
+- One constant `sh -c` script per step, values as positional arguments; the script body itself travels on stdin. Steps: INSPECT (one round trip — `mkdir -p` the bin **directory** and `~/.local/bin`, then classify the link: `readlink -f` if symlink, `file` if it exists, `none` otherwise), WRITE (`cat > "$1" && chmod 755 "$1"` with `{ input: script }`), LINK (`ln -sfn "$2" "$1"`), PROBE (`'<clientPath>' --version >/dev/null 2>&1`).
+- Upgrade policy: a link resolving inside `${root}/bin/` is ours → rewrite + relink in place; `file` or a foreign target → `foreign-link`, nothing overwritten. Probe exit 126/127 → `failed` with the `/etc/wsl.conf` `[interop] enabled=false` message (no amount of reinstalling fixes that).
+- `commands.js`: `targetDistro(title)` = current window's distro (from `currentAuthority`) else `pickDistro`; `installCli` = `distroHomeOf` → `ensureComponentInteractive` → tag from `catalog` (missing → error "这个构建没有 WSL 服务器组件，无法安装命令行。") → `toPosixPath(options.clientPath ?? process.execPath)` → `installShim` → one of three status messages; `removeCli` = distro → `removeShim` → info. `COMMANDS` gains `picket.wsl.installCli` / `picket.wsl.removeCli`; `options.clientPath` is the seam the tests use instead of `process.execPath`.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1–4: RED → implement → GREEN** — `node --test "test/*.test.js"`: 155 pass / 0 fail.
 
-`test/shim.test.js` — cases: `shimScript` sets both variables and ends with `exec '<path>' "$@"`; a client path containing a single quote is escaped so it cannot break out of the quoting; `installShim` writes the script and the `~/.local/bin/picket-code` symlink (asserted from the argv of the `sh -c` call); an existing symlink pointing somewhere else yields `status: 'foreign-link'` and leaves it alone; `removeShim` removes both paths.
+- [x] **Step 5: commit and re-export** — vscode `581ff108`; patch 67 re-exported from `wsl-baseline`, `git apply -R --check` OK; main-repo commit `feat(wsl): Task 13 — in-distro picket-code CLI shim`. The Windows manual smoke (`picket-code .` opens a `picket-wsl+<distro>` window, `--version` prints the payload CLI version, uninstall removes the link) moved to the L3 checklist in `docs/wsl-verification.md` (Task 14) — it needs a real Windows machine, like the rest of L3.
 
-```js
-const test = require('node:test');
-const assert = require('node:assert');
-const { shQuote, shimScript } = require('../src/shim.js');
-
-test('quotes single quotes so the script cannot break out', () => {
-	assert.strictEqual(shQuote("it's"), "'it'\\''s'");
-});
-
-test('the shim exports the client command and authority, then execs the payload CLI', () => {
-	const script = shimScript({
-		clientPath: '/mnt/c/Users/u/AppData/Local/Programs/Picket Code/Picket Code.exe',
-		authority: 'picket-wsl+Ubuntu 22.04 LTS',
-		remoteCliPath: '/home/u/.picket-code-server/payloads/server-T/bin/remote-cli/picket-code'
-	});
-	assert.match(script, /VSCODE_CLIENT_COMMAND='\/mnt\/c\/Users\/u\/AppData\/Local\/Programs\/Picket Code\/Picket Code\.exe'/);
-	assert.match(script, /VSCODE_CLI_AUTHORITY='picket-wsl\+Ubuntu 22\.04 LTS'/);
-	assert.match(script, /exec '\/home\/u\/\.picket-code-server\/payloads\/server-T\/bin\/remote-cli\/picket-code' "\$@"$/);
-});
-```
-
-- [ ] **Step 2: Run the test to verify it fails**
-
-Run: `cd vscode/extensions/picket-remote-wsl && node --test test/shim.test.js`
-Expected: FAIL — `Cannot find module '../src/shim.js'`.
-
-- [ ] **Step 3: Implement `shim.js` and the two commands**
-
-The script is written to `<home>/.picket-code-server/bin/<tag>/bin/picket-code` (mode 755) and symlinked to `<home>/.local/bin/picket-code`. `installShim` asks the distro for the current link target while creating the directory, in one round trip; a symlink that resolves outside our script yields `foreign-link` with a message naming the path, and nothing is overwritten. `clientPath` is the extension host's own executable (`process.execPath`, the Windows `Picket Code.exe`) converted with `toPosixPath` in the target distro. When the exec fails with 126/127 the script prints one line pointing at `[interop] enabled=false` in `/etc/wsl.conf` — the one case where a Windows executable cannot be started from the distro at all. `picket.wsl.installCli` / `picket.wsl.removeCli` act on the current window's distro (else the default one) and report the link path.
-
-- [ ] **Step 4: Run the test to verify it passes**
-
-Run: `cd vscode/extensions/picket-remote-wsl && node --test "test/*.test.js"`
-Expected: PASS — every suite under `test/` green.
-
-- [ ] **Step 5: Manual smoke on Windows, then commit and re-export**
-
-Run `Picket: 在 WSL 中安装命令行…` in a WSL window, then in that distro's terminal run `picket-code .` from a project directory: a new window opens with `picket-wsl+<distro>`. Confirm `picket-code --version` prints the payload CLI's version, and that uninstalling removes `~/.local/bin/picket-code`. Commit as in Task 7 with message `feat(wsl): in-distro picket-code CLI shim`.
+Deviations (ledger R-13): `removeShim` has no tag; the upgrade check is a `startsWith` on the shim root; `shimScript` ends without a newline; INSPECT mkdirs the bin directory (not the script path) in the same round trip as the link classification; manual smoke deferred to Task 14's L3 checklist.
 
 ---
 
