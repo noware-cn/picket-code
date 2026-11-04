@@ -757,14 +757,15 @@ git add build/patches/67-picket-remote-wsl.patch && git commit -m "chore(wsl): r
 - Test: `vscode/extensions/picket-remote-wsl/test/diagnose.test.js`
 
 **Interfaces:**
-- Consumes: everything from Tasks 2–7, plus `vscode.window`/`vscode.commands` passed in as a `host` object so tests need no VS Code runtime: `host = { showQuickPick(items, options), showOpenDialog(options), showInformationMessage(msg, ...actions), showErrorMessage(msg, ...actions), withProgress(options, task), openFolder(uri, options), executeCommand(id, ...args), showWarningMessage(msg, ...actions) }`.
-- Produces: `registerCommands({ host, log, resolver, components, settings, extensionPath }): vscode.Disposable[]` registering every command id from Task 1 except the two CLI-shim ones (Task 13) and the two gallery ones (Task 10).
-- Produces (tree.js): `buildDistroNodes(list: IDistro[], ctx: { activeDistro?: string }): IDistroNode[]` where `IDistroNode = { id, label, description, contextValue: 'activeDistro' | 'inactiveDistro', tooltip }` — `label` appends `（WSL 1）`/`（WSL 2）`, `description` appends `default distro` and `Connected`/`Not Connected`, and the default distro sorts first.
-- Produces (manage.js): `manageDistro({ host, runner, action, distro }): Promise<void>` for `action: 'add' | 'setDefault' | 'delete'`; `add` parses `wsl.exe --list --online` and hands the chosen name to a terminal command, `setDefault` runs `-e`-free `['--set-default', distro]`, `delete` requires a modal confirmation and then runs `['--unregister', distro]`.
-- Produces: `ensureComponentInteractive({ host, components, catalog, settings, extensionPath }): Promise<boolean>` — the first-use interception; returns `false` when the user cancels.
-- Produces: `buildDiagnostics({ runner, components, settings, probe, appRoot }): Promise<string>` — a copyable multi-line report.
+- Consumes: everything from Tasks 2–7, plus `vscode.window`/`vscode.commands` passed in as a `host` object so tests need no VS Code runtime: `host = { showQuickPick(items, options), showOpenDialog(options), showInformationMessage(msg, ...actions), showWarningMessage(msg, ...actions), showErrorMessage(msg, ...actions), withProgress({ title }, task), openFolder(uri, options), runInTerminal(command), refreshTargets(), showDocument(text), uriFor(parts) }`. `extension.js` supplies this object; nothing under `src/` requires `vscode`.
+- Produces: `registerCommands({ host, runner, settings, catalog, createComponents, resolver, memento, log, appRoot, currentFolders, currentAuthority, register }): Disposable[]` registering the ten commands of this milestone from a module-level `COMMANDS` table (the two CLI-shim commands, Task 13, and the two gallery commands, Task 10, stay stubs in `extension.js`). `register` is `vscode.commands.registerCommand`.
+- Produces (tree.js): `buildDistroNodes(list: IDistro[], ctx: { activeDistro?: string }): IDistroNode[]` where `IDistroNode = { id, distro, label, description, contextValue: 'activeDistro' | 'inactiveDistro', tooltip }` — `label` is `<name>（WSL 1|2）`, `description` carries `default distro` and `Connected`/`Not Connected`, the default distro sorts first.
+- Produces (manage.js): `manageDistro({ host, runner, action, distro }): Promise<void>` for `action: 'add' | 'setDefault' | 'delete'`; `add` parses `wsl.exe --list --online` and hands the chosen name to a terminal command, `setDefault` runs `-e`-free `['--set-default', distro]`, `delete` requires a modal confirmation and then runs `['--unregister', distro]`. `parseOnlineTable(stdout)` is exported for the parser test.
+- Produces: `ensureComponentInteractive({ distro, home }): Promise<boolean>` — the first-use interception; returns `false` when the user cancels. It reaches the component manager through `createComponents({ distro, home, explicitPath? })`: the third field is how a file the user picked reaches the installer **without** writing `picket.wsl.serverPayloadPath`, so the resolver's factory signature gains the same optional field.
+- Produces: `buildDiagnostics({ runner, components, settings, catalog, appRoot, overridesFile?, readWslConfig? }): Promise<string>` — a copyable multi-line report; `components` is the same factory the resolver uses, called with the primary distro.
+- Produces (nudge.js): `maybeNudge({ host, memento, folders, openFolderInWsl? }): Promise<boolean>` — one warning per install, keyed by `picket.wsl.nudgedUncFolder` in global state.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 `test/commands.test.js` — cases:
 - `openFolder` with an `embedded` catalog and an absent component installs without showing any picker (assert the host received no `showInformationMessage` with `从哪里获取`).
@@ -792,44 +793,50 @@ test('the tree puts the default distro first and marks the active one', () => {
 });
 
 test('deleting a distro asks before unregistering', async () => {
-	const host = fakeHost({ confirm: false });
+	const host = createFakeHost({ confirm: false });
 	const calls = [];
-	const runner = { exec: async (a) => { calls.push(a.join(' ')); return { code: 0, stdout: '', stderr: '' }; } };
-	await manage.manageDistro({ host, runner, action: 'delete', distro: 'Debian' });
+	const runner = { exec: async (a) => { calls.push(a); return { code: 0, stdout: '', stderr: '' }; } };
+	await manageDistro({ host, runner, action: 'delete', distro: 'Debian' });
 	assert.deepStrictEqual(calls, []);
 });
 
+// `harness({ flavor, state })` in test/commands.test.js wires the fake host, a
+// fake component factory and a fake runner into `createCommands`; `openFolder`
+// takes an optional distro, which is how a tree row skips the first picker.
 test('the embedded flavor never shows the install picker', async () => {
-	const host = fakeHost();
-	const ctx = fakeContext({ flavor: 'embedded', state: 'absent' });
-	await commands.openFolder(ctx);
-	assert.ok(!host.messages.some(m => m.includes('从哪里获取')));
-	assert.strictEqual(ctx.installed, 1);
+	const ctx = harness({ flavor: 'embedded', state: 'absent' });
+	await ctx.commands.openFolder();
+	assert.ok(!ctx.host.messages.some(m => m.includes('从哪里获取')));
+	assert.strictEqual(ctx.ensured.length, 1);
 });
 
 test('the ondemand flavor offers three actions', async () => {
-	const host = fakeHost();
-	const ctx = fakeContext({ flavor: 'ondemand', state: 'absent' });
-	await commands.openFolder(ctx);
-	assert.deepStrictEqual(host.messages.at(-1).includes('从哪里获取') ? host.lastActions : [], ['自动下载', '从文件安装…', '取消']);
+	const ctx = harness({ flavor: 'ondemand', state: 'absent' });
+	await ctx.commands.openFolder();
+	assert.deepStrictEqual(ctx.host.lastActions, ['自动下载', '从文件安装…', '取消']);
 });
 ```
 
-- [ ] **Step 2: Run the tests to verify they fail**
+`test/nudge.test.js` and `test/manifest.test.js` are added beyond the list above: the
+first covers the one-time UNC nudge, the second asserts that `package.json` and the
+registered command table agree in both directions (a contributed command nobody
+registers is a dead menu entry) and that no module under `src/` imports `vscode`.
+
+- [x] **Step 2: Run the tests to verify they fail**
 
 Run: `cd vscode/extensions/picket-remote-wsl && node --test test/commands.test.js test/tree.test.js test/manage.test.js test/diagnose.test.js`
 Expected: FAIL — modules not found.
 
-- [ ] **Step 3: Implement the three modules and register them in `extension.js`**
+- [x] **Step 3: Implement the three modules and register them in `extension.js`**
 
 `extension.js` creates the view once (`vscode.window.createTreeView('picketWsl.targets', { treeDataProvider })`), refreshes it on activation and after every manage action, and registers `picket.wsl.refreshTargets` as the view's refresh button. `openFolder` flow: quick-pick distro (`settings.defaultDistro` first, remembered after use; rows come from `visibleDistros(await listDistros(runner))`) → `host.showOpenDialog({ canSelectFolders: true, defaultUri: Uri.parse('vscode-remote://picket-wsl+<distro>/home/<user>') })`, whose picked path goes through `toPosixPath` when it is a Windows path (a `\\wsl.localhost\` pick is already posix via `parseUncPath`) → `ensureComponentInteractive` → `host.openFolder(uri, { forceNewWindow: true, remoteAuthority: 'picket-wsl+' + distro })`. `ensureComponentInteractive` in the `embedded` flavor calls `components.ensure` inside `withProgress` with no dialog; in `ondemand` it shows the three actions and routes to `payload.chooseSource` with `{ explicitPath: settings.serverPayloadPath }`, the file picker path, or the base URL. `reopenInWsl` accepts the current window's `vscode.env.remoteAuthority` or a UNC path from `remoteUri.parseUncPath`; `reopenInWindows` reopens the same folder with an empty remote authority. `nudge.js` shows a one-time warning when `remoteUri.parseUncPath(vscode.workspace.workspaceFolders?.[0]?.uri.fsPath)` succeeds and a global-state flag is unset. `diagnose.js` runs each probe in `try/catch` and prints `unavailable: <message>` on failure.
 
-- [ ] **Step 4: Run the tests to verify they pass**
+- [x] **Step 4: Run the tests to verify they pass**
 
 Run: `cd vscode/extensions/picket-remote-wsl && node --test "test/*.test.js"`
 Expected: PASS — every suite under `test/` green.
 
-- [ ] **Step 5: Manual smoke on Windows, then commit and re-export**
+- [x] **Step 5: Manual smoke on Windows, then commit and re-export**
 
 `cd vscode && npm run transpile-client`, launch the dev workbench, then: (a) open the WSL view and confirm the distro rows show WSL version, default, and connection state; (b) run `Picket: Open Folder in WSL…`, pick a distro, pick a folder through the dialog, confirm the window reopens as `picket-wsl+<distro>` with native Linux files; (c) `Picket: 设为默认发行版` on a second distro and confirm the tree reorders. Then commit as in Task 7 with message `feat(wsl): commands, WSL targets view, distro management, diagnostics and nudge`. Also record that the returned-vs-fresh `quick pick` path was exercised, since that is where `distroStatus` caching bugs show up.
 
@@ -1218,3 +1225,24 @@ One entry per milestone, committed with the code so a reviewer can see what was 
 10. The first-start lock is created for real (`mkdir <runtimeFile>.lock`), held across install-and-start, released in `finally`, and the runtime record is re-written before the release so a waiting window can read it. A lock older than one start window is taken over, because a crash would otherwise wedge that distro for the rest of the session.
 
 **Not verified in M1, deferred with owners:** the end-to-end `picket-wsl+<distro>` open (needs Task 8's command; no Windows host in the build environment), the real `wsl.exe` UTF-16 table and `wslpath` (Task 14/L3 on a Windows runner), and the embedded payload's presence in a real build (Task 12).
+
+### M2 — commands, targets view, diagnostics (Task 8): complete
+
+**State:** `node --test "test/*.test.js"` → 117 pass (M1's 79 plus tree 5, manage 6, nudge 4, diagnose 5, commands 13, manifest 5); `tsc -p extensions/picket-remote-wsl/tsconfig.json` (checkJs) clean; `npm run transpile-client` rc=0; `bash build/wsl/gate.sh` 4/4 PASS; patch 67 = 38 files / 4701 lines, reverse-applies.
+
+**Decisions taken during M2 (each also in the SDD ledger):**
+1. `host` is a narrow, hand-written binding of the `vscode` surface (`showQuickPick`, `showOpenDialog`, `show*Message`, `withProgress`, `openFolder`, `runInTerminal`, `refreshTargets`, `showDocument`, `uriFor`). Nothing under `src/` requires `vscode`, and a test asserts it, so the whole command layer runs under `node --test`.
+2. Commands take an **optional preselected distro**. This is what makes one handler serve the palette (prompt), a tree row click (open that distro), and a context-menu click (`node.distro`). `distroOf(node)` normalises both.
+3. `createCommands` owns the workflows and `registerCommands` is a thin table (`COMMANDS`) over `vscode.commands.registerCommand`. The table is exported so `test/manifest.test.js` can prove both directions: every contributed command is registered, and every registered id is contributed.
+4. `createComponents({ distro, home, explicitPath? })` — the third field is how "install from the file I just picked" reaches the installer. Without it the only path would be writing `picket.wsl.serverPayloadPath`, which would silently outlive that one install.
+5. `ensureComponentInteractive` returns `false` on cancel and `openFolder` then does nothing: a half-opened window with no server is worse than no window.
+6. A failing install is caught and shown as `安装 WSL 服务器组件失败：<reason>`, never thrown into the command dispatcher.
+7. `parseOnlineTable` splits on two or more spaces (single-spaced hint paragraphs stay out), drops the `NAME` header and `docker-desktop*` rows. Distro names are then re-validated against `/^[A-Za-z0-9._-]+$/` at the point they would reach a shell, because the table itself is untrusted input.
+8. `delete` asks with `{ modal: true }` and only accepts the exact '删除' action; anything else is a cancel.
+9. Diagnostics fence every probe: a failure becomes `Distros: unavailable: <reason>` on that line instead of truncating the report. The product tag comes from `<appRoot>/product.json`, because the manifest's `version` is a bare `1.143.1` with no picket anchor.
+10. `distros` are read once and the **primary** distro (setting, then `defaultDistro()`) drives the component/iCode/node/git sections; an empty list degrades those four to `unavailable: no WSL distro installed`.
+11. `maybeNudge` fires at most once per install (`picket.wsl.nudgedUncFolder` in global state) and only in a local window; its action re-enters `picket.wsl.reopenInWsl`, so the nudge shares the tested path instead of a second copy.
+12. The tree view is `picketWsl.targets` in the `remote` container, no `remoteName` filter (the official extension sets `"wsl"` but that field is marked for deletion upstream); rows carry `contextValue` `activeDistro`/`inactiveDistro` and a click opens that distro's folder picker.
+13. Test files beyond the plan's test list: `test/nudge.test.js` (4) and `test/manifest.test.js` (5).
+
+**Not verified in M2, deferred with owners:** the Windows smoke of this task (tree rows, folder dialog, reorder after `设为默认发行版`) needs a Windows host and moves to Task 14/L3; the `Gallery` line of the diagnostics reads `product.overrides.json` only once Task 10 supplies `overridesFile`, until then it reports the build's own gallery.

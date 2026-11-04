@@ -9,20 +9,23 @@ index 00000000..96fab092
 +tsconfig.json
 diff --git a/extensions/picket-remote-wsl/extension.js b/extensions/picket-remote-wsl/extension.js
 new file mode 100644
-index 00000000..4d78f4f1
+index 00000000..fbda7959
 --- /dev/null
 +++ b/extensions/picket-remote-wsl/extension.js
-@@ -0,0 +1,80 @@
+@@ -0,0 +1,172 @@
 +'use strict';
 +
 +const { join } = require('node:path');
 +const vscode = require('vscode');
 +const { createLog } = require('./src/log.js');
 +const { loadCatalog } = require('./src/catalog.js');
-+const { createWslRunner } = require('./src/distro.js');
++const { createWslRunner, listDistros, visibleDistros } = require('./src/distro.js');
 +const { createComponentManager } = require('./src/components.js');
 +const { createResolver } = require('./src/resolver.js');
-+const { AUTHORITY_PREFIX } = require('./src/remoteUri.js');
++const { AUTHORITY_PREFIX, parseAuthority } = require('./src/remoteUri.js');
++const { buildDistroNodes } = require('./src/tree.js');
++const { registerCommands } = require('./src/commands.js');
++const { maybeNudge } = require('./src/nudge.js');
 +
 +/** @param {vscode.ExtensionContext} context */
 +async function activate(context) {
@@ -40,6 +43,7 @@ index 00000000..4d78f4f1
 +	// Getters, not values: a setting changed while a window is open must apply to
 +	// the next connection without a reload.
 +	const settings = {
++		get defaultDistro() { return config().get('defaultDistro', ''); },
 +		get serverPayloadPath() { return config().get('serverPayloadPath', ''); },
 +		get serverPayloadBaseUrl() { return config().get('serverPayloadBaseUrl', ''); },
 +		get icodePath() { return config().get('icodePath', ''); },
@@ -48,23 +52,32 @@ index 00000000..4d78f4f1
 +	};
 +
 +	const runner = createWslRunner();
++
++	/**
++	 * One factory for both the resolver and the command layer: `explicitPath` is
++	 * how "install from a file I picked" reaches the component manager without
++	 * writing a setting.
++	 * @param {{ distro: string, home: string, explicitPath?: string }} target
++	 */
++	const createComponents = ({ distro, home, explicitPath }) => createComponentManager({
++		catalog,
++		runner,
++		distro,
++		home,
++		env: {
++			explicitPath: explicitPath ?? (settings.serverPayloadPath || undefined),
++			embeddedDir: catalog.flavor === 'embedded' ? join(context.extensionPath, 'resources', 'wsl-payloads') : undefined,
++			baseUrl: settings.serverPayloadBaseUrl || undefined
++		}
++	});
++
 +	const resolver = createResolver({
 +		runner,
 +		catalog,
 +		settings,
 +		log,
 +		warn: (message) => void vscode.window.showWarningMessage(message),
-+		components: ({ distro, home }) => createComponentManager({
-+			catalog,
-+			runner,
-+			distro,
-+			home,
-+			env: {
-+				explicitPath: settings.serverPayloadPath || undefined,
-+				embeddedDir: catalog.flavor === 'embedded' ? join(context.extensionPath, 'resources', 'wsl-payloads') : undefined,
-+				baseUrl: settings.serverPayloadBaseUrl || undefined
-+			}
-+		})
++		components: createComponents
 +	});
 +
 +	context.subscriptions.push(vscode.workspace.registerRemoteAuthorityResolver(AUTHORITY_PREFIX, {
@@ -75,18 +88,97 @@ index 00000000..4d78f4f1
 +	}));
 +	context.subscriptions.push({ dispose: () => resolver.dispose() });
 +
++	const changed = new vscode.EventEmitter();
++	context.subscriptions.push(changed);
++
++	const treeProvider = {
++		onDidChangeTreeData: changed.event,
++		refresh() {
++			changed.fire(undefined);
++		},
++		/** @param {any} element */
++		async getChildren(element) {
++			if (element) {
++				return [];
++			}
++			const activeDistro = parseAuthority(vscode.env.remoteAuthority ?? '');
++			try {
++				return buildDistroNodes(visibleDistros(await listDistros(runner)), { activeDistro });
++			} catch (error) {
++				log.error(`Could not list WSL distros: ${error.message}`);
++				return [];
++			}
++		},
++		/** @param {any} node */
++		getTreeItem(node) {
++			const item = new vscode.TreeItem(node.label, vscode.TreeItemCollapsibleState.None);
++			item.id = node.id;
++			item.description = node.description;
++			item.tooltip = node.tooltip;
++			item.contextValue = node.contextValue;
++			item.iconPath = new vscode.ThemeIcon(node.contextValue === 'activeDistro' ? 'vm-active' : 'vm-outline');
++			item.command = { command: 'picket.wsl.openFolder', title: 'Open Folder', arguments: [node.distro] };
++			return item;
++		}
++	};
++
++	const view = vscode.window.createTreeView('picketWsl.targets', { treeDataProvider: treeProvider });
++	context.subscriptions.push(view);
++
++	const host = {
++		showQuickPick: (items, options) => vscode.window.showQuickPick(items, options),
++		showOpenDialog: (options) => vscode.window.showOpenDialog(options),
++		showInformationMessage: (message, ...actions) => vscode.window.showInformationMessage(message, ...actions),
++		showWarningMessage: (message, ...actions) => vscode.window.showWarningMessage(message, ...actions),
++		showErrorMessage: (message, ...actions) => vscode.window.showErrorMessage(message, ...actions),
++		withProgress: (options, task) => vscode.window.withProgress(
++			{ location: vscode.ProgressLocation.Notification, title: options.title },
++			task
++		),
++		openFolder: (uri, options) => vscode.commands.executeCommand('vscode.openFolder', uri, options),
++		runInTerminal: (command) => {
++			const terminal = vscode.window.createTerminal('Picket WSL');
++			terminal.show();
++			terminal.sendText(command);
++		},
++		refreshTargets: () => treeProvider.refresh(),
++		showDocument: async (text) => {
++			const document = await vscode.workspace.openTextDocument({ content: text, language: 'plaintext' });
++			await vscode.window.showTextDocument(document);
++		},
++		uriFor: (parts) => vscode.Uri.from(parts)
++	};
++
++	context.subscriptions.push(...registerCommands({
++		host,
++		runner,
++		settings,
++		catalog,
++		createComponents,
++		resolver,
++		memento: context.globalState,
++		log,
++		appRoot: vscode.env.appRoot,
++		currentFolders: () => vscode.workspace.workspaceFolders ?? [],
++		currentAuthority: () => vscode.env.remoteAuthority ?? '',
++		register: (id, run) => vscode.commands.registerCommand(id, run)
++	}));
++
 +	// Until the remaining commands land, they exist so the palette and the
 +	// remote indicator do not offer dead entries.
-+	for (const id of [
-+		'picket.wsl.openFolder', 'picket.wsl.reopenInWsl', 'picket.wsl.reopenInWindows',
-+		'picket.wsl.stopServer', 'picket.wsl.components', 'picket.wsl.diagnose',
-+		'picket.wsl.selectGallery', 'picket.wsl.installVsix', 'picket.wsl.addDistro',
-+		'picket.wsl.setDefaultDistro', 'picket.wsl.deleteDistro', 'picket.wsl.installCli',
-+		'picket.wsl.removeCli', 'picket.wsl.refreshTargets'
-+	]) {
++	for (const id of ['picket.wsl.selectGallery', 'picket.wsl.installVsix', 'picket.wsl.installCli', 'picket.wsl.removeCli']) {
 +		context.subscriptions.push(vscode.commands.registerCommand(id, () => {
-+			log.info(`${id} is not implemented yet (Task 1 skeleton)`);
++			log.info(`${id} is not implemented yet`);
 +		}));
++	}
++
++	if (!(vscode.env.remoteAuthority ?? '')) {
++		void maybeNudge({
++			host,
++			memento: context.globalState,
++			folders: vscode.workspace.workspaceFolders,
++			openFolderInWsl: async () => { await vscode.commands.executeCommand('picket.wsl.reopenInWsl'); }
++		}).catch((error) => log.error(`Could not show the WSL nudge: ${error.message}`));
 +	}
 +}
 +
@@ -95,10 +187,10 @@ index 00000000..4d78f4f1
 +module.exports = { activate, deactivate };
 diff --git a/extensions/picket-remote-wsl/package.json b/extensions/picket-remote-wsl/package.json
 new file mode 100644
-index 00000000..e7e8abd5
+index 00000000..193694e7
 --- /dev/null
 +++ b/extensions/picket-remote-wsl/package.json
-@@ -0,0 +1,294 @@
+@@ -0,0 +1,311 @@
 +{
 +	"name": "picket-remote-wsl",
 +	"displayName": "Picket Remote - WSL",
@@ -306,6 +398,23 @@ index 00000000..e7e8abd5
 +					"command": "picket.wsl.addDistro",
 +					"when": "view == picketWsl.targets",
 +					"group": "navigation@2"
++				}
++			],
++			"view/item/context": [
++				{
++					"command": "picket.wsl.setDefaultDistro",
++					"when": "view == picketWsl.targets && viewItem == inactiveDistro",
++					"group": "1_distro@1"
++				},
++				{
++					"command": "picket.wsl.deleteDistro",
++					"when": "view == picketWsl.targets && viewItem =~ /Distro$/",
++					"group": "1_distro@2"
++				},
++				{
++					"command": "picket.wsl.stopServer",
++					"when": "view == picketWsl.targets && viewItem == activeDistro",
++					"group": "2_server@1"
 +				}
 +			]
 +		},
@@ -518,6 +627,362 @@ index 00000000..f612ff0a
 +}
 +
 +module.exports = { loadCatalog };
+diff --git a/extensions/picket-remote-wsl/src/commands.js b/extensions/picket-remote-wsl/src/commands.js
+new file mode 100644
+index 00000000..95304245
+--- /dev/null
++++ b/extensions/picket-remote-wsl/src/commands.js
+@@ -0,0 +1,350 @@
++'use strict';
++
++const { listDistros, distroHome, visibleDistros } = require('./distro.js');
++const { AUTHORITY_PREFIX, parseAuthority, parseUncPath, toPosixPath, toWindowsPath } = require('./remoteUri.js');
++const { manageDistro } = require('./manage.js');
++const { buildDiagnostics } = require('./diagnose.js');
++
++const LAST_DISTRO = 'picket.wsl.lastDistro';
++const SERVER_COMPONENT = 'wsl-server';
++
++/**
++ * Every command is a workflow over `host`, the narrow slice of `vscode` this
++ * module is allowed to touch, so the whole command layer runs under `node --test`
++ * with no extension host. `extension.js` supplies the real `vscode` bindings.
++ * @param {{
++ *   host: any,
++ *   runner: any,
++ *   settings: any,
++ *   catalog: any,
++ *   createComponents: (config: { distro: string, home: string, explicitPath?: string }) => any,
++ *   resolver: { stop(distro?: string): Promise<void> },
++ *   memento?: { get(key: string): any, update(key: string, value: any): any },
++ *   log?: { info(...parts: unknown[]): void, error(...parts: unknown[]): void },
++ *   listDistros?: typeof listDistros,
++ *   distroHome?: typeof distroHome,
++ *   appRoot?: string,
++ *   overridesFile?: string,
++ *   currentFolders?: () => readonly any[],
++ *   currentAuthority?: () => string
++ * }} options
++ */
++function createCommands(options) {
++	const { host, runner, settings, catalog, createComponents, resolver } = options;
++	const listDistrosOf = options.listDistros ?? listDistros;
++	const distroHomeOf = options.distroHome ?? distroHome;
++
++	/** @param {string} title */
++	async function pickDistro(title) {
++		let list;
++		try {
++			list = visibleDistros(await listDistrosOf(runner));
++		} catch (error) {
++			await host.showErrorMessage(`无法列出 WSL 发行版：${error.message}`);
++			return undefined;
++		}
++		if (list.length === 0) {
++			await host.showErrorMessage('没有检测到 WSL 发行版。先运行 "wsl --install" 安装一个。');
++			return undefined;
++		}
++		const preferred = String(settings.defaultDistro || options.memento?.get(LAST_DISTRO) || '').toLowerCase();
++		const ordered = [...list].sort((a, b) => Number(b.name.toLowerCase() === preferred) - Number(a.name.toLowerCase() === preferred));
++		const items = ordered.map(distro => ({
++			label: distro.name,
++			description: `WSL ${distro.version}${distro.isDefault ? ' · 默认发行版' : ''} · ${distro.state}`,
++			distro: distro.name
++		}));
++		const picked = await host.showQuickPick(items, { placeHolder: title });
++		if (!picked) {
++			return undefined;
++		}
++		const name = typeof picked === 'string' ? picked : picked.distro;
++		await options.memento?.update(LAST_DISTRO, name);
++		return name;
++	}
++
++	/** @param {any} manager */
++	async function install(manager) {
++		try {
++			await host.withProgress({ title: '正在准备 WSL 服务器组件…' }, () => manager.ensure(SERVER_COMPONENT));
++			return true;
++		} catch (error) {
++			await host.showErrorMessage(`安装 WSL 服务器组件失败：${error.message}`);
++			return false;
++		}
++	}
++
++	/**
++	 * The first-use interception. The embedded flavor is meant to be invisible:
++	 * the payload shipped with the build, so there is nothing to ask. The public
++	 * build carries only a catalog, so it asks — and "cancel" must leave the
++	 * window untouched.
++	 * @param {{ distro: string, home: string }} target
++	 * @returns {Promise<boolean>}
++	 */
++	async function ensureComponentInteractive(target) {
++		const component = (catalog?.components ?? []).find((/** @type {any} */ c) => c.id === SERVER_COMPONENT);
++		if (!component) {
++			await host.showErrorMessage('这个构建没有 WSL 服务器组件，无法在 WSL 中打开文件夹。');
++			return false;
++		}
++		const manager = createComponents({ distro: target.distro, home: target.home });
++		const current = await manager.inspect(SERVER_COMPONENT);
++		if (current.state === 'installed') {
++			return true;
++		}
++
++		if (catalog.flavor === 'embedded') {
++			return install(manager);
++		}
++
++		const choice = await host.showInformationMessage(
++			'WSL 里还没有服务器组件。从哪里获取？',
++			'自动下载',
++			'从文件安装…',
++			'取消'
++		);
++		if (choice === '自动下载') {
++			return install(manager);
++		}
++		if (choice === '从文件安装…') {
++			const picked = await host.showOpenDialog({
++				canSelectFiles: true,
++				canSelectMany: false,
++				title: '选择服务器载荷 tar.gz',
++				filters: { '服务器载荷': ['gz', 'tgz'] }
++			});
++			const file = Array.isArray(picked) ? picked[0] : picked;
++			const path = file?.fsPath ?? file?.path ?? (typeof file === 'string' ? file : '');
++			if (!path) {
++				return false;
++			}
++			return install(createComponents({ distro: target.distro, home: target.home, explicitPath: path }));
++		}
++		return false;
++	}
++
++	/**
++	 * A path the dialog hands back is Windows-shaped unless the user typed or
++	 * pasted a UNC path; `wslpath` owns the translation because only it knows
++	 * where the drives are mounted.
++	 * @param {any} chosen
++	 * @param {string} distro
++	 * @returns {Promise<string | undefined>}
++	 */
++	async function toPosix(chosen, distro) {
++		const raw = String(chosen?.fsPath ?? chosen?.path ?? '');
++		const unc = parseUncPath(raw);
++		if (unc) {
++			return unc.posixPath;
++		}
++		if (chosen?.scheme === 'vscode-remote') {
++			return chosen.path;
++		}
++		const candidate = raw.startsWith('/') ? raw : String(chosen?.path ?? raw);
++		if (candidate.startsWith('/')) {
++			return candidate;
++		}
++		try {
++			return await toPosixPath(runner, distro, candidate);
++		} catch (error) {
++			await host.showErrorMessage(`无法把 ${candidate} 转换成 WSL 路径：${error.message}`);
++			return undefined;
++		}
++	}
++
++	/** @param {string} distro @param {string} posixPath @param {string} home */
++	async function connect(distro, posixPath, home) {
++		if (!await ensureComponentInteractive({ distro, home })) {
++			return;
++		}
++		await host.openFolder(
++			host.uriFor({ scheme: 'vscode-remote', authority: `${AUTHORITY_PREFIX}+${distro}`, path: posixPath }),
++			{ forceNewWindow: true, remoteAuthority: `${AUTHORITY_PREFIX}+${distro}` }
++		);
++	}
++
++	/** @param {string} [preselected] */
++	async function openFolder(preselected) {
++		const distro = typeof preselected === 'string' && preselected.length > 0
++			? preselected
++			: await pickDistro('选择要在其中打开文件夹的发行版');
++		if (!distro) {
++			return;
++		}
++		let home;
++		try {
++			home = await distroHomeOf(runner, distro);
++		} catch (error) {
++			await host.showErrorMessage(`无法进入 ${distro}：${error.message}`);
++			return;
++		}
++		const picked = await host.showOpenDialog({
++			canSelectFiles: false,
++			canSelectFolders: true,
++			canSelectMany: false,
++			title: `在 ${distro} 中选择文件夹`,
++			defaultUri: host.uriFor({ scheme: 'vscode-remote', authority: `${AUTHORITY_PREFIX}+${distro}`, path: home })
++		});
++		const chosen = Array.isArray(picked) ? picked[0] : picked;
++		if (!chosen) {
++			return;
++		}
++		const posixPath = await toPosix(chosen, distro);
++		if (!posixPath) {
++			return;
++		}
++		await connect(distro, posixPath, home);
++	}
++
++	async function reopenInWsl() {
++		const folder = (options.currentFolders?.() ?? [])[0];
++		const unc = parseUncPath(folder?.uri?.fsPath ?? '');
++		if (!unc) {
++			await host.showErrorMessage('当前文件夹不在 \\\\wsl.localhost 或 \\\\wsl$ 下。');
++			return;
++		}
++		const home = await distroHomeOf(runner, unc.distro).catch(() => '/');
++		await connect(unc.distro, unc.posixPath, home);
++	}
++
++	async function reopenInWindows() {
++		const folder = (options.currentFolders?.() ?? [])[0];
++		const distro = parseAuthority(options.currentAuthority?.() ?? '');
++		if (!folder || !distro) {
++			await host.showErrorMessage('当前窗口不是 Picket WSL 窗口。');
++			return;
++		}
++		try {
++			const windowsPath = await toWindowsPath(runner, distro, folder.uri.path);
++			await host.openFolder(host.uriFor({ scheme: 'file', path: windowsPath }), { forceNewWindow: true, remoteAuthority: '' });
++		} catch (error) {
++			await host.showErrorMessage(`无法映射回 Windows 路径：${error.message}`);
++		}
++	}
++
++	/** @param {string} [preselected] */
++	async function stopServer(preselected) {
++		const distro = typeof preselected === 'string' && preselected.length > 0
++			? preselected
++			: await pickDistro('选择要停止服务器的发行版');
++		if (!distro) {
++			return;
++		}
++		await resolver.stop(distro);
++		await host.refreshTargets();
++	}
++
++	async function componentsCommand() {
++		const distro = await pickDistro('选择发行版');
++		if (!distro) {
++			return;
++		}
++		const home = await distroHomeOf(runner, distro);
++		const rows = await createComponents({ distro, home }).list();
++		const picked = await host.showQuickPick(
++			rows.map((/** @type {any} */ row) => ({
++				label: row.id,
++				description: `${row.state}${row.version ? ` · ${row.version}` : ''}`,
++				row
++			})),
++			{ placeHolder: '选择组件' }
++		);
++		if (!picked) {
++			return;
++		}
++		const row = typeof picked === 'string' ? { id: picked } : picked.row;
++		const choice = await host.showInformationMessage(`组件 ${row.id}：${row.state ?? '未知'}`, '重新安装', '取消');
++		if (choice === '重新安装') {
++			await install(createComponents({ distro, home, explicitPath: settings.serverPayloadPath || undefined }));
++			await host.refreshTargets();
++		}
++	}
++
++	async function diagnose() {
++		const report = await buildDiagnostics({
++			runner,
++			settings,
++			catalog,
++			components: createComponents,
++			appRoot: options.appRoot,
++			overridesFile: options.overridesFile
++		});
++		await host.showDocument(report);
++	}
++
++	async function refreshTargets() {
++		await host.refreshTargets();
++	}
++
++	/**
++	 * @param {'add' | 'setDefault' | 'delete'} action
++	 * @param {string} [preselected] the distro a context-menu click carries
++	 */
++	async function manage(action, preselected) {
++		const distro = action === 'add'
++			? undefined
++			: (typeof preselected === 'string' && preselected.length > 0 ? preselected : await pickDistro('选择发行版'));
++		if (action !== 'add' && !distro) {
++			return;
++		}
++		await manageDistro({ host, runner, action, distro });
++		await host.refreshTargets();
++	}
++
++	return {
++		openFolder,
++		reopenInWsl,
++		reopenInWindows,
++		stopServer,
++		componentsCommand,
++		diagnose,
++		refreshTargets,
++		addDistro: () => manage('add'),
++		setDefaultDistro: (distro) => manage('setDefault', distro),
++		deleteDistro: (distro) => manage('delete', distro),
++		ensureComponentInteractive,
++		pickDistro
++	};
++}
++
++/**
++ * A command invoked from the targets view receives its tree element; one
++ * invoked from the palette receives nothing.
++ * @param {any} node
++ * @returns {string | undefined}
++ */
++function distroOf(node) {
++	return typeof node?.distro === 'string' ? node.distro : undefined;
++}
++
++/**
++ * One table serves registration and the manifest test: a command that is
++ * described in `package.json` but absent here is a dead menu entry.
++ * @type {Record<string, (api: ReturnType<typeof createCommands>) => (...args: any[]) => any>}
++ */
++const COMMANDS = {
++	'picket.wsl.openFolder': (api) => (node) => api.openFolder(distroOf(node)),
++	'picket.wsl.reopenInWsl': (api) => () => api.reopenInWsl(),
++	'picket.wsl.reopenInWindows': (api) => () => api.reopenInWindows(),
++	'picket.wsl.stopServer': (api) => (node) => api.stopServer(distroOf(node)),
++	'picket.wsl.components': (api) => () => api.componentsCommand(),
++	'picket.wsl.diagnose': (api) => () => api.diagnose(),
++	'picket.wsl.refreshTargets': (api) => () => api.refreshTargets(),
++	'picket.wsl.addDistro': (api) => () => api.addDistro(),
++	'picket.wsl.setDefaultDistro': (api) => (node) => api.setDefaultDistro(distroOf(node)),
++	'picket.wsl.deleteDistro': (api) => (node) => api.deleteDistro(distroOf(node))
++};
++
++/**
++ * `register` is `vscode.commands.registerCommand`, injected so this file never
++ * requires `vscode`.
++ * @param {Parameters<typeof createCommands>[0] & { register: (id: string, run: (...args: any[]) => any) => any }} options
++ * @returns {any[]}
++ */
++function registerCommands(options) {
++	const api = createCommands(options);
++	return Object.entries(COMMANDS).map(([id, handler]) => options.register(id, handler(api)));
++}
++
++module.exports = { createCommands, registerCommands, COMMANDS, LAST_DISTRO };
 diff --git a/extensions/picket-remote-wsl/src/components.js b/extensions/picket-remote-wsl/src/components.js
 new file mode 100644
 index 00000000..d587fe9c
@@ -722,6 +1187,167 @@ index 00000000..d587fe9c
 +}
 +
 +module.exports = { createComponentManager, markerPath };
+diff --git a/extensions/picket-remote-wsl/src/diagnose.js b/extensions/picket-remote-wsl/src/diagnose.js
+new file mode 100644
+index 00000000..3c7bf372
+--- /dev/null
++++ b/extensions/picket-remote-wsl/src/diagnose.js
+@@ -0,0 +1,155 @@
++'use strict';
++
++const { readFile } = require('node:fs/promises');
++const { join } = require('node:path');
++const { listDistros, defaultDistro, distroHome, wslStatus } = require('./distro.js');
++const { detectIcode } = require('./icode.js');
++const { chooseTunnelMode, readWslConfigFile, wslConfigPath } = require('./preflight.js');
++
++/**
++ * A support report is only useful if it is complete, so every probe is fenced:
++ * a broken distro or a missing binary degrades to `unavailable: <reason>` on
++ * that one line instead of truncating everything after it.
++ * @param {{
++ *   runner: any,
++ *   settings?: any,
++ *   catalog?: any,
++ *   components: (ctx: { distro: string, home: string, runner: any }) => { list(): Promise<any[]> },
++ *   appRoot?: string,
++ *   overridesFile?: string,
++ *   platform?: string,
++ *   readWslConfig?: () => Promise<{ localhostForwarding?: boolean, networkingMode?: string }>
++ * }} options
++ * @returns {Promise<string>}
++ */
++async function buildDiagnostics(options) {
++	const { runner, catalog, components } = options;
++	const settings = options.settings ?? {};
++	const appRoot = options.appRoot ?? '';
++	/** @type {string[]} */
++	const lines = [];
++
++	/**
++	 * @param {string} title
++	 * @param {() => Promise<string | string[]>} probe
++	 */
++	const section = async (title, probe) => {
++		try {
++			const value = await probe();
++			if (Array.isArray(value)) {
++				lines.push(`${title}:`);
++				for (const line of value) {
++					lines.push(`  ${line}`);
++				}
++			} else {
++				lines.push(`${title}: ${value}`);
++			}
++		} catch (error) {
++			lines.push(`${title}: unavailable: ${error?.message ?? error}`);
++		}
++	};
++
++	const product = async () => JSON.parse(await readFile(join(appRoot, 'product.json'), 'utf8'));
++
++	lines.push('Picket WSL diagnostics');
++	lines.push('======================');
++
++	await section('Product tag', async () => (await product()).picketTag ?? 'none');
++
++	await section('WSL', async () => {
++		const status = await wslStatus(runner);
++		if (!status.installed) {
++			return 'not installed';
++		}
++		return status.kernelUpdateRequired ? 'installed (kernel update required)' : 'installed';
++	});
++
++	/** @type {import('./distro.js').IDistro[]} */
++	let distros = [];
++	await section('Distros', async () => {
++		distros = await listDistros(runner);
++		if (distros.length === 0) {
++			return ['(none)'];
++		}
++		return distros.map(d => `${d.isDefault ? '*' : ' '} ${d.name}  ${d.state}  WSL ${d.version}`);
++	});
++
++	const configured = String(settings.defaultDistro ?? '').toLowerCase();
++	const primary = distros.length === 0
++		? undefined
++		: (configured && distros.find(d => d.name.toLowerCase() === configured)?.name) || defaultDistro(distros);
++
++	/** @param {string} distro @param {string} command */
++	const versionOf = async (distro, command) => {
++		const result = await runner.exec(['-d', distro, '-e', 'sh', '-lc', `${command} 2>/dev/null || true`]);
++		const text = String(result.stdout).trim().split(/\r?\n/).filter(Boolean).pop();
++		return text || 'not found';
++	};
++
++	await section('Tunnel mode', async () => {
++		const setting = settings.tunnelMode ?? 'auto';
++		const wslConfig = options.readWslConfig ? await options.readWslConfig() : await readWslConfigFile(wslConfigPath());
++		const mode = chooseTunnelMode({ configured: setting, wslConfig, platform: options.platform });
++		const hints = [];
++		if (wslConfig.localhostForwarding !== undefined) {
++			hints.push(`localhostForwarding=${wslConfig.localhostForwarding}`);
++		}
++		if (wslConfig.networkingMode) {
++			hints.push(`networkingMode=${wslConfig.networkingMode}`);
++		}
++		return `${mode} (setting=${setting}${hints.length > 0 ? `, ${hints.join(', ')}` : ''})`;
++	});
++
++	await section('Components', async () => {
++		if (!primary) {
++			throw new Error('no WSL distro installed');
++		}
++		if (!Array.isArray(catalog?.components) || catalog.components.length === 0) {
++			return ['(none in this build)'];
++		}
++		const home = await distroHome(runner, primary);
++		const rows = await components({ distro: primary, home, runner }).list();
++		return rows.map(row => `${row.id}  ${row.state}${row.version ? `  ${row.version}` : ''}${row.payloadDir ? `  ${row.payloadDir}` : ''}`);
++	});
++
++	await section('iCode', async () => {
++		if (!primary) {
++			throw new Error('no WSL distro installed');
++		}
++		const found = await detectIcode({ runner, distro: primary, configuredPath: settings.icodePath ?? '' });
++		return found.path ? `${found.path} (${found.source})` : 'not found';
++	});
++
++	await section('node', async () => {
++		if (!primary) {
++			throw new Error('no WSL distro installed');
++		}
++		return versionOf(primary, 'node -v');
++	});
++
++	await section('git', async () => {
++		if (!primary) {
++			throw new Error('no WSL distro installed');
++		}
++		return versionOf(primary, 'git --version');
++	});
++
++	await section('Gallery', async () => {
++		let gallery = (await product()).extensionsGallery ?? null;
++		if (options.overridesFile) {
++			try {
++				const overrides = JSON.parse(await readFile(options.overridesFile, 'utf8'));
++				if ('extensionsGallery' in overrides) {
++					gallery = overrides.extensionsGallery;
++				}
++			} catch {
++				// An unreadable override file means the build's own gallery stands.
++			}
++		}
++		return gallery ? gallery.serviceUrl : 'none';
++	});
++
++	return lines.join('\n');
++}
++
++module.exports = { buildDiagnostics };
 diff --git a/extensions/picket-remote-wsl/src/distro.js b/extensions/picket-remote-wsl/src/distro.js
 new file mode 100644
 index 00000000..5d068b16
@@ -1404,6 +2030,145 @@ index 00000000..918896a0
 +}
 +
 +module.exports = { createLog };
+diff --git a/extensions/picket-remote-wsl/src/manage.js b/extensions/picket-remote-wsl/src/manage.js
+new file mode 100644
+index 00000000..3769f45d
+--- /dev/null
++++ b/extensions/picket-remote-wsl/src/manage.js
+@@ -0,0 +1,92 @@
++'use strict';
++
++const { decodeWslOutput } = require('./distro.js');
++
++/**
++ * A distro name reaches a shell only through this gate. `wsl --install` is run
++ * in a terminal the user can see, but the name still comes from a table we
++ * parsed, so anything that is not a plain distro name is refused rather than
++ * quoted and hoped for.
++ */
++const PLAIN_NAME = /^[A-Za-z0-9._-]+$/;
++
++/**
++ * `wsl.exe --list --online` prints a header, a hint paragraph and rows whose
++ * columns are separated by two or more spaces. Everything else is noise.
++ * @param {string} stdout
++ * @returns {Array<{ name: string, friendly: string }>}
++ */
++function parseOnlineTable(stdout) {
++	/** @type {Array<{ name: string, friendly: string }>} */
++	const rows = [];
++	for (const raw of decodeWslOutput(stdout).split(/\r?\n/)) {
++		const parts = raw.split(/\s{2,}/).map(part => part.trim()).filter(Boolean);
++		if (parts.length < 2) {
++			continue;
++		}
++		if (/^NAME$/i.test(parts[0])) {
++			continue;
++		}
++		if (/^docker-desktop/i.test(parts[0])) {
++			continue;
++		}
++		rows.push({ name: parts[0], friendly: parts.slice(1).join(' ') });
++	}
++	return rows;
++}
++
++/**
++ * @param {{ host: any, runner: any, action: 'add' | 'setDefault' | 'delete', distro?: string }} options
++ * @returns {Promise<void>}
++ */
++async function manageDistro(options) {
++	const { host, runner, action, distro } = options;
++
++	if (action === 'setDefault') {
++		const result = await runner.exec(['--set-default', distro]);
++		if (result.code !== 0) {
++			await host.showErrorMessage(`无法把 ${distro} 设为默认发行版：${decodeWslOutput(result.stderr)}`);
++		}
++		return;
++	}
++
++	if (action === 'delete') {
++		const confirmed = await host.showWarningMessage(
++			`删除 ${distro} 会删除它里面的所有文件，且无法撤销。确定要删除吗？`,
++			{ modal: true },
++			'删除'
++		);
++		if (confirmed !== '删除') {
++			return;
++		}
++		const result = await runner.exec(['--unregister', distro]);
++		if (result.code !== 0) {
++			await host.showErrorMessage(`无法删除 ${distro}：${decodeWslOutput(result.stderr)}`);
++		}
++		return;
++	}
++
++	const listed = await runner.exec(['--list', '--online']);
++	const rows = parseOnlineTable(String(listed.stdout));
++	if (rows.length === 0) {
++		await host.showErrorMessage(`无法读取可安装的发行版列表：${decodeWslOutput(listed.stderr) || '列表为空'}`);
++		return;
++	}
++	const picked = await host.showQuickPick(
++		rows.map(row => ({ label: row.friendly ? `${row.name}（${row.friendly}）` : row.name, name: row.name })),
++		{ placeHolder: '选择要安装的 WSL 发行版' }
++	);
++	if (!picked) {
++		return;
++	}
++	const name = typeof picked === 'string' ? picked : picked.name;
++	if (!PLAIN_NAME.test(name ?? '')) {
++		await host.showErrorMessage(`非法发行版名称：${name ?? '(空)'}`);
++		return;
++	}
++	// Visible in a terminal on purpose: the install downloads gigabytes and asks
++	// for a UNIX user name, so it cannot be a silent background step.
++	host.runInTerminal(`wsl.exe --install -d '${name}'`);
++}
++
++module.exports = { manageDistro, parseOnlineTable, PLAIN_NAME };
+diff --git a/extensions/picket-remote-wsl/src/nudge.js b/extensions/picket-remote-wsl/src/nudge.js
+new file mode 100644
+index 00000000..f1756287
+--- /dev/null
++++ b/extensions/picket-remote-wsl/src/nudge.js
+@@ -0,0 +1,35 @@
++'use strict';
++
++const { parseUncPath } = require('./remoteUri.js');
++
++const NUDGE_KEY = 'picket.wsl.nudgedUncFolder';
++
++/**
++ * A folder opened from `\\wsl.localhost\...` works, badly: the extension host,
++ * the file watcher and every task run on Windows against a 9p share. Say so
++ * once — a warning on every window would be worse than the problem.
++ * @param {{ host: any, memento?: any, folders?: readonly any[], openFolderInWsl?: (distro: string, posixPath: string) => Promise<void> }} options
++ * @returns {Promise<boolean>} true when the user was warned this time
++ */
++async function maybeNudge(options) {
++	const { host, memento } = options;
++	const folder = Array.isArray(options.folders) ? options.folders[0] : undefined;
++	const unc = parseUncPath(folder?.uri?.fsPath ?? '');
++	if (!unc) {
++		return false;
++	}
++	if (memento?.get(NUDGE_KEY)) {
++		return false;
++	}
++	await memento?.update(NUDGE_KEY, true);
++	const choice = await host.showInformationMessage(
++		'这个文件夹位于 WSL 中。用 Picket 在 WSL 里打开，扩展、终端和文件监听都会跑在 Linux 上。',
++		'在 WSL 中打开'
++	);
++	if (choice === '在 WSL 中打开') {
++		await options.openFolderInWsl?.(unc.distro, unc.posixPath);
++	}
++	return true;
++}
++
++module.exports = { maybeNudge, NUDGE_KEY };
 diff --git a/extensions/picket-remote-wsl/src/payload.js b/extensions/picket-remote-wsl/src/payload.js
 new file mode 100644
 index 00000000..62602222
@@ -2038,6 +2803,45 @@ index 00000000..cad3f9b8
 +}
 +
 +module.exports = { createResolver };
+diff --git a/extensions/picket-remote-wsl/src/tree.js b/extensions/picket-remote-wsl/src/tree.js
+new file mode 100644
+index 00000000..83dc02a7
+--- /dev/null
++++ b/extensions/picket-remote-wsl/src/tree.js
+@@ -0,0 +1,33 @@
++'use strict';
++
++/**
++ * The tree is the only place where a distro's WSL version, whether it is the
++ * default and whether this window is connected to it are visible at once.
++ * @param {import('./distro.js').IDistro[]} list
++ * @param {{ activeDistro?: string }} [ctx]
++ * @returns {Array<{ id: string, distro: string, label: string, description: string, contextValue: 'activeDistro' | 'inactiveDistro', tooltip: string }>}
++ */
++function buildDistroNodes(list, ctx = {}) {
++	const active = (ctx.activeDistro ?? '').toLowerCase();
++	const nodes = list.map(distro => {
++		const connected = distro.name.toLowerCase() === active;
++		const description = [distro.isDefault ? 'default distro' : undefined, connected ? 'Connected' : 'Not Connected'];
++		return {
++			node: {
++				id: `distro:${distro.name}`,
++				distro: distro.name,
++				label: `${distro.name}（WSL ${distro.version}）`,
++				description: description.filter(Boolean).join(' · '),
++				contextValue: /** @type {'activeDistro' | 'inactiveDistro'} */ (connected ? 'activeDistro' : 'inactiveDistro'),
++				tooltip: `${distro.name}\nWSL ${distro.version} · ${distro.state}\n${connected ? 'Connected' : 'Not Connected'}`
++			},
++			position: distro.isDefault ? 0 : 1
++		};
++	});
++	return nodes
++		.map((entry, index) => ({ ...entry, index }))
++		.sort((a, b) => (a.position - b.position) || (a.index - b.index))
++		.map(entry => entry.node);
++}
++
++module.exports = { buildDistroNodes };
 diff --git a/extensions/picket-remote-wsl/test/catalog.test.js b/extensions/picket-remote-wsl/test/catalog.test.js
 new file mode 100644
 index 00000000..350ec874
@@ -2111,6 +2915,207 @@ index 00000000..350ec874
 +	}));
 +	const catalog = await loadCatalog(dir);
 +	assert.deepStrictEqual(catalog.components.map(c => c.id), ['wsl-server']);
++});
+diff --git a/extensions/picket-remote-wsl/test/commands.test.js b/extensions/picket-remote-wsl/test/commands.test.js
+new file mode 100644
+index 00000000..275145dc
+--- /dev/null
++++ b/extensions/picket-remote-wsl/test/commands.test.js
+@@ -0,0 +1,195 @@
++// RED first: this file must fail until src/commands.js exists.
++const test = require('node:test');
++const assert = require('node:assert');
++const { createCommands } = require('../src/commands.js');
++const { createFakeHost, createFakeComponents, createCatalog } = require('./fixtures/fake-host.js');
++
++const TABLE = '* Ubuntu-24.04    Running         2\n  Debian          Stopped         2';
++
++/**
++ * Everything the command layer touches, minus VS Code itself.
++ * @param {{ flavor?: 'embedded' | 'ondemand', state?: 'installed' | 'absent', host?: any, fail?: string }} [options]
++ */
++function harness(options = {}) {
++	const host = createFakeHost(options.host);
++	/** @type {any[]} */
++	const calls = [];
++	/** @type {any[]} */
++	const configs = [];
++	/** @type {Array<{ id: string, config: any }>} */
++	const ensured = [];
++	/** @type {string[]} */
++	const stopped = [];
++
++	const createComponents = (config) => {
++		configs.push(config);
++		const components = createFakeComponents({ state: options.state ?? 'absent', fail: options.fail });
++		const ensure = components.ensure.bind(components);
++		components.ensure = async (id) => {
++			ensured.push({ id, config });
++			return ensure(id);
++		};
++		return components;
++	};
++
++	const runner = {
++		async exec(args) {
++			const key = args.join(' ');
++			calls.push(args);
++			if (key === '--list --verbose') {
++				return { code: 0, stdout: Buffer.from(TABLE, 'utf16le'), stderr: '' };
++			}
++			if (key.endsWith('printenv HOME')) {
++				return { code: 0, stdout: '/home/u\n', stderr: '' };
++			}
++			if (key.includes('wslpath -u')) {
++				return { code: 0, stdout: '/mnt/c/project\n', stderr: '' };
++			}
++			return { code: 0, stdout: '', stderr: '' };
++		}
++	};
++
++	const settings = {
++		defaultDistro: '',
++		serverPayloadPath: '',
++		serverPayloadBaseUrl: '',
++		tunnelMode: 'auto',
++		icodePath: '',
++		startTimeoutSeconds: 90
++	};
++	const store = new Map();
++	const memento = {
++		get: (key) => store.get(key),
++		async update(key, value) { store.set(key, value); }
++	};
++
++	const commands = createCommands({
++		host,
++		runner,
++		settings,
++		memento,
++		catalog: createCatalog({ flavor: options.flavor ?? 'ondemand' }),
++		createComponents,
++		resolver: { async stop(distro) { stopped.push(distro); } },
++		log: { info() { }, error() { } },
++		extensionPath: '/ext'
++	});
++
++	return { host, commands, calls, configs, ensured, stopped, memento };
++}
++
++test('the embedded flavor installs without asking where to get the payload', async () => {
++	const ctx = harness({
++		flavor: 'embedded',
++		host: { quickPick: 'Ubuntu-24.04', openDialog: [{ path: '/home/u/project' }] }
++	});
++	await ctx.commands.openFolder();
++	assert.ok(!ctx.host.messages.some(message => message.includes('从哪里获取')), `unexpected prompt: ${ctx.host.messages.join(' | ')}`);
++	assert.strictEqual(ctx.ensured.length, 1);
++	assert.strictEqual(ctx.host.opened.length, 1);
++});
++
++test('the ondemand flavor offers exactly three ways to get the payload', async () => {
++	const ctx = harness({ flavor: 'ondemand', host: { quickPick: 'Ubuntu-24.04', openDialog: [{ path: '/home/u/project' }] } });
++	await ctx.commands.openFolder();
++	assert.match(ctx.host.messages.at(-1), /从哪里获取/);
++	assert.deepStrictEqual(ctx.host.lastActions, ['自动下载', '从文件安装…', '取消']);
++	assert.deepStrictEqual(ctx.host.opened, []);
++});
++
++test('picking "install from file" hands the chosen path to the component manager', async () => {
++	const ctx = harness({
++		flavor: 'ondemand',
++		host: {
++			quickPick: 'Ubuntu-24.04',
++			openDialog: (opts) => (opts.canSelectFolders ? [{ path: '/home/u/project' }] : '/tmp/payload.tar.gz'),
++			info: ['从文件安装…']
++		}
++	});
++	await ctx.commands.openFolder();
++	assert.strictEqual(ctx.ensured.length, 1);
++	assert.strictEqual(ctx.ensured[0].config.explicitPath, '/tmp/payload.tar.gz');
++	assert.strictEqual(ctx.host.opened.length, 1);
++});
++
++test('cancelling the folder dialog opens nothing', async () => {
++	const ctx = harness({ host: { quickPick: 'Ubuntu-24.04' } });
++	await ctx.commands.openFolder();
++	assert.deepStrictEqual(ctx.host.opened, []);
++	assert.strictEqual(ctx.ensured.length, 0);
++});
++
++test('an installed component goes straight to a new window', async () => {
++	const ctx = harness({
++		state: 'installed',
++		host: { quickPick: 'Ubuntu-24.04', openDialog: [{ path: '/home/u/project' }] }
++	});
++	await ctx.commands.openFolder();
++	assert.strictEqual(ctx.host.opened.length, 1);
++	assert.deepStrictEqual(ctx.host.opened[0].opts, { forceNewWindow: true, remoteAuthority: 'picket-wsl+Ubuntu-24.04' });
++	assert.strictEqual(ctx.host.opened[0].uri.path, '/home/u/project');
++	assert.strictEqual(ctx.ensured.length, 0);
++});
++
++test('a UNC path chosen in the dialog is already posix', async () => {
++	const ctx = harness({
++		state: 'installed',
++		host: { quickPick: 'Debian', openDialog: [{ path: '', fsPath: '\\\\wsl.localhost\\Debian\\home\\u\\src' }] }
++	});
++	await ctx.commands.openFolder();
++	assert.strictEqual(ctx.host.opened[0].uri.path, '/home/u/src');
++	assert.strictEqual(ctx.host.opened[0].uri.authority, 'picket-wsl+Debian');
++});
++
++test('a Windows path chosen in the dialog is translated by wslpath', async () => {
++	const ctx = harness({
++		state: 'installed',
++		host: { quickPick: 'Ubuntu-24.04', openDialog: [{ path: 'C:\\project', fsPath: 'C:\\project', scheme: 'file' }] }
++	});
++	await ctx.commands.openFolder();
++	assert.ok(ctx.calls.some(args => args.join(' ').includes('wslpath -u')), 'expected a wslpath translation');
++	assert.strictEqual(ctx.host.opened[0].uri.path, '/mnt/c/project');
++});
++
++test('a failing install is reported, not thrown', async () => {
++	const ctx = harness({
++		flavor: 'embedded',
++		fail: 'no source configured',
++		host: { quickPick: 'Ubuntu-24.04', openDialog: [{ path: '/home/u/project' }] }
++	});
++	await ctx.commands.openFolder();
++	assert.deepStrictEqual(ctx.host.opened, []);
++	assert.match(ctx.host.messages.at(-1), /no source configured/);
++});
++
++test('stopping the server asks which distro and hands it to the resolver', async () => {
++	const ctx = harness({ host: { quickPick: 'Debian' } });
++	await ctx.commands.stopServer();
++	assert.deepStrictEqual(ctx.stopped, ['Debian']);
++});
++
++test('refresh reloads the targets view', async () => {
++	const ctx = harness();
++	await ctx.commands.refreshTargets();
++	assert.strictEqual(ctx.host.state.refreshed, 1);
++});
++
++test('diagnostics open in a document', async () => {
++	const ctx = harness();
++	await ctx.commands.diagnose();
++	assert.strictEqual(ctx.host.documents.length, 1);
++	assert.match(ctx.host.documents[0], /Product tag/);
++});
++
++test('setting the default distro goes through manage and refreshes the view', async () => {
++	const ctx = harness({ host: { quickPick: 'Debian' } });
++	await ctx.commands.setDefaultDistro();
++	assert.deepStrictEqual(ctx.calls.at(-1), ['--set-default', 'Debian']);
++	assert.strictEqual(ctx.host.state.refreshed, 1);
++});
++
++test('remembering a distro survives into the next quick pick', async () => {
++	const ctx = harness({ state: 'installed', host: { quickPick: 'Debian', openDialog: [{ path: '/home/u/src' }] } });
++	await ctx.commands.openFolder();
++	assert.strictEqual(ctx.memento.get('picket.wsl.lastDistro'), 'Debian');
 +});
 diff --git a/extensions/picket-remote-wsl/test/components.test.js b/extensions/picket-remote-wsl/test/components.test.js
 new file mode 100644
@@ -2211,6 +3216,128 @@ index 00000000..6679f571
 +	assert.strictEqual((await manager.inspect('wsl-server')).state, 'absent');
 +	assert.strictEqual((await manager.list())[0].state, 'absent');
 +});
+diff --git a/extensions/picket-remote-wsl/test/diagnose.test.js b/extensions/picket-remote-wsl/test/diagnose.test.js
+new file mode 100644
+index 00000000..e2c16da4
+--- /dev/null
++++ b/extensions/picket-remote-wsl/test/diagnose.test.js
+@@ -0,0 +1,116 @@
++// RED first: this file must fail until src/diagnose.js exists.
++const test = require('node:test');
++const assert = require('node:assert');
++const { mkdtemp, writeFile } = require('node:fs/promises');
++const { tmpdir } = require('node:os');
++const { join } = require('node:path');
++const { buildDiagnostics } = require('../src/diagnose.js');
++const { createFakeComponents, createCatalog } = require('./fixtures/fake-host.js');
++
++/**
++ * wsl.exe answers UTF-16LE for its tables; the report has to survive that.
++ * @param {Array<[string, any]>} handlers
++ */
++function makeRunner(handlers) {
++	return {
++		async exec(args) {
++			const key = args.join(' ');
++			for (const [match, value] of handlers) {
++				if (key.includes(match)) {
++					if (value instanceof Error) {
++						throw value;
++					}
++					return { code: 0, stderr: '', ...value };
++				}
++			}
++			return { code: 0, stdout: '', stderr: '' };
++		}
++	};
++}
++
++/** @param {Array<[string, any]>} handlers */
++function happyRunner(handlers = []) {
++	return makeRunner([
++		...handlers,
++		['--list --verbose', { stdout: Buffer.from('  NAME            STATE           VERSION\n* Ubuntu-24.04    Running         2\n  Debian          Stopped         2', 'utf16le') }],
++		['--status', { stdout: '' }],
++		['printenv HOME', { stdout: '/home/u\n' }],
++		['command -v icode', { stdout: '/usr/local/bin/icode\n' }],
++		['node -v', { stdout: 'v20.11.0\n' }],
++		['git --version', { stdout: 'git version 2.43.0\n' }]
++	]);
++}
++
++/** @param {{ picketTag?: string, gallery?: any }} [product] */
++async function appRoot(product = {}) {
++	const dir = await mkdtemp(join(tmpdir(), 'picket-diag-'));
++	await writeFile(join(dir, 'product.json'), JSON.stringify({
++		picketTag: product.picketTag ?? 'v1.143.1-picket.1-rc.4',
++		extensionsGallery: product.gallery
++	}));
++	return dir;
++}
++
++/**
++ * @param {{ runner?: any, settings?: any, product?: any }} [options]
++ */
++async function diagnostics(options = {}) {
++	const root = await appRoot(options.product);
++	return buildDiagnostics({
++		runner: options.runner ?? happyRunner(),
++		settings: options.settings ?? { tunnelMode: 'auto', icodePath: '', defaultDistro: '' },
++		catalog: createCatalog(),
++		components: () => createFakeComponents({ state: 'installed' }),
++		appRoot: root,
++		readWslConfig: async () => ({ localhostForwarding: true })
++	});
++}
++
++test('the report carries a line for every thing a support request needs', async () => {
++	const report = await diagnostics();
++	for (const heading of ['Product tag', 'WSL', 'Distros', 'Tunnel mode', 'Components', 'iCode', 'node', 'git', 'Gallery']) {
++		assert.match(report, new RegExp(`^${heading}:`, 'm'), `missing the ${heading} section:\n${report}`);
++	}
++	assert.match(report, /Ubuntu-24\.04/);
++	assert.match(report, /direct/);
++});
++
++test('a failing probe becomes unavailable instead of throwing', async () => {
++	const report = await buildDiagnostics({
++		runner: makeRunner([['', new Error('boom')]]),
++		settings: { tunnelMode: 'auto', icodePath: '', defaultDistro: '' },
++		catalog: createCatalog(),
++		components: () => createFakeComponents({ state: 'installed' }),
++		appRoot: await appRoot(),
++		readWslConfig: async () => ({})
++	});
++	assert.match(report, /^Distros: unavailable: boom$/m);
++	assert.match(report, /^Product tag: v1\.143\.1-picket\.1-rc\.4$/m);
++});
++
++test('the product tag is read from the build, not from the extension manifest', async () => {
++	const report = await diagnostics({ product: { picketTag: 'v9.9.9-picket.7' } });
++	assert.match(report, /^Product tag: v9\.9\.9-picket\.7$/m);
++});
++
++test('the effective gallery comes from product.overrides.json when it exists', async () => {
++	const root = await appRoot({ gallery: { serviceUrl: 'https://open-vsx.org/vscode/gallery', itemUrl: 'https://open-vsx.org/vscode/item' } });
++	const overrides = join(root, 'product.overrides.json');
++	await writeFile(overrides, JSON.stringify({ extensionsGallery: null }));
++	const report = await buildDiagnostics({
++		runner: happyRunner(),
++		settings: { tunnelMode: 'auto', icodePath: '', defaultDistro: '' },
++		catalog: createCatalog(),
++		components: () => createFakeComponents({ state: 'installed' }),
++		appRoot: root,
++		overridesFile: overrides,
++		readWslConfig: async () => ({})
++	});
++	assert.match(report, /^Gallery: none/m);
++});
++
++test('the components section names the installed payload', async () => {
++	const report = await diagnostics();
++	assert.match(report, /wsl-server\s+installed/);
++	assert.match(report, /server-v1\.143\.1-picket\.1-rc\.4/);
++});
 diff --git a/extensions/picket-remote-wsl/test/distro.test.js b/extensions/picket-remote-wsl/test/distro.test.js
 new file mode 100644
 index 00000000..99a9dc23
@@ -2300,6 +3427,150 @@ index 00000000..99a9dc23
 +		/Timed out after 200 ms/
 +	);
 +});
+diff --git a/extensions/picket-remote-wsl/test/fixtures/fake-host.js b/extensions/picket-remote-wsl/test/fixtures/fake-host.js
+new file mode 100644
+index 00000000..4d50c8cf
+--- /dev/null
++++ b/extensions/picket-remote-wsl/test/fixtures/fake-host.js
+@@ -0,0 +1,138 @@
++'use strict';
++
++/**
++ * A stand-in for the slice of `vscode` that the command layer touches, so the
++ * command layer can be tested without an extension host.
++ * @param {{ quickPick?: any, openDialog?: any, info?: any[], warning?: any[], confirm?: boolean, folderOpen?: boolean }} [options]
++ */
++function createFakeHost(options = {}) {
++	/** @type {string[]} */
++	const messages = [];
++	/** @type {any[][]} */
++	const actionSets = [];
++	/** @type {any[]} */
++	const opened = [];
++	/** @type {string[]} */
++	const terminals = [];
++	/** @type {string[]} */
++	const documents = [];
++	const state = { refreshed: 0, progress: 0 };
++	const infoQueue = [...(options.info ?? [])];
++	const warningQueue = [...(options.warning ?? [])];
++
++	const host = {
++		messages,
++		actionSets,
++		opened,
++		terminals,
++		documents,
++		state,
++		get lastActions() {
++			return actionSets.length === 0 ? [] : actionSets[actionSets.length - 1];
++		},
++		/** @param {any[]} items @param {any} [opts] */
++		async showQuickPick(items, opts) {
++			const answer = typeof options.quickPick === 'function' ? options.quickPick(items, opts) : options.quickPick;
++			return answer === undefined ? undefined : items.find(item => item.label === answer) ?? answer;
++		},
++		/** @param {any} opts */
++		async showOpenDialog(opts) {
++			return typeof options.openDialog === 'function' ? options.openDialog(opts) : options.openDialog;
++		},
++		/** @param {string} message @param {...any} actions */
++		async showInformationMessage(message, ...actions) {
++			messages.push(message);
++			actionSets.push(actions.filter(action => typeof action === 'string'));
++			return infoQueue.length > 0 ? infoQueue.shift() : undefined;
++		},
++		/** @param {string} message @param {...any} actions */
++		async showWarningMessage(message, ...actions) {
++			messages.push(message);
++			actionSets.push(actions.filter(action => typeof action === 'string'));
++			if (options.confirm !== undefined) {
++				return options.confirm ? actions.filter(action => typeof action === 'string')[0] : undefined;
++			}
++			return warningQueue.length > 0 ? warningQueue.shift() : undefined;
++		},
++		/** @param {string} message */
++		async showErrorMessage(message) {
++			messages.push(message);
++			actionSets.push([]);
++			return undefined;
++		},
++		/** @param {any} opts @param {(progress: { report(value: any): void }) => Promise<any>} task */
++		async withProgress(opts, task) {
++			state.progress += 1;
++			return task({ report() { } });
++		},
++		/** @param {any} uri @param {any} opts */
++		async openFolder(uri, opts) {
++			opened.push({ uri, opts });
++		},
++		/** @param {string} command */
++		runInTerminal(command) {
++			terminals.push(command);
++		},
++		refreshTargets() {
++			state.refreshed += 1;
++		},
++		/** @param {string} text @param {string} [language] */
++		async showDocument(text, language) {
++			documents.push(language ? `${text}` : text);
++		},
++		/** @param {{ scheme?: string, authority?: string, path?: string }} parts */
++		uriFor(parts) {
++			return { ...parts, fsPath: parts.path ?? '' };
++		}
++	};
++	return host;
++}
++
++/**
++ * @param {{ state?: 'installed' | 'absent' | 'broken', entries?: any[], fail?: string, version?: string }} [options]
++ */
++function createFakeComponents(options = {}) {
++	const state = { installed: 0, inspected: 0 };
++	const version = options.version ?? 'v1.143.1-picket.1-rc.4';
++	const payloadDir = `/home/u/.picket-code-server/payloads/server-${version}`;
++	const components = {
++		state,
++		async inspect() {
++			state.inspected += 1;
++			return { state: options.state ?? 'installed', version, payloadDir };
++		},
++		async ensure() {
++			if (options.fail) {
++				throw new Error(options.fail);
++			}
++			state.installed += 1;
++			return { payloadDir };
++		},
++		async list() {
++			return options.entries ?? [{ id: 'wsl-server', state: options.state ?? 'installed', version, payloadDir }];
++		},
++		async uninstall() { }
++	};
++	return components;
++}
++
++/** @param {{ tag?: string, flavor?: 'embedded' | 'ondemand', version?: string }} [options] */
++function createCatalog(options = {}) {
++	const version = options.version ?? 'v1.143.1-picket.1-rc.4';
++	return {
++		tag: options.tag ?? version,
++		flavor: options.flavor ?? 'ondemand',
++		components: [{
++			id: 'wsl-server',
++			kind: 'server',
++			version,
++			file: `picket-code-server-${version}-linux-x64.tar.gz`,
++			sha256: 'a'.repeat(64),
++			size: 1,
++			embedded: false,
++			embeddedPath: ''
++		}]
++	};
++}
++
++module.exports = { createFakeHost, createFakeComponents, createCatalog };
 diff --git a/extensions/picket-remote-wsl/test/fixtures/fake-wsl.js b/extensions/picket-remote-wsl/test/fixtures/fake-wsl.js
 new file mode 100755
 index 00000000..ac0353a7
@@ -2565,6 +3836,204 @@ index 00000000..9c28c453
 +	assert.ok(age !== undefined && age >= 30000 && age < 33000, `unexpected age ${age}`);
 +	const gone = { exec: async () => ({ code: 0, stdout: '', stderr: '' }), spawn: () => { throw new Error('not used'); } };
 +	assert.strictEqual(await lockAgeMs(gone, 'Ubuntu', '/home/u/.picket-code-server/runtime/Ubuntu.json'), undefined);
++});
+diff --git a/extensions/picket-remote-wsl/test/manage.test.js b/extensions/picket-remote-wsl/test/manage.test.js
+new file mode 100644
+index 00000000..118dde5d
+--- /dev/null
++++ b/extensions/picket-remote-wsl/test/manage.test.js
+@@ -0,0 +1,66 @@
++// RED first: this file must fail until src/manage.js exists.
++const test = require('node:test');
++const assert = require('node:assert');
++const { manageDistro, parseOnlineTable } = require('../src/manage.js');
++const { createFakeHost } = require('./fixtures/fake-host.js');
++
++/** @param {{ code?: number, stdout?: string }} [options] */
++function recordingRunner(options = {}) {
++	const calls = [];
++	const runner = {
++		calls,
++		async exec(args) {
++			calls.push(args);
++			return { code: options.code ?? 0, stdout: options.stdout ?? '', stderr: '' };
++		}
++	};
++	return runner;
++}
++
++test('setDefault sends exactly the set-default arguments', async () => {
++	const runner = recordingRunner();
++	await manageDistro({ host: createFakeHost(), runner, action: 'setDefault', distro: 'Debian' });
++	assert.deepStrictEqual(runner.calls, [['--set-default', 'Debian']]);
++});
++
++test('deleting without a confirmation runs nothing', async () => {
++	const runner = recordingRunner();
++	const host = createFakeHost({ confirm: false });
++	await manageDistro({ host, runner, action: 'delete', distro: 'Debian' });
++	assert.deepStrictEqual(runner.calls, []);
++	assert.match(host.messages.at(-1), /Debian/);
++});
++
++test('deleting after an affirmative confirmation unregisters', async () => {
++	const runner = recordingRunner();
++	const host = createFakeHost({ confirm: true });
++	await manageDistro({ host, runner, action: 'delete', distro: 'Debian' });
++	assert.deepStrictEqual(runner.calls, [['--unregister', 'Debian']]);
++});
++
++test('adding parses the online table and hands an install command to a terminal', async () => {
++	const runner = recordingRunner({
++		stdout: '以下是可安装的有效分发。\n使用 “wsl.exe --install -d <Distro>” 安装分发。\n\nNAME            FRIENDLY NAME\nUbuntu          Ubuntu\nDebian          Debian GNU/Linux\ndocker-desktop  Docker Desktop\n'
++	});
++	const host = createFakeHost({ quickPick: 'Debian（Debian GNU/Linux）' });
++	await manageDistro({ host, runner, action: 'add' });
++	assert.deepStrictEqual(runner.calls[0], ['--list', '--online']);
++	assert.deepStrictEqual(host.terminals, ["wsl.exe --install -d 'Debian'"]);
++});
++
++test('an install name that is not a plain distro name is refused', async () => {
++	// A name reaches a shell, so the guard has to hold even when the table it
++	// came from is hostile rather than merely wrong.
++	const runner = recordingRunner({ stdout: 'NAME                  FRIENDLY NAME\nE; rm -rf /           Evil\n' });
++	const host = createFakeHost({ quickPick: 'E; rm -rf /' });
++	await manageDistro({ host, runner, action: 'add' });
++	assert.deepStrictEqual(host.terminals, []);
++	assert.match(host.messages.at(-1), /非法|invalid/i);
++});
++
++test('the online table parser ignores headers, hints and docker plumbing', () => {
++	assert.deepStrictEqual(
++		parseOnlineTable('以下是可安装的有效分发。\n使用 “wsl.exe --install -d <Distro>” 安装分发。\n\nNAME            FRIENDLY NAME\nUbuntu-24.04    Ubuntu 24.04 LTS\nDebian          Debian GNU/Linux\n'),
++		[{ name: 'Ubuntu-24.04', friendly: 'Ubuntu 24.04 LTS' }, { name: 'Debian', friendly: 'Debian GNU/Linux' }]
++	);
++});
+diff --git a/extensions/picket-remote-wsl/test/manifest.test.js b/extensions/picket-remote-wsl/test/manifest.test.js
+new file mode 100644
+index 00000000..67d09963
+--- /dev/null
++++ b/extensions/picket-remote-wsl/test/manifest.test.js
+@@ -0,0 +1,63 @@
++// RED first: the manifest and the code must agree about which commands exist.
++const test = require('node:test');
++const assert = require('node:assert');
++const { readFileSync } = require('node:fs');
++const { join } = require('node:path');
++const { COMMANDS } = require('../src/commands.js');
++
++const root = join(__dirname, '..');
++const manifest = JSON.parse(readFileSync(join(root, 'package.json'), 'utf8'));
++const extension = readFileSync(join(root, 'extension.js'), 'utf8');
++
++const contributed = manifest.contributes.commands.map(command => command.command);
++// Two places can register: `extension.js` itself (log plus the not-yet-built
++// commands) and the table in `commands.js`.
++const registered = new Set([
++	...(extension.match(/picket\.wsl\.[A-Za-z]+/g) ?? []),
++	...Object.keys(COMMANDS)
++]);
++
++test('every contributed command is registered somewhere', () => {
++	const missing = contributed.filter(id => !registered.has(id));
++	assert.deepStrictEqual(missing, [], `contributed but never registered: ${missing.join(', ')}`);
++});
++
++test('every registered command is contributed', () => {
++	const stray = [...registered].filter(id => !contributed.includes(id));
++	assert.deepStrictEqual(stray, [], `registered but not in the manifest: ${stray.join(', ')}`);
++});
++
++test('the command layer owns the ten commands of this milestone', () => {
++	assert.deepStrictEqual(Object.keys(COMMANDS).sort(), [
++		'picket.wsl.addDistro',
++		'picket.wsl.components',
++		'picket.wsl.deleteDistro',
++		'picket.wsl.diagnose',
++		'picket.wsl.openFolder',
++		'picket.wsl.refreshTargets',
++		'picket.wsl.reopenInWindows',
++		'picket.wsl.reopenInWsl',
++		'picket.wsl.setDefaultDistro',
++		'picket.wsl.stopServer'
++	]);
++});
++
++test('the only file that imports vscode is the one that can', () => {
++	// log.js is the one vscode-bound helper: it owns an OutputChannel.
++	const sources = ['catalog.js', 'distro.js', 'components.js', 'payload.js', 'launch.js', 'probe.js',
++		'remoteUri.js', 'resolver.js', 'icode.js', 'preflight.js', 'tree.js', 'manage.js', 'diagnose.js', 'nudge.js', 'commands.js'];
++	for (const name of sources) {
++		const text = readFileSync(join(root, 'src', name), 'utf8');
++		assert.doesNotMatch(text, /require\(['"]vscode['"]\)/, `${name} must stay testable without an extension host`);
++	}
++});
++
++test('the view is contributed to the remote explorer and has a welcome state', () => {
++	const remote = manifest.contributes.views.remote.map(view => view.id);
++	assert.ok(remote.includes('picketWsl.targets'));
++	const welcomed = manifest.contributes.viewsWelcome.map(entry => entry.view);
++	assert.ok(welcomed.includes('picketWsl.targets'));
++	const menu = manifest.contributes.menus['view/item/context'].map(entry => entry.command);
++	assert.ok(menu.includes('picket.wsl.setDefaultDistro'));
++	assert.ok(menu.includes('picket.wsl.deleteDistro'));
++});
+diff --git a/extensions/picket-remote-wsl/test/nudge.test.js b/extensions/picket-remote-wsl/test/nudge.test.js
+new file mode 100644
+index 00000000..1ae6d0d9
+--- /dev/null
++++ b/extensions/picket-remote-wsl/test/nudge.test.js
+@@ -0,0 +1,51 @@
++// RED first: this file must fail until src/nudge.js exists.
++const test = require('node:test');
++const assert = require('node:assert');
++const { maybeNudge, NUDGE_KEY } = require('../src/nudge.js');
++const { createFakeHost } = require('./fixtures/fake-host.js');
++
++function memento() {
++	const store = new Map();
++	return { store, get: (key) => store.get(key), async update(key, value) { store.set(key, value); } };
++}
++
++/** @param {string} fsPath */
++function folder(fsPath) {
++	return [{ uri: { fsPath } }];
++}
++
++test('a WSL folder opened from Windows is nudged exactly once', async () => {
++	const host = createFakeHost({ info: ['取消'] });
++	const state = memento();
++	const folders = folder('\\\\wsl.localhost\\Ubuntu-24.04\\home\\u\\src');
++
++	assert.strictEqual(await maybeNudge({ host, memento: state, folders }), true);
++	assert.strictEqual(await maybeNudge({ host, memento: state, folders }), false);
++	assert.strictEqual(host.messages.length, 1);
++	assert.strictEqual(state.store.get(NUDGE_KEY), true);
++});
++
++test('the nudge offers to reopen the same folder inside WSL', async () => {
++	const host = createFakeHost({ info: ['在 WSL 中打开'] });
++	/** @type {any[]} */
++	const opened = [];
++	await maybeNudge({
++		host,
++		memento: memento(),
++		folders: folder('\\\\wsl$\\Debian\\home\\u'),
++		openFolderInWsl: async (distro, posixPath) => { opened.push({ distro, posixPath }); }
++	});
++	assert.deepStrictEqual(opened, [{ distro: 'Debian', posixPath: '/home/u' }]);
++});
++
++test('an ordinary Windows folder is never nudged', async () => {
++	const host = createFakeHost();
++	assert.strictEqual(await maybeNudge({ host, memento: memento(), folders: folder('C:\\project') }), false);
++	assert.deepStrictEqual(host.messages, []);
++});
++
++test('an empty window is never nudged', async () => {
++	const host = createFakeHost();
++	assert.strictEqual(await maybeNudge({ host, memento: memento(), folders: [] }), false);
++	assert.deepStrictEqual(host.messages, []);
 +});
 diff --git a/extensions/picket-remote-wsl/test/payload.test.js b/extensions/picket-remote-wsl/test/payload.test.js
 new file mode 100644
@@ -3178,4 +4647,55 @@ index 00000000..4e2e66f8
 +	assert.strictEqual((await resolver.resolve('picket-wsl+Ubuntu')).port, 5555);
 +	assert.strictEqual(starts.length, 1);
 +	assert.ok(runner.state.released >= 1, 'the stale lock is cleared before the new one is taken');
++});
+diff --git a/extensions/picket-remote-wsl/test/tree.test.js b/extensions/picket-remote-wsl/test/tree.test.js
+new file mode 100644
+index 00000000..864c9d17
+--- /dev/null
++++ b/extensions/picket-remote-wsl/test/tree.test.js
+@@ -0,0 +1,45 @@
++// RED first: this file must fail until src/tree.js exists.
++const test = require('node:test');
++const assert = require('node:assert');
++const { buildDistroNodes } = require('../src/tree.js');
++const { visibleDistros } = require('../src/distro.js');
++
++const LIST = [
++	{ name: 'Debian', isDefault: false, version: '2', state: 'Stopped' },
++	{ name: 'Ubuntu-24.04', isDefault: true, version: '2', state: 'Running' },
++	{ name: 'Old', isDefault: false, version: '1', state: 'Stopped' }
++];
++
++test('the tree puts the default distro first and labels the WSL version', () => {
++	const nodes = buildDistroNodes(LIST, { activeDistro: 'Debian' });
++	assert.deepStrictEqual(nodes.map(n => n.label), ['Ubuntu-24.04（WSL 2）', 'Debian（WSL 2）', 'Old（WSL 1）']);
++});
++
++test('the active distro is marked connected, the others are not', () => {
++	const nodes = buildDistroNodes(LIST, { activeDistro: 'Debian' });
++	assert.strictEqual(nodes[1].contextValue, 'activeDistro');
++	assert.match(nodes[1].tooltip, /Connected/);
++	assert.strictEqual(nodes[0].contextValue, 'inactiveDistro');
++	assert.match(nodes[0].description, /default distro/);
++	assert.match(nodes[0].description, /Not Connected/);
++});
++
++test('the default distro is named in its description', () => {
++	const nodes = buildDistroNodes(LIST, {});
++	assert.match(nodes[0].description, /default distro/);
++	assert.doesNotMatch(nodes[1].description, /default distro/);
++});
++
++test('a docker-desktop distro never reaches the tree', () => {
++	const list = [
++		{ name: 'Ubuntu', isDefault: true, version: '2', state: 'Running' },
++		{ name: 'docker-desktop', isDefault: false, version: '2', state: 'Running' },
++		{ name: 'docker-desktop-data', isDefault: false, version: '2', state: 'Stopped' }
++	];
++	const nodes = buildDistroNodes(visibleDistros(list), {});
++	assert.deepStrictEqual(nodes.map(n => n.label), ['Ubuntu（WSL 2）']);
++});
++
++test('no distros produce no nodes rather than an error', () => {
++	assert.deepStrictEqual(buildDistroNodes([], {}), []);
 +});
