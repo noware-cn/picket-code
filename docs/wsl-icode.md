@@ -197,6 +197,14 @@ Measure-Command { Get-ChildItem -Recurse "\\wsl.localhost\Ubuntu\home\<user>\pro
 
 自建 server（A′）与它的差别只在于 **server 从哪来**：多一个构建 job，同时解决许可、iCode 归属、可验证性三件事。
 
+### 3.2 server 的构建与分发已经独立成仓
+
+`noware-cn/picket-code-server`（私有）负责 A′ 的后端产物：按同名 tag 拉 `dantesun/picket-code` 的补丁集与 `microsoft/vscode` 的上游 tag，打补丁后跑 `gulp vscode-reh-linux-x64-min`，断言三条不变量（裸 `X.Y.Z`、`serverDataFolderName`、无 vsda、`out/` 里有 iCode）并做 `/version` 冒烟，然后发布 Release 并镜像到 R2。
+
+产物契约：`picket-code-server-<tag>-linux-x64.tar.gz`，顶层目录 `picket-code-server-linux-x64/`，入口 `bin/picket-code-server`（`product.serverApplicationName`）。首版已发布 `v1.143.1-picket.1-rc.4`（83 MB）。
+
+因此 A′ 剩下的工作只有客户端侧的 resolver 扩展（下载/校验/解包/拉起 + `resolveAuthority`），不再需要动 server 构建。
+
 ## 4. 里程碑
 
 | 阶段 | 内容 | 验证 |
