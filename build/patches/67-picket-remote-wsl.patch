@@ -475,6 +475,210 @@ index 00000000..f612ff0a
 +}
 +
 +module.exports = { loadCatalog };
+diff --git a/extensions/picket-remote-wsl/src/components.js b/extensions/picket-remote-wsl/src/components.js
+new file mode 100644
+index 00000000..d587fe9c
+--- /dev/null
++++ b/extensions/picket-remote-wsl/src/components.js
+@@ -0,0 +1,198 @@
++'use strict';
++
++const { readFile, writeFile } = require('node:fs/promises');
++const { chooseSource, installPayload } = require('./payload.js');
++
++/** @typedef {{ sha256: string, source: string, installedAt: string }} IPayloadMarker */
++/** @typedef {'absent' | 'installed' | 'outdated' | 'broken'} IPayloadState */
++
++/**
++ * @param {string} payloadDir
++ * @returns {string}
++ */
++function markerPath(payloadDir) {
++	return `${payloadDir}/.picket-payload.json`;
++}
++
++/**
++ * @param {string} base
++ * @param {string} child
++ */
++function joinPath(base, child) {
++	return `${base.replace(/\/+$/, '')}/${child}`;
++}
++
++/**
++ * The disk inside the distro is the only source of truth: the Windows-side
++ * cache can be stale or corrupt, and a marker whose hash disagrees with the
++ * catalog means the payload is not the one this build expects.
++ * @param {{ catalog: any, runner: any, distro: string, home: string, statePath?: string, env?: any, fetchImpl?: typeof fetch, onProgress?: (progress: { downloaded: number, total: number }) => void }} options
++ */
++function createComponentManager(options) {
++	const { catalog, runner, distro, home } = options;
++	const payloadRoot = joinPath(home, '.picket-code-server/payloads');
++
++	/** @param {string} script @param {...string} params */
++	function sh(script, ...params) {
++		return runner.exec(['-d', distro, '-e', 'sh', '-c', script, 'sh', ...params]);
++	}
++
++	/** @returns {Promise<string[]>} absolute server-* paths, newest first */
++	async function listServerDirs() {
++		const result = await sh('ls -1t "$1" 2>/dev/null || true', payloadRoot);
++		const base = `${payloadRoot}/`;
++		return String(result.stdout)
++			.split(/\r?\n/)
++			.map(line => line.trim())
++			.filter(line => line.startsWith('server-') || line.startsWith(base))
++			.map(line => (line.startsWith('/') ? line : `${payloadRoot}/${line}`));
++	}
++
++	/** @param {string} dir */
++	async function readMarker(dir) {
++		const result = await sh('cat "$1" 2>/dev/null || true', markerPath(dir));
++		const text = String(result.stdout).trim();
++		if (!text) {
++			return undefined;
++		}
++		try {
++			const parsed = JSON.parse(text);
++			return typeof parsed?.sha256 === 'string' ? parsed : undefined;
++		} catch {
++			return undefined;
++		}
++	}
++
++	/** @param {string} id */
++	function componentOf(id) {
++		const component = catalog?.components?.find((c) => c.id === id);
++		if (!component) {
++			throw new Error(`Unknown component: ${id}`);
++		}
++		return component;
++	}
++
++	/** @param {string} id */
++	async function inspect(id) {
++		const component = componentOf(id);
++		const dirs = await listServerDirs();
++		const expected = joinPath(payloadRoot, `server-${component.version}`);
++		if (dirs.includes(expected)) {
++			const marker = await readMarker(expected);
++			const matches = marker !== undefined && marker.sha256.toLowerCase() === component.sha256.toLowerCase();
++			return {
++				state: /** @type {IPayloadState} */ (matches ? 'installed' : 'broken'),
++				version: component.version,
++				payloadDir: expected
++			};
++		}
++		const other = dirs[0];
++		if (other) {
++			return {
++				state: /** @type {IPayloadState} */ ('outdated'),
++				version: other.slice(other.lastIndexOf('server-') + 'server-'.length),
++				payloadDir: other
++			};
++		}
++		return { state: /** @type {IPayloadState} */ ('absent') };
++	}
++
++	/** @param {string} id */
++	async function ensure(id) {
++		const component = componentOf(id);
++		const current = await inspect(id);
++		if (current.state === 'installed' && current.payloadDir) {
++			return { payloadDir: current.payloadDir, source: sourceOfMarker(await readMarker(current.payloadDir)) };
++		}
++		const source = await chooseSource(component, {
++			explicitPath: options.env?.explicitPath,
++			embeddedDir: options.env?.embeddedDir,
++			baseUrl: options.env?.baseUrl,
++			exists: options.env?.exists
++		});
++		const installed = await installPayload({
++			runner, distro, component, source, payloadRoot,
++			fetchImpl: options.fetchImpl,
++			onProgress: options.onProgress
++		});
++		/** @type {IPayloadMarker} */
++		const marker = {
++			sha256: component.sha256.toLowerCase(),
++			source: source.kind === 'url' ? source.url : source.path,
++			installedAt: new Date().toISOString()
++		};
++		const written = await sh('printf %s "$1" > "$2"', JSON.stringify(marker), markerPath(installed.payloadDir));
++		if (written.code !== 0) {
++			throw new Error(`Could not write the payload marker in ${installed.payloadDir}: ${written.stderr}`);
++		}
++		await remember(id, { version: component.version, payloadDir: installed.payloadDir });
++		return { payloadDir: installed.payloadDir, source };
++	}
++
++	/** @param {any} marker */
++	function sourceOfMarker(marker) {
++		if (!marker || typeof marker.source !== 'string') {
++			return undefined;
++		}
++		return /^https?:\/\//.test(marker.source)
++			? { kind: 'url', url: marker.source }
++			: { kind: 'file', path: marker.source };
++	}
++
++	/** @param {string} id */
++	async function uninstall(id) {
++		const component = componentOf(id);
++		await sh('rm -rf "$1"', joinPath(payloadRoot, `server-${component.version}`));
++		await remember(id, undefined);
++	}
++
++	/**
++	 * Keeps the catalog version plus the newest `keep` of the rest.
++	 * @param {number} keep
++	 * @returns {Promise<string[]>} removed directory names
++	 */
++	async function cleanup(keep) {
++		const dirs = await listServerDirs();
++		const current = joinPath(payloadRoot, `server-${catalog?.tag ?? ''}`);
++		const extras = dirs.filter(dir => dir !== current);
++		const gone = extras.slice(keep);
++		for (const dir of gone) {
++			await sh('rm -rf "$1"', dir);
++		}
++		return gone.map(dir => dir.slice(dir.lastIndexOf('/') + 1));
++	}
++
++	async function list() {
++		const components = Array.isArray(catalog?.components) ? catalog.components : [];
++		/** @type {Array<{ id: string, state: string, version?: string, payloadDir?: string }>} */
++		const rows = [];
++		for (const component of components) {
++			const inspected = await inspect(component.id);
++			rows.push({ id: component.id, state: inspected.state, version: inspected.version, payloadDir: inspected.payloadDir });
++		}
++		return rows;
++	}
++
++	/** @param {string} id @param {any} value */
++	async function remember(id, value) {
++		if (!options.statePath) {
++			return;
++		}
++		let cache = {};
++		try {
++			cache = JSON.parse(await readFile(options.statePath, 'utf8'));
++		} catch {
++			cache = {};
++		}
++		cache[id] = value;
++		try {
++			await writeFile(options.statePath, JSON.stringify(cache, null, '\t'));
++		} catch {
++			// The cache is a convenience; the distro is authoritative.
++		}
++	}
++
++	return { inspect, ensure, uninstall, cleanup, list, markerPath, payloadRoot };
++}
++
++module.exports = { createComponentManager, markerPath };
 diff --git a/extensions/picket-remote-wsl/src/distro.js b/extensions/picket-remote-wsl/src/distro.js
 new file mode 100644
 index 00000000..5d068b16
@@ -992,6 +1196,105 @@ index 00000000..350ec874
 +	}));
 +	const catalog = await loadCatalog(dir);
 +	assert.deepStrictEqual(catalog.components.map(c => c.id), ['wsl-server']);
++});
+diff --git a/extensions/picket-remote-wsl/test/components.test.js b/extensions/picket-remote-wsl/test/components.test.js
+new file mode 100644
+index 00000000..6679f571
+--- /dev/null
++++ b/extensions/picket-remote-wsl/test/components.test.js
+@@ -0,0 +1,93 @@
++// RED first: this file must fail until src/components.js exists.
++const test = require('node:test');
++const assert = require('node:assert');
++const { createComponentManager } = require('../src/components.js');
++
++const HOME = '/home/u';
++const PAYLOADS = `${HOME}/.picket-code-server/payloads`;
++const V = 'v1.143.1-picket.1-rc.4';
++
++function managerWith(disk, opts = {}) {
++	const calls = [];
++	const runner = { exec: async (args) => {
++		calls.push(args.join(' '));
++		const script = args.slice(args.indexOf('-e') + 1).join(' ');
++		return disk(script) || { code: 0, stdout: '', stderr: '' };
++	}, spawn: () => { throw new Error('not used'); } };
++	const catalog = { tag: V, flavor: 'ondemand', components: [{ id: 'wsl-server', kind: 'server', version: V,
++		file: `picket-code-server-${V}-linux-x64.tar.gz`, size: 3, sha256: 'd'.repeat(64), embedded: false }] };
++	return { manager: createComponentManager({ catalog, runner, distro: 'D', home: HOME, statePath: '/tmp/state.json', ...opts }), calls };
++}
++
++test('absent when nothing is installed', async () => {
++	const { manager } = managerWith(() => ({ code: 0, stdout: '' }));
++	assert.strictEqual((await manager.inspect('wsl-server')).state, 'absent');
++});
++
++test('installed when the marker matches the catalog', async () => {
++	const { manager } = managerWith((s) => s.includes('cat')
++		? { code: 0, stdout: JSON.stringify({ sha256: 'd'.repeat(64), source: 'file', installedAt: 'now' }) }
++		: { code: 0, stdout: `${PAYLOADS}/server-${V}\n` });
++	assert.strictEqual((await manager.inspect('wsl-server')).state, 'installed');
++});
++
++test('broken when the marker sha differs', async () => {
++	const { manager } = managerWith((s) => s.includes('cat')
++		? { code: 0, stdout: JSON.stringify({ sha256: 'e'.repeat(64), source: 'file', installedAt: 'now' }) }
++		: { code: 0, stdout: `${PAYLOADS}/server-${V}\n` });
++	assert.strictEqual((await manager.inspect('wsl-server')).state, 'broken');
++});
++
++test('outdated when only another version is present', async () => {
++	const { manager } = managerWith((s) => s.includes('readlink') || s.includes('ls')
++		? { code: 0, stdout: `${PAYLOADS}/server-v1.143.1-picket.1-rc.3\n` }
++		: { code: 0, stdout: '' });
++	assert.strictEqual((await manager.inspect('wsl-server')).state, 'outdated');
++});
++
++test('ensure on an installed component issues no tar', async () => {
++	const { manager, calls } = managerWith((s) => s.includes('cat')
++		? { code: 0, stdout: JSON.stringify({ sha256: 'd'.repeat(64), source: 'file', installedAt: 'now' }) }
++		: { code: 0, stdout: `${PAYLOADS}/server-${V}\n` });
++	await manager.ensure('wsl-server');
++	assert.ok(!calls.some(c => c.includes('tar')), calls.join('\n'));
++});
++
++test('cleanup keeps the catalog version and the newest extras, drops the rest', async () => {
++	let listings = [`${PAYLOADS}/server-v1.143.1-picket.1-rc.4`, `${PAYLOADS}/server-v1.143.1-picket.1-rc.3`, `${PAYLOADS}/server-v1.143.1-picket.1-rc.2`];
++	const removed = [];
++	const runner = { exec: async (args) => {
++		const script = args.slice(args.indexOf('-e') + 1).join(' ');
++		if (script.includes('ls')) {
++			return { code: 0, stdout: `${listings.join('\n')}\n`, stderr: '' };
++		}
++		if (script.includes('cat')) {
++			return { code: 0, stdout: JSON.stringify({ sha256: 'd'.repeat(64), source: 'file', installedAt: 'now' }), stderr: '' };
++		}
++		if (script.includes('rm')) {
++			removed.push(args[args.length - 1]);
++			listings = listings.filter(l => !l.endsWith(args[args.length - 1].split('/').pop()));
++			return { code: 0, stdout: '', stderr: '' };
++		}
++		return { code: 0, stdout: '', stderr: '' };
++	}, spawn: () => { throw new Error('not used'); } };
++	const manager = createComponentManager({
++		catalog: { tag: V, flavor: 'ondemand', components: [{ id: 'wsl-server', kind: 'server', version: V,
++			file: 'f.tar.gz', size: 3, sha256: 'd'.repeat(64), embedded: false }] },
++		runner, distro: 'D', home: HOME, statePath: '/tmp/state.json'
++	});
++	const gone = await manager.cleanup(0);
++	assert.deepStrictEqual(gone.sort(), ['server-v1.143.1-picket.1-rc.2', 'server-v1.143.1-picket.1-rc.3']);
++	assert.ok(!removed.some(r => r.endsWith(`server-${V}`)), 'the catalog version survives');
++});
++
++test('a corrupt state cache never changes the verdict', async () => {
++	const { writeFileSync, mkdtempSync } = require('node:fs');
++	const { tmpdir } = require('node:os');
++	const { join } = require('node:path');
++	const statePath = join(mkdtempSync(join(tmpdir(), 'picket-state-')), 'components.json');
++	writeFileSync(statePath, '{ not json');
++	const { manager } = managerWith(() => ({ code: 0, stdout: '' }), { statePath });
++	assert.strictEqual((await manager.inspect('wsl-server')).state, 'absent');
++	assert.strictEqual((await manager.list())[0].state, 'absent');
 +});
 diff --git a/extensions/picket-remote-wsl/test/distro.test.js b/extensions/picket-remote-wsl/test/distro.test.js
 new file mode 100644
