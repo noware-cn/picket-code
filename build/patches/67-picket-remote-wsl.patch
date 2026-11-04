@@ -1,0 +1,602 @@
+diff --git a/extensions/picket-remote-wsl/.vscodeignore b/extensions/picket-remote-wsl/.vscodeignore
+new file mode 100644
+index 00000000..96fab092
+--- /dev/null
++++ b/extensions/picket-remote-wsl/.vscodeignore
+@@ -0,0 +1,3 @@
++test/**
++**/*.map
++tsconfig.json
+diff --git a/extensions/picket-remote-wsl/extension.js b/extensions/picket-remote-wsl/extension.js
+new file mode 100644
+index 00000000..f7949286
+--- /dev/null
++++ b/extensions/picket-remote-wsl/extension.js
+@@ -0,0 +1,37 @@
++'use strict';
++
++const vscode = require('vscode');
++const { createLog } = require('./src/log.js');
++const { loadCatalog } = require('./src/catalog.js');
++
++/**
++ * @param {vscode.ExtensionContext} context
++ */
++async function activate(context) {
++	const log = createLog(context);
++	context.subscriptions.push(log);
++
++	const catalog = await loadCatalog(context.extensionPath);
++	const components = catalog.components.length;
++	log.info(`Picket WSL activated (tag=${catalog.tag ?? 'none'}, flavor=${catalog.flavor}, components=${components})`);
++
++	context.subscriptions.push(vscode.commands.registerCommand('picket.wsl.showLog', () => log.show()));
++
++	// Until the remaining commands land, they exist so the palette and the
++	// remote indicator do not offer dead entries.
++	for (const id of [
++		'picket.wsl.openFolder', 'picket.wsl.reopenInWsl', 'picket.wsl.reopenInWindows',
++		'picket.wsl.stopServer', 'picket.wsl.components', 'picket.wsl.diagnose',
++		'picket.wsl.selectGallery', 'picket.wsl.installVsix', 'picket.wsl.addDistro',
++		'picket.wsl.setDefaultDistro', 'picket.wsl.deleteDistro', 'picket.wsl.installCli',
++		'picket.wsl.removeCli', 'picket.wsl.refreshTargets'
++	]) {
++		context.subscriptions.push(vscode.commands.registerCommand(id, () => {
++			log.info(`${id} is not implemented yet (Task 1 skeleton)`);
++		}));
++	}
++}
++
++function deactivate() { }
++
++module.exports = { activate, deactivate };
+diff --git a/extensions/picket-remote-wsl/package.json b/extensions/picket-remote-wsl/package.json
+new file mode 100644
+index 00000000..63162040
+--- /dev/null
++++ b/extensions/picket-remote-wsl/package.json
+@@ -0,0 +1,294 @@
++{
++	"name": "picket-remote-wsl",
++	"displayName": "Picket Remote - WSL",
++	"description": "Open folders inside a WSL distro from Picket Code on Windows.",
++	"publisher": "noware",
++	"version": "0.0.1",
++	"license": "MIT",
++	"engines": {
++		"vscode": "^1.143.0"
++	},
++	"main": "./extension.js",
++	"extensionKind": [
++		"ui"
++	],
++	"enabledApiProposals": [
++		"resolvers",
++		"contribViewsRemote"
++	],
++	"activationEvents": [
++		"onStartupFinished",
++		"onResolveRemoteAuthority:picket-wsl"
++	],
++	"categories": [
++		"Other"
++	],
++	"contributes": {
++		"commands": [
++			{
++				"command": "picket.wsl.openFolder",
++				"title": "Picket: Open Folder in WSL…",
++				"category": "Picket"
++			},
++			{
++				"command": "picket.wsl.reopenInWsl",
++				"title": "Reopen Folder in WSL",
++				"category": "Picket"
++			},
++			{
++				"command": "picket.wsl.reopenInWindows",
++				"title": "Reopen Folder in Windows",
++				"category": "Picket"
++			},
++			{
++				"command": "picket.wsl.showLog",
++				"title": "Show WSL Log",
++				"category": "Picket"
++			},
++			{
++				"command": "picket.wsl.stopServer",
++				"title": "Stop WSL Server",
++				"category": "Picket"
++			},
++			{
++				"command": "picket.wsl.components",
++				"title": "组件…",
++				"category": "Picket"
++			},
++			{
++				"command": "picket.wsl.diagnose",
++				"title": "诊断 WSL 支持",
++				"category": "Picket"
++			},
++			{
++				"command": "picket.wsl.selectGallery",
++				"title": "选择扩展市场来源",
++				"category": "Picket"
++			},
++			{
++				"command": "picket.wsl.installVsix",
++				"title": "从 VSIX 安装扩展…",
++				"category": "Picket"
++			},
++			{
++				"command": "picket.wsl.addDistro",
++				"title": "添加发行版…",
++				"category": "Picket"
++			},
++			{
++				"command": "picket.wsl.setDefaultDistro",
++				"title": "设为默认发行版",
++				"category": "Picket"
++			},
++			{
++				"command": "picket.wsl.deleteDistro",
++				"title": "删除发行版…",
++				"category": "Picket"
++			},
++			{
++				"command": "picket.wsl.installCli",
++				"title": "在 WSL 中安装命令行…",
++				"category": "Picket"
++			},
++			{
++				"command": "picket.wsl.removeCli",
++				"title": "从 WSL 中移除命令行",
++				"category": "Picket"
++			},
++			{
++				"command": "picket.wsl.refreshTargets",
++				"title": "刷新 WSL 目标",
++				"category": "Picket"
++			}
++		],
++		"menus": {
++			"commandPalette": [
++				{
++					"command": "picket.wsl.openFolder",
++					"when": "isWindows && !isWeb"
++				},
++				{
++					"command": "picket.wsl.reopenInWsl",
++					"when": "isWindows && !isWeb && remoteName == '' && workspaceFolderCount > 0"
++				},
++				{
++					"command": "picket.wsl.reopenInWindows",
++					"when": "isWindows && !isWeb && remoteName == 'picket-wsl'"
++				},
++				{
++					"command": "picket.wsl.showLog",
++					"when": "isWindows && !isWeb"
++				},
++				{
++					"command": "picket.wsl.stopServer",
++					"when": "isWindows && !isWeb"
++				},
++				{
++					"command": "picket.wsl.components",
++					"when": "isWindows && !isWeb"
++				},
++				{
++					"command": "picket.wsl.diagnose",
++					"when": "isWindows && !isWeb"
++				},
++				{
++					"command": "picket.wsl.selectGallery",
++					"when": "isWindows && !isWeb"
++				},
++				{
++					"command": "picket.wsl.installVsix",
++					"when": "isWindows && !isWeb"
++				},
++				{
++					"command": "picket.wsl.addDistro",
++					"when": "isWindows && !isWeb"
++				},
++				{
++					"command": "picket.wsl.setDefaultDistro",
++					"when": "isWindows && !isWeb"
++				},
++				{
++					"command": "picket.wsl.deleteDistro",
++					"when": "isWindows && !isWeb"
++				},
++				{
++					"command": "picket.wsl.installCli",
++					"when": "isWindows && !isWeb"
++				},
++				{
++					"command": "picket.wsl.removeCli",
++					"when": "isWindows && !isWeb"
++				},
++				{
++					"command": "picket.wsl.refreshTargets",
++					"when": "isWindows && !isWeb"
++				}
++			],
++			"statusBar/remoteIndicator": [
++				{
++					"command": "picket.wsl.openFolder",
++					"when": "remoteName != 'picket-wsl'",
++					"group": "remote_10_picket-wsl_0_local@1"
++				},
++				{
++					"command": "picket.wsl.reopenInWsl",
++					"when": "remoteName != 'picket-wsl'",
++					"group": "remote_10_picket-wsl_0_local@2"
++				},
++				{
++					"command": "picket.wsl.reopenInWindows",
++					"when": "remoteName == 'picket-wsl'",
++					"group": "remote_10_picket-wsl_1_open@1"
++				},
++				{
++					"command": "picket.wsl.stopServer",
++					"when": "remoteName == 'picket-wsl'",
++					"group": "remote_10_picket-wsl_1_open@2"
++				},
++				{
++					"command": "picket.wsl.diagnose",
++					"when": "remoteName == 'picket-wsl'",
++					"group": "remote_10_picket-wsl_1_open@3"
++				},
++				{
++					"command": "picket.wsl.showLog",
++					"group": "remote_10_picket-wsl_1_open@4"
++				}
++			],
++			"view/title": [
++				{
++					"command": "picket.wsl.refreshTargets",
++					"when": "view == picketWsl.targets",
++					"group": "navigation@1"
++				},
++				{
++					"command": "picket.wsl.addDistro",
++					"when": "view == picketWsl.targets",
++					"group": "navigation@2"
++				}
++			]
++		},
++		"views": {
++			"remote": [
++				{
++					"id": "picketWsl.targets",
++					"name": "WSL 目标",
++					"when": "isWindows && !isWeb"
++				}
++			]
++		},
++		"viewsWelcome": [
++			{
++				"view": "picketWsl.targets",
++				"contents": "未检测到可用的 WSL 发行版。\n[安装 WSL](https://learn.microsoft.com/windows/wsl/install)\n[诊断 WSL 支持](command:picket.wsl.diagnose)"
++			}
++		],
++		"resourceLabelFormatters": [
++			{
++				"scheme": "vscode-remote",
++				"authority": "picket-wsl+*",
++				"formatting": {
++					"label": "${path}",
++					"separator": "/",
++					"tildify": true,
++					"workspaceSuffix": "WSL"
++				}
++			}
++		],
++		"configuration": {
++			"title": "Picket WSL",
++			"properties": {
++				"picket.wsl.defaultDistro": {
++					"type": "string",
++					"default": "",
++					"description": "默认发行版名称；留空则使用 WSL 的默认发行版。"
++				},
++				"picket.wsl.serverPayloadPath": {
++					"type": "string",
++					"default": "",
++					"description": "服务器载荷 tar.gz 的本地路径；优先于内嵌与下载。"
++				},
++				"picket.wsl.serverPayloadBaseUrl": {
++					"type": "string",
++					"default": "",
++					"description": "服务器载荷的下载基址（需同时提供 SHA256SUMS 与 catalog.json）。"
++				},
++				"picket.wsl.icodePath": {
++					"type": "string",
++					"default": "",
++					"description": "发行版内 iCode 可执行文件路径；留空则在 PATH 中查找。"
++				},
++				"picket.wsl.startTimeoutSeconds": {
++					"type": "number",
++					"default": 90,
++					"minimum": 10,
++					"description": "服务器启动无输出多久后判定失败。"
++				},
++				"picket.wsl.probeRetrySeconds": {
++					"type": "number",
++					"default": 2,
++					"minimum": 1,
++					"description": "运行时文件探活的重试间隔。"
++				},
++				"picket.wsl.tunnelMode": {
++					"type": "string",
++					"enum": [
++						"auto",
++						"direct",
++						"stdio"
++					],
++					"default": "auto",
++					"description": "连接方式：auto 依据 .wslconfig 决定，direct 直连 127.0.0.1，stdio 走本地管道隧道。"
++				},
++				"picket.wsl.caFile": {
++					"type": "string",
++					"default": "",
++					"description": "内网 CA 证书路径（PEM），下载载荷时使用。"
++				}
++			}
++		}
++	},
++	"scripts": {
++		"test": "node --test test/"
++	}
++}
+diff --git a/extensions/picket-remote-wsl/payloads/catalog.json b/extensions/picket-remote-wsl/payloads/catalog.json
+new file mode 100644
+index 00000000..c60ef4e0
+--- /dev/null
++++ b/extensions/picket-remote-wsl/payloads/catalog.json
+@@ -0,0 +1,6 @@
++{
++	"version": 1,
++	"tag": null,
++	"flavor": "ondemand",
++	"components": []
++}
+diff --git a/extensions/picket-remote-wsl/src/catalog.js b/extensions/picket-remote-wsl/src/catalog.js
+new file mode 100644
+index 00000000..f612ff0a
+--- /dev/null
++++ b/extensions/picket-remote-wsl/src/catalog.js
+@@ -0,0 +1,107 @@
++'use strict';
++
++const { readFile } = require('node:fs/promises');
++const { join } = require('node:path');
++
++/**
++ * A fresh object every time, so callers cannot share one mutable catalog.
++ * @returns {ICatalog}
++ */
++function emptyCatalog() {
++	return { tag: null, flavor: 'ondemand', components: [] };
++}
++
++/**
++ * @typedef {{ id: string, kind: 'server' | 'extensions', version: string, file: string, size: number, sha256: string, embedded: boolean, embeddedPath?: string }} ICatalogComponent
++ * @typedef {{ tag: string | null, flavor: 'embedded' | 'ondemand', components: ICatalogComponent[] }} ICatalog
++ */
++
++/** @param {unknown} value @returns {value is Record<string, any>} */
++function isObject(value) {
++	return typeof value === 'object' && value !== null && !Array.isArray(value);
++}
++
++/** @param {unknown} value @returns {value is string} */
++function nonEmpty(value) {
++	return typeof value === 'string' && value.length > 0;
++}
++
++/** @param {unknown} value @returns {value is number} */
++function positiveInteger(value) {
++	return typeof value === 'number' && Number.isInteger(value) && value > 0;
++}
++
++/**
++ * A component is usable only when every field the installer relies on is present
++ * and well formed. Anything else is dropped rather than trusted.
++ * @param {unknown} raw @returns {ICatalogComponent | undefined}
++ */
++function normalizeComponent(raw) {
++	if (!isObject(raw)) {
++		return undefined;
++	}
++	if (!nonEmpty(raw.id) || !nonEmpty(raw.version) || !nonEmpty(raw.file)) {
++		return undefined;
++	}
++	if (raw.kind !== 'server' && raw.kind !== 'extensions') {
++		return undefined;
++	}
++	if (!positiveInteger(raw.size)) {
++		return undefined;
++	}
++	if (typeof raw.sha256 !== 'string' || !/^[0-9a-f]{64}$/.test(raw.sha256)) {
++		return undefined;
++	}
++	const embedded = raw.embedded === true;
++	const embeddedPath = raw.embeddedPath;
++	if (embedded) {
++		if (!nonEmpty(embeddedPath) || embeddedPath.includes('..') || embeddedPath.startsWith('/')) {
++			return undefined;
++		}
++	}
++	return {
++		id: raw.id,
++		kind: raw.kind,
++		version: raw.version,
++		file: raw.file,
++		size: raw.size,
++		sha256: raw.sha256,
++		embedded,
++		embeddedPath: embedded ? embeddedPath : undefined
++	};
++}
++
++/**
++ * Reads `payloads/catalog.json` from the extension directory. A missing or
++ * malformed catalog is a valid state (an ondemand build with nothing installed
++ * yet), so it resolves to the empty catalog and never throws.
++ * @param {string} extensionPath
++ * @returns {Promise<ICatalog>}
++ */
++async function loadCatalog(extensionPath) {
++	let text;
++	try {
++		text = await readFile(join(extensionPath, 'payloads', 'catalog.json'), 'utf8');
++	} catch {
++		return emptyCatalog();
++	}
++	let parsed;
++	try {
++		parsed = JSON.parse(text);
++	} catch {
++		return emptyCatalog();
++	}
++	if (!isObject(parsed)) {
++		return emptyCatalog();
++	}
++	const components = Array.isArray(parsed.components)
++		? parsed.components.map(normalizeComponent).filter(Boolean)
++		: [];
++	return {
++		tag: nonEmpty(parsed.tag) ? parsed.tag : null,
++		flavor: parsed.flavor === 'embedded' ? 'embedded' : 'ondemand',
++		components
++	};
++}
++
++module.exports = { loadCatalog };
+diff --git a/extensions/picket-remote-wsl/src/log.js b/extensions/picket-remote-wsl/src/log.js
+new file mode 100644
+index 00000000..918896a0
+--- /dev/null
++++ b/extensions/picket-remote-wsl/src/log.js
+@@ -0,0 +1,45 @@
++'use strict';
++
++const vscode = require('vscode');
++const { appendFile, mkdir } = require('node:fs/promises');
++const { dirname, join } = require('node:path');
++
++/**
++ * Two sinks so a user can read the log in the editor and a supporter can ask
++ * for a file: the OutputChannel is live, the file survives a closed window.
++ * @param {vscode.ExtensionContext} context
++ */
++function createLog(context) {
++	const channel = vscode.window.createOutputChannel('Picket WSL');
++	const file = join(context.logUri.fsPath, 'picket-wsl.log');
++	context.subscriptions.push(channel);
++
++	/** @param {unknown[]} parts */
++	function write(parts) {
++		const line = parts.map(p => (typeof p === 'string' ? p : String(p))).join(' ');
++		channel.appendLine(line);
++		void mkdir(dirname(file), { recursive: true })
++			.then(() => appendFile(file, `${new Date().toISOString()} ${line}\n`))
++			.catch(() => { /* the channel already has it; a log file failure must not throw */ });
++	}
++
++	return {
++		/** @param {...unknown} parts */
++		info(...parts) {
++			write(parts);
++		},
++		/** @param {...unknown} parts */
++		error(...parts) {
++			write(['ERROR', ...parts]);
++		},
++		show() {
++			channel.show(true);
++		},
++		dispose() {
++			channel.dispose();
++		},
++		logFile: file
++	};
++}
++
++module.exports = { createLog };
+diff --git a/extensions/picket-remote-wsl/test/catalog.test.js b/extensions/picket-remote-wsl/test/catalog.test.js
+new file mode 100644
+index 00000000..350ec874
+--- /dev/null
++++ b/extensions/picket-remote-wsl/test/catalog.test.js
+@@ -0,0 +1,68 @@
++// RED first: this file must fail until src/catalog.js exists.
++const test = require('node:test');
++const assert = require('node:assert');
++const { mkdtempSync, mkdirSync, writeFileSync } = require('node:fs');
++const { tmpdir } = require('node:os');
++const { join } = require('node:path');
++const { loadCatalog } = require('../src/catalog.js');
++
++function extensionWith(catalog) {
++	const dir = mkdtempSync(join(tmpdir(), 'picket-wsl-'));
++	mkdirSync(join(dir, 'payloads'), { recursive: true });
++	writeFileSync(join(dir, 'payloads', 'catalog.json'), catalog);
++	return dir;
++}
++
++const VALID = {
++	version: 1,
++	tag: 'v1.143.1-picket.1-rc.4',
++	flavor: 'ondemand',
++	components: [{
++		id: 'wsl-server',
++		kind: 'server',
++		version: 'v1.143.1-picket.1-rc.4',
++		file: 'picket-code-server-v1.143.1-picket.1-rc.4-linux-x64.tar.gz',
++		size: 87123456,
++		sha256: 'a'.repeat(64)
++	}]
++};
++
++test('parses a valid catalog', async () => {
++	const dir = extensionWith(JSON.stringify(VALID));
++	const catalog = await loadCatalog(dir);
++	assert.strictEqual(catalog.tag, 'v1.143.1-picket.1-rc.4');
++	assert.strictEqual(catalog.flavor, 'ondemand');
++	assert.strictEqual(catalog.components.length, 1);
++	assert.strictEqual(catalog.components[0].embedded, false);
++	assert.strictEqual(catalog.components[0].embeddedPath, undefined);
++});
++
++test('keeps embeddedPath when embedded is true', async () => {
++	const dir = extensionWith(JSON.stringify({
++		...VALID,
++		flavor: 'embedded',
++		components: [{ ...VALID.components[0], embedded: true, embeddedPath: 'wsl-payloads/server.tar.gz' }]
++	}));
++	const catalog = await loadCatalog(dir);
++	assert.strictEqual(catalog.components[0].embedded, true);
++	assert.strictEqual(catalog.components[0].embeddedPath, 'wsl-payloads/server.tar.gz');
++});
++
++test('invalid JSON yields the empty catalog instead of throwing', async () => {
++	const dir = extensionWith('{ not json');
++	const catalog = await loadCatalog(dir);
++	assert.deepStrictEqual(catalog, { tag: null, flavor: 'ondemand', components: [] });
++});
++
++test('a component without a valid sha256 is dropped, the rest survive', async () => {
++	const dir = extensionWith(JSON.stringify({
++		...VALID,
++		components: [
++			VALID.components[0],
++			{ ...VALID.components[0], id: 'no-sha', sha256: 'short' },
++			{ ...VALID.components[0], id: 'traversal', embedded: true, embeddedPath: '../escape.tar.gz' }
++		]
++	}));
++	const catalog = await loadCatalog(dir);
++	assert.deepStrictEqual(catalog.components.map(c => c.id), ['wsl-server']);
++});

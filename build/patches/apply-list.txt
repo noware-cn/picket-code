@@ -9,3 +9,4 @@
 63-agenthost-icode-provider.patch
 64-changeset-auto-diff-strategy.patch
 65-icode-smoke-tests.patch
+67-picket-remote-wsl.patch

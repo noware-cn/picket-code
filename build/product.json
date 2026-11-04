@@ -27,6 +27,10 @@
       "contribRemoteHelp",
       "contribViewsRemote",
       "telemetry"
+    ],
+    "noware.picket-remote-wsl": [
+      "resolvers",
+      "contribViewsRemote"
     ]
   },
   "quality": "stable",

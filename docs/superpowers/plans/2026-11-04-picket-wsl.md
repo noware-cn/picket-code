@@ -173,14 +173,11 @@ Also in the manifest, because discovery is the difference between "works" and "f
 Run: `cd vscode/extensions/picket-remote-wsl && node --test test/catalog.test.js`
 Expected: PASS, 4 tests.
 
-- [ ] **Step 4.5: Check the contributions render, before building on them**
+- [ ] **Step 4.5: Settle the container question from the official manifest, not from a GUI run**
 
-Temporarily register a tree data provider whose `getChildren` logs one line, plus a command `picket.wsl.verify` that writes `vscode.commands.getCommands()` filtered to `picket.wsl.`, `vscode.env.remoteName`, and `vscode.workspace.workspaceFolders?.length` to the `Picket WSL` output channel. Drop `isWindows` from the view's and the command's `when` clause for this run only, then `cd vscode && ./scripts/code.sh --agents` and open the empty window:
+The risk was that `viewsExtensionPoint.ts:537` forces `workspace: true` on views contributed to `remote`, hiding ours in an empty window. Settled statically: the official Remote-WSL manifest contributes exactly `{"views": {"remote": [{"id": "targetsWsl", ...}]}}`, and that view is the one users see in an empty local window — so the forcing does not gate on `workspaceFolderCount`. No GUI run is needed here; the runtime assertion (command count, `remoteName`, `getChildren` firing) moves to Task 8, where a real tree provider exists and the check costs nothing extra.
 
-- run `Picket: 验证` and read the channel: the command list must match the manifest exactly, `remoteName` must be `''`, `workspaceFolders` must be `undefined`;
-- find `WSL 目标` in the Remote Explorer container. **If the channel has no `getChildren` line, the container hid the view** — `viewsExtensionPoint.ts:537` forces `workspace: true` on views contributed to `remote`, and Task 8 must then target `explorer` or a custom container instead.
-
-Remove the temporary provider and command, restore the `when` clauses, and record both observations in the ledger — this is the cheapest possible moment to learn them.
+Do not add `remoteName` to our view: the official sets `"remoteName": "wsl"`, but the field is marked `TODO@roblou - delete after remote extensions are updated` and omitting it applies no filter at all.
 
 - [ ] **Step 5: Add the API proposal entry and export the patch**
 
@@ -729,7 +726,7 @@ The resolver computes `icode = await detectIcode(...)` before `startServer` and 
 
 - [ ] **Step 4: Run the tests to verify they pass**
 
-Run: `cd vscode/extensions/picket-remote-wsl && node --test test/`
+Run: `cd vscode/extensions/picket-remote-wsl && node --test "test/*.test.js"`
 Expected: PASS — every suite under `test/` green.
 
 - [ ] **Step 5: Commit and re-export the patch**
@@ -828,7 +825,7 @@ Expected: FAIL — modules not found.
 
 - [ ] **Step 4: Run the tests to verify they pass**
 
-Run: `cd vscode/extensions/picket-remote-wsl && node --test test/`
+Run: `cd vscode/extensions/picket-remote-wsl && node --test "test/*.test.js"`
 Expected: PASS — every suite under `test/` green.
 
 - [ ] **Step 5: Manual smoke on Windows, then commit and re-export**
@@ -934,7 +931,7 @@ Expected: FAIL — `writeGalleryOverride is not a function`.
 
 - [ ] **Step 4: Run the test to verify it passes**
 
-Run: `cd vscode/extensions/picket-remote-wsl && node --test test/`
+Run: `cd vscode/extensions/picket-remote-wsl && node --test "test/*.test.js"`
 Expected: PASS — every suite under `test/` green.
 
 - [ ] **Step 5: Manual smoke on Windows, then commit and re-export**
@@ -985,7 +982,7 @@ The resolver calls `chooseTunnelMode` with the parsed `.wslconfig` (read from `%
 
 - [ ] **Step 4: Run the test to verify it passes**
 
-Run: `cd vscode/extensions/picket-remote-wsl && node --test test/`
+Run: `cd vscode/extensions/picket-remote-wsl && node --test "test/*.test.js"`
 Expected: PASS — every suite under `test/` green.
 
 - [ ] **Step 5: Manual smoke on Windows, then commit and re-export**
@@ -1100,7 +1097,7 @@ The script is written to `<home>/.picket-code-server/bin/<tag>/bin/picket-code` 
 
 - [ ] **Step 4: Run the test to verify it passes**
 
-Run: `cd vscode/extensions/picket-remote-wsl && node --test test/`
+Run: `cd vscode/extensions/picket-remote-wsl && node --test "test/*.test.js"`
 Expected: PASS — every suite under `test/` green.
 
 - [ ] **Step 5: Manual smoke on Windows, then commit and re-export**

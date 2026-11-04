@@ -31,7 +31,7 @@ echo "==> picket-remote-wsl gate"
 
 # 1. L1/L2 suites
 if [ -d "$EXT_DIR/test" ]; then
-	out=$(cd "$EXT_DIR" && node --test test/ 2>&1)
+	out=$(cd "$EXT_DIR" && node --test "test/*.test.js" 2>&1)
 	rc=$?
 	tail_of_log=$(printf '%s\n' "$out" | grep -E '^# (pass|fail)' | tr '\n' ' ')
 	if [ $rc -eq 0 ]; then
