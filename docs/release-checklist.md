@@ -42,6 +42,7 @@ Linux x64 包上依次执行，任一项失败即停止发布。
 | Linux x64 | L1–L5 全绿 | 第 1 节 6 条 | - [ ] 通过 |
 | Windows x64 | L1/L2 单测 + 打包产物启动冒烟 | `.cmd` 真实启动、审批、diff | - [ ] 通过 |
 | Windows x64（历史欠账） | `.cmd` 转义只到单测（`icodeLaunchConfig`） | 在真机上用 `.cmd` 版 iCode 跑一轮对话 | - [ ] 通过 |
+| Windows x64 + WSL2（远程窗口） | `build/wsl/acceptance.sh --all`（Linux 桌面跑，`wsl.exe` 用替身，服务器载荷是真的）+ L4 冒烟用例 A5/A6 | `docs/wsl-verification.md` 四项：原生文件夹对话框、真实 `picket-code .`、界面观感、M4 末 15 分钟走查。**Windows Server 与 WSL1 不在范围** | - [ ] 通过 |
 | macOS | 未覆盖 | v1 不发布 macOS 则跳过此项 | - [ ] 不适用 / - [ ] 通过 |
 
 ## 3. 未验证项及原因
