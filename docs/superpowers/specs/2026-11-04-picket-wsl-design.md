@@ -1,6 +1,6 @@
 # Picket Code 的 WSL 支持 — 设计
 
-状态：待批准（v2，已并入 builder check 与四轮问答）
+状态：待批准（v3 — 并入决策表单前的讨论：隧道模式、决策记录）
 日期：2026-11-04
 相关：`docs/wsl-icode.md`（方案比较与 9p 评估）、`noware-cn/picket-code-server`（server 产物）、`spikes/picket-remote-wsl/`（一次性参考实现）
 
@@ -21,6 +21,7 @@ Windows 上的 Picket Code 打开 WSL 发行版里的文件夹时，工作区应
 - 载荷来源三条，优先级明确：显式路径 → 内嵌 → 内网地址（后两条用于替换与修复）。
 - 扩展市场三种模式：默认 Open VSX、内网自建 Open VSX、彻底离线。
 - iCode 由用户在发行版内自备；扩展负责检测、注入路径、缺失时给可执行说明。
+- 连接方式三档 `auto | direct | stdio`：默认直连，检测到 `localhostForwarding=false` 或异常网络模式时自动走 stdio 隧道（隧道为 M4 可选交付，见 §4.5）。
 - 任何失败都能被一句话解释清楚（列出尝试过的来源与原因）。
 
 ### 非目标（第一版不做，理由）
@@ -29,8 +30,8 @@ Windows 上的 Picket Code 打开 WSL 发行版里的文件夹时，工作区应
 - ARM64 / Alpine / Windows Server / 嵌套远程。
 - WSL-on-Web / exec server 连接路径。
 - iCode 载荷与版本钉死：iCode 由用户自备，扩展只做检测与注入，不负责安装。
-- 跨窗口 helper 进程 + 端口代理：改为"运行时文件 + 探活复用"（§4.4），效果等价且更简单。
-- WSL 内 CLI shim（`picket-code .`）：M4 可选，不进第一版验收。
+- 常驻 helper 进程（daemon）：跨窗口复用改用运行时文件（§4.4）；`localhostForwarding=false` 用 §4.5 的 per-window 隧道解决，不需要 daemon。
+- WSL 内 CLI shim（`picket-code .`）：可选，不进第一版验收。
 - 遥测。
 
 ### 反目标（这样算失败，哪怕技术上跑通）
@@ -40,13 +41,15 @@ Windows 上的 Picket Code 打开 WSL 发行版里的文件夹时，工作区应
 - 通过修改安装目录里的 `product.json` 实现内网切换（升级即丢）。
 - 依赖公网可达才可用。
 - 两个窗口争用同一份 `--user-data-dir` 导致 agent 历史/SQLite 损坏。
+- 用"启动超时"去掩盖一个本可以一句话说清的配置问题（如 `localhostForwarding=false`）。
 
 ## 3. 约束
 
-- **tag 强绑定**：`product.json.commit` 在握手时比对（`remoteExtensionHostAgentServer.ts:351-357`），载荷 tag 必须等于客户端 tag。运行时没有可推导的锚点（当前 `version` 是上游裸 `1.143.1`，发布 tag 是 `v1.143.1-picket.1-rc.4`），所以**构建时往 `product.json` 盖一个 `picketTag` 字段**，载荷命名、安装目录、诊断输出都读它。
+- **tag 强绑定**：`product.json.commit` 在握手时比对（`remoteExtensionHostAgentServer.ts:351-357`），载荷 tag 必须等于客户端 tag。运行时没有可推导的锚点（`version` 是上游裸 `1.143.1`，发布 tag 是 `v1.143.1-picket.1-rc.4`），所以**构建时往 `product.json` 盖 `picketTag`**，载荷命名、安装目录、诊断输出都读它。
 - **server 无 vsda**：产物没有校验器，客户端也不签名；不引入任何签名环节。
 - **离线内网的 PATH 不可信**：不依赖发行版 `.bashrc` 导出的 PATH，一律绝对路径 + 显式注入环境变量。
 - **扩展市场**：`productService.extensionsGallery` 是唯一真实来源；设置项 `extensions.gallery.serviceUrl` 走账号服务（本构建已剥离所有认证 provider，配了会永久 `RequiresSignIn`），因此必须在 `productService` 层覆盖，并隐藏该设置项。
+- **直连依赖 WSL 的 localhost 中继**：`[wsl2] localhostForwarding=false` 时 Windows 的 `127.0.0.1:<port>` 与 VM 内的是两个地址，直连必然失败。
 
 ## 4. 方案
 
@@ -55,11 +58,12 @@ Windows 上的 Picket Code 打开 WSL 发行版里的文件夹时，工作区应
 | 选择 | 备选 | 结论与理由 |
 |---|---|---|
 | 内置扩展（随客户端发布） | fork/重打包官方扩展；发 Open VSX | `resolvers` 是提议 API，只有白名单里的扩展能用；上市场等于给不可用的扩展。内置即零安装。 |
-| 直连 `127.0.0.1:<port>` + 运行时文件复用 | 官方式 helper 进程 + 每连接 `wsl.exe` 端口代理 | 省 ~250 行；跨窗口共享改用运行时文件（§4.4）达成，比官方更省内存。仍未覆盖 `localhostForwarding=false`，记录在案。 |
-| 载荷一律内嵌 | 只做下载器 / 只做随包 | 内网/离线是主场景；"装完即用、首次零网络"是产品承诺，不是部署清单。 |
-| iCode 用户自备 | 我们打包 Linux 版 | iCode 的 Linux 形态不由我们控制；我们只检测 + 注入 + 报错，避免背上运行时打包。 |
+| 直连 `127.0.0.1:<port>` 为主 | 一律走 stdio 隧道 | 默认路径最省事、延迟最低；隧道作为 `auto` 的兜底（§4.5）。 |
+| 跨窗口复用用运行时文件 | 官方式 helper 进程 | 省 ~250 行；一个发行版始终一个 server，且避免 data 目录争用。 |
+| 载荷一律内嵌 | 只做下载器 / 只做随包 | 内网/离线是主场景；"装完即用、首次零网络"是产品承诺。 |
+| iCode 用户自备 | 我们打包 Linux 版 | Linux 形态不由我们控制；我们只检测 + 注入 + 报错。 |
 | 市场覆盖用核心补丁（B） | 部署期改 product.json | 升级会覆盖，用户不能自助。 |
-| 离线再加"载荷预置 + VSIX 安装"（C） | 只靠 gallery | 彻底离线时 gallery 必然不可达，扩展供给必须有第二条腿。 |
+| 离线再加"载荷预置 + VSIX 安装"（C） | 只靠 gallery | 彻底离线时 gallery 必然不可达。 |
 | 内网档 = 自建 Open VSX | 仅文件共享 | 用户确认有自建 Open VSX，可浏览/搜索/安装。 |
 
 ### 4.2 架构
@@ -69,20 +73,22 @@ Picket Code (Windows)
 ├─ 内置扩展 picket-remote-wsl  ── registerRemoteAuthorityResolver('picket-wsl')
 │   ├─ payload.js      来源解析 → SHA256 校验 → 装进发行版
 │   ├─ icode.js        检测 icode、注入 PICKET_ICODE_BIN
-│   ├─ resolver.js     authority → {host:127.0.0.1, port, token}，运行时文件复用
+│   ├─ preflight.js    WSL 版本、.wslconfig、连接方式选择
+│   ├─ resolver.js     authority → {host, port, token}，运行时文件复用
+│   ├─ tunnel.js       （M4 可选）stdio 隧道
 │   └─ commands.js     打开/重开/停止/日志/诊断/市场来源/VSIX 安装
 ├─ resources/wsl-payloads/     内嵌载荷（tar.gz + SHA256SUMS）
 └─ 核心补丁 66         gallery 覆盖（product.overrides.json）
 
 WSL2 发行版
-├─ ~/.picket-code-server/payloads/server-<tag>/   bin/picket-code-server
+├─ ~/.picket-code-server/payloads/server-<tag>/   bin/picket-code-server, node
 ├─ ~/.picket-code-server/runtime/<distro>.json    {port, token, tag, pid, startedAt}
 ├─ ~/.picket-code-server/data/                    --user-data-dir
 ├─ ~/.picket-code-server/extensions/              --extensions-dir（可预置）
 └─ ~/.picket-code-server/logs/
 ```
 
-启动链路：`spawn('wsl.exe', ['-d', distro, '-e', 'env', 'PICKET_ICODE_BIN=<abs>', '<server-bin>', ...flags])`，从 stdout 解析 `Extension host agent listening on <port>`，把 `{host, port, connectionToken}` 交还给 `vscode-remote`。
+启动链路：`spawn('wsl.exe', ['-d', distro, '-e', 'env', 'PICKET_ICODE_BIN=<abs>', '<server-bin>', ...flags])`，从 stdout 解析 `Extension host agent listening on <port>`，按连接方式把 `{host, port, connectionToken}` 交还给 `vscode-remote`。
 
 ### 4.3 载荷（单制品）
 
@@ -100,40 +106,65 @@ WSL2 发行版
 2. 内嵌 `resources/wsl-payloads/` — **始终存在**，出厂默认路径。
 3. `picket.wsl.serverPayloadBaseUrl` — 内网地址，用于内嵌包损坏或版本回退时的兜底。
 
-网络访问（仅第 3 条会用到）遵守 `http.proxy`、`http.proxyStrictSSL`、`picket.wsl.caFile`；默认直连 + 严格 SSL。三者都不可用时，错误里逐条列出尝试与原因。
+网络访问（仅第 3 条用到）遵守 `http.proxy`、`http.proxyStrictSSL`、`picket.wsl.caFile`；默认直连 + 严格 SSL。三者都不可用时，错误里逐条列出尝试与原因。
 
 ### 4.4 Resolver 语义
 
 - authority：`picket-wsl+<distro>`，`<distro>` 为空时取默认发行版。
-- 复用：启动前读发行版内 `runtime/<distro>.json`；`probe()` 通过且 tag 匹配 → 直接复用（跨窗口、跨重载都成立），不新起进程。
-- 探活：`GET http://127.0.0.1:<port>/vscode-remote-resource?tkn=<token>`，**400 = 端口通且 token 对**，403 = token 错，拒绝 = 已死。超时 2 s，重试窗口由 `picket.wsl.probeRetrySeconds`（默认 60）控制。
+- 复用：启动前读发行版内 `runtime/<distro>.json`；`probe()` 通过且 tag 匹配 → 直接复用（跨窗口、跨重载），不新起进程。
+- 探活：`GET http://127.0.0.1:<port>/vscode-remote-resource?tkn=<token>`，**400 = 端口通且 token 对**，403 = token 错，拒绝 = 已死。超时 2 s，重试窗口由 `picket.wsl.probeRetrySeconds`（默认 60）控制。走隧道时探的是**隧道端口**。
 - 启动参数：`--host=127.0.0.1 --port=0 --connection-token=<t> --use-host-proxy --without-browser-env-var --disable-websocket-compression --accept-server-license-terms --user-data-dir=... --extensions-dir=... --log=trace`；token 由 4 段 `crypto.randomInt` 拼接。
 - 看护：每收到 stdout/stderr 数据重置计时；默认 90 s 无输出判失败（`picket.wsl.startTimeoutSeconds`）；`exit 99` → "发行版不兼容（缺 libstdc++ 等）"。
 - 落盘：启动成功后写 `runtime/<distro>.json`（含 pid），失败时清理。
 - 停止：`Picket: Stop WSL Server` → 按运行时文件杀进程树 → `wsl.exe -d <d> -e pkill -f 'picket-code-server.*<tag>'` → 删除运行时文件。不做"退出即杀"。
 
-### 4.5 iCode 检测（用户自备）
+### 4.5 连接方式（`picket.wsl.tunnelMode`）
 
-检测顺序：`picket.wsl.icodePath` 设置 → 发行版内 `command -v icode`（`wsl.exe -d <d> -e sh -lc 'command -v icode'`）→ 无。
+| 值 | 行为 |
+|---|---|
+| `auto`（默认） | 读 `%USERPROFILE%\.wslconfig` 的 `[wsl2] localhostForwarding`；为 `false` 时走 stdio 隧道，否则直连。检测到镜像网络模式（`networkingMode=mirrored`）时也走隧道，避免两套 localhost 语义混淆。 |
+| `direct` | 强制直连（排障用）。 |
+| `stdio` | 强制隧道（排障用，或部署策略要求）。 |
+
+**stdio 隧道的形态**：扩展在 Windows 侧 `net.createServer({ pauseOnConnect: true })` 监听 `127.0.0.1:0`；每条连接对应一个 `wsl.exe -d <distro> -e <payload>/node -e "<pipe 到 127.0.0.1:<serverPort>>"` 子进程，双向管道。VM 内仍绑 `127.0.0.1`，不对虚拟网卡暴露。
+
+**实现代价（必须按此排期，否则会低估）**：
+
+| 项 | 量 | 说明 |
+|---|---|---|
+| 隧道主体 | ~100 行 | 监听 + 每连接子进程 + 背压 + 半关闭 |
+| preamble 处理 | ~20 行 | `wsl.exe` 会在子进程输出前打印自己的提示，脚本先输出一行魔数，Windows 侧丢弃至该行 |
+| 诊断分层 | ~30 行 | Windows 监听 / `wsl.exe` 子进程 / VM 内 socket 三层分别记录 |
+| 生命周期 | ~15 行 | 断开即杀子进程；`deactivate` 关闭监听并清理 |
+| 测试（假 `wsl.exe` + 二进制管道） | ~60 行 | 无法在 Linux 上真跑 `wsl.exe`，用脚本模拟 |
+| **合计** | **~250 行** | 其中 80% 是边界处理，不是网络 |
+
+**已知代价（接受）**：每条连接一个 `wsl.exe` 进程（冷启 100–150 ms，热启几十毫秒；企业机器上杀软会放大）；对 B2 的复用无影响（隧道端口是新的临时端口）；不引入 daemon。
+
+**验收要求**：隧道模式下必须能打开 `/home/<user>`、能保存大文件（≥10 MB）、能连续重连 20 次不泄漏 `wsl.exe` 进程。
+
+### 4.6 iCode 检测（用户自备）
+
+检测顺序：`picket.wsl.icodePath` → 发行版内 `command -v icode`（`wsl.exe -d <d> -e sh -lc 'command -v icode'`）→ 无。
 
 - 命中：启动 server 时注入 `PICKET_ICODE_BIN=<绝对路径>`（不依赖发行版 PATH）。
-- 未命中：不阻塞 WSL 窗口（编辑器/终端/搜索照常工作），一次性提示"WSL 里未找到 iCode，AI 功能不可用"，附上期望路径与设置项；诊断命令里单独列出这一项。
+- 未命中：不阻塞 WSL 窗口（编辑器/终端/搜索照常），一次性提示"WSL 里未找到 iCode，AI 功能不可用"，附期望路径与设置项；诊断命令单独列出。
 
-### 4.6 扩展市场三模式（B + C）
+### 4.7 扩展市场三模式（B + C）
 
 **B｜核心补丁 66**
 
 - 启动时若存在 `<userDataDir>/product.overrides.json`，其 `extensionsGallery` 覆盖 `product.json`；`null` 表示关闭市场。文件缺失/损坏时回退，仅记日志。
-- 隐藏设置项 `extensions.gallery.serviceUrl`（以及 `extensions.gallery.authProvider`），避免用户掉进永久 `RequiresSignIn`。
+- 隐藏设置项 `extensions.gallery.serviceUrl` 与 `extensions.gallery.authProvider`，避免用户掉进永久 `RequiresSignIn`。
 - 命令 `Picket: 选择扩展市场来源`：默认 Open VSX / 内网 Open VSX（填 URL）/ 关闭 → 写文件 → 提示重载窗口。客户端生效即可；服务端不需要该补丁（`serverServices` 把 manifest 委托给客户端）。
-- 补丁编号顺延（当前最后一个为 65，本补丁为 66）。
+- 补丁编号顺延（当前最后为 65，本补丁为 66）。
 
 **C｜彻底离线**
 
-- server 载荷可选携带 `extensions/`；首次安装时若 `--extensions-dir` 为空则复制进去，绝不覆盖用户已装扩展（M3 决定清单，第一版留空）。
+- server 载荷可选携带 `extensions/`；首次安装时若 `--extensions-dir` 为空则复制进去，绝不覆盖用户已装扩展（第一版留空）。
 - 命令 `Picket: 从 VSIX 安装扩展…`：文件选择器 → `workbench.extensions.installExtension`（远端窗口时自动装到远端）。
 
-### 4.7 UX
+### 4.8 UX
 
 命令（全部 `Picket:` 前缀，避免与官方 `WSL:` 混淆）：
 
@@ -142,13 +173,13 @@ WSL2 发行版
 3. `Picket: Reopen Folder in Windows`。
 4. `Picket: Show WSL Log`。
 5. `Picket: Stop WSL Server`。
-6. `Picket: 诊断 WSL 支持` — 输出 WSL 版本、发行版、载荷来源命中情况、iCode 位置、市场模式、运行时文件状态；可复制。
+6. `Picket: 诊断 WSL 支持` — WSL 版本、发行版、`.wslconfig` 关键项、连接方式、载荷来源命中、iCode 位置、市场模式、运行时文件状态；可复制。
 7. `Picket: 选择扩展市场来源`。
 8. `Picket: 从 VSIX 安装扩展…`。
 
 常驻：沿用远程指示器；在 `\\wsl.localhost` 本地窗口里一次性提示"重开可获得原生性能"（`globalState` 记一次）。
 
-### 4.8 失败模式与文案原则
+### 4.9 失败模式与文案原则
 
 | 症状 | 原因 | 提示要点 |
 |---|---|---|
@@ -158,14 +189,16 @@ WSL2 发行版
 | `Client refused: version mismatch` | 载荷 tag ≠ 客户端 `picketTag` | 给出两者当前值，提示替换载荷 |
 | SHA256 不匹配 | 包被截断/换版 | 拒绝安装并指出来源 |
 | 解包失败 / 磁盘满 | 空间或权限 | 指出目标路径与所需空间 |
-| 启动 90 s 无输出 | 发行版不兼容/缺依赖 | 指向服务端日志 |
+| 启动 90 s 无输出 | 发行版不兼容/缺依赖 | 指向服务端日志；附最后 40 行输出 |
+| `localhostForwarding=false` | 直连不可达 | 提示已自动切换隧道；若隧道不可用则给出改 `.wslconfig` 与 `wsl --shutdown` 的指引 |
+| 隧道建立失败 | 三层之一 | 指明是哪一层（监听 / `wsl.exe` / VM 内 socket） |
 | iCode 未找到 | 用户未装 | 期望路径 + 设置项 + 一次性提示 |
-| 无法浏览扩展 | 市场模式为关闭或内网不可达 | 引导执行"选择扩展市场来源" |
-| 同时打开两个窗口 | 复用运行时文件 | 无提示（正常），日志记录"reused" |
+| 无法浏览扩展 | 市场模式关闭或内网不可达 | 引导执行"选择扩展市场来源" |
+| 同时打开两个窗口 | 复用运行时文件 | 无提示（正常），日志记 `reused` |
 
-原则：一条消息说清"发生了什么 + 期望是什么 + 下一步做什么"；内部术语（payload、resolver）只出现在日志里。
+原则：一条消息说清"发生了什么 + 期望是什么 + 下一步做什么"；内部术语（payload、resolver、tunnel）只出现在日志里。
 
-### 4.9 与现有补丁体系的关系
+### 4.10 与现有补丁体系的关系
 
 | 编号 | 内容 | 状态 |
 |---|---|---|
@@ -184,11 +217,13 @@ WSL2 发行版
 package.json        8 条命令、设置项、enabledApiProposals:["resolvers"]、extensionKind:["ui"]
 extension.js        activate/deactivate、日志、注册
 src/distro.js       发行版枚举、默认发行版、$HOME、WSL1 检测
+src/preflight.js    WSL 版本、.wslconfig 解析、连接方式选择
 src/payload.js      三来源解析、SHA256 校验、原子安装、标记文件、代理/CA 支持
 src/icode.js        检测与注入
 src/launch.js       参数构造、端口解析、看护、运行时文件读写、停止
+src/tunnel.js       （M4）stdio 隧道：监听、每连接子进程、preamble、诊断
 src/probe.js        400/403/拒绝 三态
-src/resolver.js     运行时文件复用、探活、重启、dispose
+src/resolver.js     运行时文件复用、连接方式选择、探活、重启、dispose
 src/remoteUri.js    UNC ↔ 远程 URI
 src/commands.js     8 条命令
 src/diagnose.js     诊断报告
@@ -200,7 +235,7 @@ src/log.js          OutputChannel + 文件
 
 - 构建时往 `product.json` 盖章 `picketTag`（取自发布 tag）。
 - 发布流水线拉取同 tag 的 `picket-code-server-<tag>-linux-x64.tar.gz` 与 `SHA256SUMS`，写入 `resources/wsl-payloads/`。
-- `check-contract.sh` 新增断言：载荷与 `SHA256SUMS` 存在、`picketTag` 与文件名一致、`product.json` 白名单含 `noware.picket-remote-wsl`、安装包体积在阈值内（记录基线，防意外翻倍）。
+- `check-contract.sh` 新增断言：载荷与 `SHA256SUMS` 存在、`picketTag` 与文件名一致、白名单含 `noware.picket-remote-wsl`、安装包体积在阈值内。
 
 ### `picket-code-server` 仓库
 
@@ -211,9 +246,9 @@ src/log.js          OutputChannel + 文件
 
 | 层 | 内容 | 在哪里跑 |
 |---|---|---|
-| L1 纯逻辑 | 发行版输出解析、端口解析、`SHA256SUMS` 解析、来源优先级、参数构造、运行时文件读写、UNC↔URI、探活三态、代理选项构造 | `node --test`，Linux CI |
-| L2 伪 `wsl.exe` | 脚本模拟 `-l -q` / `-e test` / `-e env` / `-e sh -lc 'command -v icode'` / 启动与日志输出；验证解析、看护超时、exit 99、复用、停止兜底 | Linux CI |
-| L3 真机 | Windows + WSL2 清单：零网络首次打开、连续两次打开同发行版（复用）、UNC 与远程两种比较、停止后重开、VSIX 离线安装、内网 Open VSX 切换、诊断输出 | 发布前人工 |
+| L1 纯逻辑 | 发行版输出解析、端口解析、`SHA256SUMS` 解析、来源优先级、参数构造、运行时文件读写、`.wslconfig` 解析、连接方式选择、UNC↔URI、探活三态、代理选项构造 | `node --test`，Linux CI |
+| L2 伪 `wsl.exe` | 脚本模拟 `-l -q` / `-e test` / `-e env` / `-e sh -lc 'command -v icode'` / 启动与日志输出 / 隧道 preamble；验证解析、看护超时、exit 99、复用、停止兜底、隧道二进制管道 | Linux CI |
+| L3 真机 | Windows + WSL2 清单：零网络首次打开、连续两次打开同发行版（复用）、UNC 与远程比较、停止后重开、VSIX 离线安装、内网 Open VSX 切换、`localhostForwarding=false` 下隧道打通、大文件保存、20 次重连无泄漏、诊断输出 | 发布前人工 |
 | L4 构建 | 载荷内嵌、`picketTag` 一致、白名单、体积阈值 | CI |
 
 真机清单并入 `docs/testing.md` 的六层矩阵。
@@ -221,18 +256,31 @@ src/log.js          OutputChannel + 文件
 ## 7. 里程碑
 
 - **M1 载荷与 resolver**：`payload.js` + `launch.js` + `resolver.js`（含运行时文件复用）+ L1/L2 测试；Windows 上手动打开 `/home/<user>`。
-- **M2 UX 与 iCode**：8 条命令、诊断、UNC 提示、iCode 检测与注入、错误文案逐条落地。
+- **M2 UX 与 iCode**：8 条命令、诊断、UNC 提示、iCode 检测与注入、`preflight.js`（含 `.wslconfig` 检测与"需隧道"提示）、错误文案逐条落地。
 - **M3 市场三模式**：补丁 66 + 选择来源命令 + VSIX 安装 + 载荷可选预置扩展。
-- **M4 打包与验收**：`picketTag` 盖章、载荷内嵌进安装包与 `check-contract`、真机清单、文档增补（`docs/wsl-icode.md` 加"A′ 落地版"）。
+- **M4 打包、隧道与验收**：`picketTag` 盖章、载荷内嵌与 `check-contract`、`tunnel.js`（`auto` 切换，可选交付）、真机清单、文档增补（`docs/wsl-icode.md` 加"A′ 落地版"）。
 
 ## 8. 留给实现者的决定
 
 - 设置项键名与默认值（`picket.wsl.*` 之下）。
 - 标记文件与运行时文件的字段、日志文件位置与轮转。
+- 隧道 preamble 的魔数格式与超时。
+- 隧道监听端口的分配策略（`0` 还是固定段）。
 - 诊断报告的具体格式。
 - 状态栏是否自建条目（当前判断：不需要）。
-- `runtime/<distro>.json` 的并发写入策略（建议：写临时文件后 rename）。
+- `runtime/<distro>.json` 的并发写入策略（建议：临时文件 + rename，配合 `O_EXCL` 首启锁）。
 
 ## 9. 合规与来源
 
 实现依据仅限：我们自己的 server 契约（`serverEnvironmentService.ts`、`--help`）、VS Code 开源侧契约（`vscode.proposed.resolvers.d.ts`、`extHostExtensionService.ts`）、公开文档、以及对官方扩展**可观察行为**的认知。不复制其代码、文案、图标、命令 id；不记录或使用 vsda 相关的逆向细节。`spikes/picket-remote-wsl/` 为一次性参考实现，逐块复核后才可提升，不做整体搬移。
+
+## 10. 决策记录（背景与代价）
+
+| 决策 | 背景 | 代价 / 边界 |
+|---|---|---|
+| 盖 `picketTag` | 握手比的是 commit，两端天然一致；但载荷文件名用的是发布 tag，`version` 是裸 `1.143.1`，运行时无锚点 | 构建多一步；换来出厂前就能比对"盖章 tag 与内嵌载荷名" |
+| 运行时文件复用 | 每次 resolve 都起 server；多窗口/重载会共享 `--user-data-dir`，SQLite 与 agent 历史有争用风险 | 不支持 `localhostForwarding=false`（由 §4.5 补）；需处理同 tag 判等与首启锁 |
+| 90 s 无输出判失败 | 三类失败中只有"起来但不打日志"需要看护；固定总超时会误杀冷启动 | 需在超时消息里附最后 40 行输出与日志路径 |
+| 不做退出即杀 | 重载窗口、重启客户端不掉历史 | 需显式停止命令；按运行时文件的 pid 清理 |
+| iCode 缺失不阻塞 | 编辑器/终端/搜索仍可用，AI 单独报错 | 用户可能不知道 AI 没启用，靠一次性提示与诊断 |
+| stdio 隧道作为 auto 兜底 | 直连依赖 WSL localhost 中继；企业环境可能关闭 | ~250 行，80% 是流边界与进程生命周期；每连接一个进程 |
