@@ -9,10 +9,10 @@ index 00000000..96fab092
 +tsconfig.json
 diff --git a/extensions/picket-remote-wsl/extension.js b/extensions/picket-remote-wsl/extension.js
 new file mode 100644
-index 00000000..9c235613
+index 00000000..9b8b5954
 --- /dev/null
 +++ b/extensions/picket-remote-wsl/extension.js
-@@ -0,0 +1,173 @@
+@@ -0,0 +1,175 @@
 +'use strict';
 +
 +const { join } = require('node:path');
@@ -51,7 +51,9 @@ index 00000000..9c235613
 +		get startTimeoutSeconds() { return config().get('startTimeoutSeconds', 90); }
 +	};
 +
-+	const runner = createWslRunner();
++	// Acceptance runs a stand-in `wsl.exe` (test/wsl-harness/fake-wsl.mjs);
++	// production keeps the default PATH lookup.
++	const runner = createWslRunner(process.env.PICKET_WSL_RUNNER ? { wslPath: process.env.PICKET_WSL_RUNNER } : undefined);
 +
 +	/**
 +	 * One factory for both the resolver and the command layer: `explicitPath` is
@@ -1448,10 +1450,10 @@ index 00000000..8e1ceee8
 +module.exports = { buildDiagnostics };
 diff --git a/extensions/picket-remote-wsl/src/distro.js b/extensions/picket-remote-wsl/src/distro.js
 new file mode 100644
-index 00000000..5d068b16
+index 00000000..4b793ee5
 --- /dev/null
 +++ b/extensions/picket-remote-wsl/src/distro.js
-@@ -0,0 +1,224 @@
+@@ -0,0 +1,228 @@
 +'use strict';
 +
 +const { spawn: spawnChild } = require('node:child_process');
@@ -1503,6 +1505,10 @@ index 00000000..5d068b16
 +			const timeoutMs = opts.timeoutMs ?? defaultTimeout;
 +			return new Promise((resolve, reject) => {
 +				const child = spawn(wslPath, args, { cwd: options.cwd, windowsHide: true });
++				// A distro side that dies before consuming the input makes the queued
++				// writes fail with EPIPE; the exit code and stderr carry the real
++				// failure, so the write error itself must not become an unhandled event.
++				child.stdin?.on('error', () => { });
 +				/** @type {Buffer[]} */
 +				const out = [];
 +				/** @type {Buffer[]} */
@@ -1722,7 +1728,7 @@ index 00000000..cf40b908
 +module.exports = { detectIcode };
 diff --git a/extensions/picket-remote-wsl/src/launch.js b/extensions/picket-remote-wsl/src/launch.js
 new file mode 100644
-index 00000000..efe2caac
+index 00000000..c1edc950
 --- /dev/null
 +++ b/extensions/picket-remote-wsl/src/launch.js
 @@ -0,0 +1,352 @@
@@ -1892,7 +1898,7 @@ index 00000000..efe2caac
 + * @returns {Promise<boolean>} true when this caller owns the lock
 + */
 +async function acquireLock(runner, distro, runtimeFile) {
-+	const taken = await runner.exec(['-d', distro, '-e', 'sh', '-c', 'mkdir "$1" 2>/dev/null', 'sh', `${runtimeFile}.lock`]);
++	const taken = await runner.exec(['-d', distro, '-e', 'sh', '-c', 'mkdir -p "$(dirname "$1")" && mkdir "$1" 2>/dev/null', 'sh', `${runtimeFile}.lock`]);
 +	return taken.code === 0;
 +}
 +
@@ -2559,10 +2565,10 @@ index 00000000..5a909a32
 +module.exports = { unpackOfflineBundle, removeBundle, parseSha256Sums, defaultExpand };
 diff --git a/extensions/picket-remote-wsl/src/payload.js b/extensions/picket-remote-wsl/src/payload.js
 new file mode 100644
-index 00000000..62602222
+index 00000000..68811aba
 --- /dev/null
 +++ b/extensions/picket-remote-wsl/src/payload.js
-@@ -0,0 +1,157 @@
+@@ -0,0 +1,163 @@
 +'use strict';
 +
 +const { createHash, randomBytes } = require('node:crypto');
@@ -2710,7 +2716,13 @@ index 00000000..62602222
 +		throw new Error(`Could not prepare ${payloadRoot} in ${distro}: ${prepare.stderr}`);
 +	}
 +	const unpack = await runner.exec(
-+		['-d', distro, '-e', 'sh', '-c', 'rm -rf "$2" && tar -xzf - -C "$1" && mv "$1" "$2"', 'sh', tmpDir, finalDir],
++		['-d', distro, '-e', 'sh', '-c',
++			// Release archives wrap everything in one top-level directory (packaged
++			// from the parent); Task 12 bundles are flat. Unwrap when there is
++			// exactly one entry and it is a directory.
++			'rm -rf "$1" "$2" && mkdir -p "$1" && tar -xzf - -C "$1" || exit 1; ' +
++			'if [ "$(ls -1A "$1" | wc -l)" = 1 ] && [ -d "$1/$(ls -1A "$1")" ]; then mv "$1/$(ls -1A "$1")" "$2"; else mv "$1" "$2"; fi; rm -rf "$1"',
++			'sh', tmpDir, finalDir],
 +		{ input: bytes }
 +	);
 +	if (unpack.code !== 0) {
@@ -4220,10 +4232,10 @@ index 00000000..7db16f1d
 +});
 diff --git a/extensions/picket-remote-wsl/test/distro.test.js b/extensions/picket-remote-wsl/test/distro.test.js
 new file mode 100644
-index 00000000..99a9dc23
+index 00000000..7d568b2c
 --- /dev/null
 +++ b/extensions/picket-remote-wsl/test/distro.test.js
-@@ -0,0 +1,83 @@
+@@ -0,0 +1,98 @@
 +// RED first: this file must fail until src/distro.js exists.
 +const test = require('node:test');
 +const assert = require('node:assert');
@@ -4306,6 +4318,21 @@ index 00000000..99a9dc23
 +		() => runner.exec(['--hang'], { timeoutMs: 200 }),
 +		/Timed out after 200 ms/
 +	);
++});
++
++test('input survives a child that closes stdin before consuming it', { skip: process.platform !== 'linux' }, async () => {
++	// When the distro side dies early, the queued stdin writes fail with EPIPE.
++	// The exit code and stderr carry the real failure, so the write error must
++	// not surface as an unhandled event in the extension host.
++	const { spawn } = require('node:child_process');
++	const runner = createWslRunner({
++		wslPath: '/bin/sh',
++		spawn: (wslPath, args) => spawn(wslPath, ['-c', 'exec "$@"', '--', ...args.slice(3)])
++	});
++	const result = await runner.exec(['-d', 'X', '-e', 'sh', '-c', 'exec 0<&-; sleep 0.3', 'sh'], {
++		input: Buffer.alloc(256 * 1024, 7)
++	});
++	assert.strictEqual(result.code, 0);
 +});
 diff --git a/extensions/picket-remote-wsl/test/fixtures/fake-host.js b/extensions/picket-remote-wsl/test/fixtures/fake-host.js
 new file mode 100644
@@ -4612,10 +4639,10 @@ index 00000000..5e31eaaa
 +});
 diff --git a/extensions/picket-remote-wsl/test/launch.test.js b/extensions/picket-remote-wsl/test/launch.test.js
 new file mode 100644
-index 00000000..9c28c453
+index 00000000..cbc73059
 --- /dev/null
 +++ b/extensions/picket-remote-wsl/test/launch.test.js
-@@ -0,0 +1,139 @@
+@@ -0,0 +1,160 @@
 +// RED first: this file must fail until src/launch.js exists.
 +const test = require('node:test');
 +const assert = require('node:assert');
@@ -4739,12 +4766,33 @@ index 00000000..9c28c453
 +	const file = '/home/u/.picket-code-server/runtime/Ubuntu.json';
 +	assert.strictEqual(await acquireLock(runner, 'Ubuntu', file), true);
 +	await releaseLock(runner, 'Ubuntu', file);
-+	assert.deepStrictEqual(calls, ['sh -c mkdir "$1" 2>/dev/null', 'sh -c rmdir "$1" 2>/dev/null || rm -rf "$1"']);
++	assert.deepStrictEqual(calls, ['sh -c mkdir -p "$(dirname "$1")" && mkdir "$1" 2>/dev/null', 'sh -c rmdir "$1" 2>/dev/null || rm -rf "$1"']);
 +});
 +
 +test('a lock another window holds reports false', async () => {
 +	const runner = { exec: async () => ({ code: 1, stdout: '', stderr: 'mkdir: cannot create directory' }), spawn: () => { throw new Error('not used'); } };
 +	assert.strictEqual(await acquireLock(runner, 'Ubuntu', '/home/u/.picket-code-server/runtime/Ubuntu.json'), false);
++});
++
++test('acquireLock creates the runtime parent on a fresh home (real shell)', { skip: process.platform !== 'linux' }, async () => {
++	// A first-ever start has no runtime/ directory yet; the mkdir must create it
++	// or the lock is mistaken for "another window is starting" and the resolver
++	// waits out its whole timeout (acceptance --remote, 2026-11-04).
++	const { mkdtempSync } = require('node:fs');
++	const { tmpdir } = require('node:os');
++	const { join } = require('node:path');
++	const { spawn } = require('node:child_process');
++	const { createWslRunner } = require('../src/distro.js');
++
++	const home = mkdtempSync(join(tmpdir(), 'picket-wsl-lock-'));
++	const file = join(home, '.picket-code-server', 'runtime', 'Ubuntu.json');
++	// `wsl.exe -d <distro> -e <cmd...>` runs <cmd...>; map it onto the local shell.
++	const runner = createWslRunner({ wslPath: '/bin/sh', spawn: (wslPath, args) => spawn(wslPath, ['-c', 'exec "$@"', '--', ...args.slice(3)]) });
++
++	assert.strictEqual(await acquireLock(runner, 'Ubuntu', file), true, 'fresh home must be lockable');
++	assert.strictEqual(await acquireLock(runner, 'Ubuntu', file), false, 'a held lock must not be re-taken');
++	await releaseLock(runner, 'Ubuntu', file);
++	assert.strictEqual(await acquireLock(runner, 'Ubuntu', file), true, 'released lock must be re-taken');
 +});
 +
 +test('the lock age turns stat seconds into milliseconds', async () => {
@@ -5192,10 +5240,10 @@ index 00000000..55696e9f
 +});
 diff --git a/extensions/picket-remote-wsl/test/payload.test.js b/extensions/picket-remote-wsl/test/payload.test.js
 new file mode 100644
-index 00000000..93dac3fe
+index 00000000..bc92a70e
 --- /dev/null
 +++ b/extensions/picket-remote-wsl/test/payload.test.js
-@@ -0,0 +1,57 @@
+@@ -0,0 +1,112 @@
 +// RED first: this file must fail until src/payload.js exists.
 +const test = require('node:test');
 +const assert = require('node:assert');
@@ -5252,6 +5300,61 @@ index 00000000..93dac3fe
 +	assert.match(calls[0].args.join(' '), /mkdir -p/);
 +	assert.ok(calls[1].hasInput, 'tar receives the archive on stdin');
 +	assert.deepStrictEqual(readdirSync(dir), ['ok.tar.gz']);
++});
++
++test('a real shell extracts a flat archive through stdin', { skip: process.platform !== 'linux' }, async () => {
++	// The fake runner above cannot see inside the scripts; run them for real so a
++	// missing `mkdir` before `tar -C` fails here instead of in a live window
++	// (acceptance --remote, 2026-11-04: tar -C .tmp-… with no such directory).
++	const { mkdirSync, statSync, existsSync } = require('node:fs');
++	const { execFileSync, spawn } = require('node:child_process');
++	const { sha256OfFile } = require('../src/payload.js');
++	const { createWslRunner } = require('../src/distro.js');
++
++	const dir = mkdtempSync(join(tmpdir(), 'picket-payload-real-'));
++	mkdirSync(join(dir, 'bin'), { recursive: true });
++	writeFileSync(join(dir, 'bin', 'picket-code-server'), '#!/bin/sh\nexec out/server-main.js\n');
++	writeFileSync(join(dir, 'product.json'), '{}\n');
++	const file = join(dir, 'payload.tar.gz');
++	execFileSync('tar', ['-czf', file, '-C', dir, 'bin', 'product.json']);
++	const component = { ...COMPONENT, file: 'payload.tar.gz', size: statSync(file).size, sha256: await sha256OfFile(file) };
++
++	const home = mkdtempSync(join(tmpdir(), 'picket-payload-home-'));
++	const payloadRoot = join(home, '.picket-code-server', 'payloads');
++	// `wsl.exe -d <distro> -e <cmd...>` runs <cmd...>; map it onto the local shell.
++	const runner = createWslRunner({ wslPath: '/bin/sh', spawn: (wslPath, args) => spawn(wslPath, ['-c', 'exec "$@"', '--', ...args.slice(3)]) });
++
++	const result = await installPayload({ runner, distro: 'X', component, source: { kind: 'file', path: file }, payloadRoot });
++	assert.strictEqual(result.payloadDir, join(payloadRoot, `server-${component.version}`));
++	assert.ok(existsSync(join(result.payloadDir, 'bin', 'picket-code-server')), 'the binary lands in the final directory');
++	assert.deepStrictEqual(readdirSync(payloadRoot).filter(name => name.startsWith('.tmp-')), [], 'no temp directory survives');
++});
++
++test('a real shell unwraps an archive with a single top-level directory', { skip: process.platform !== 'linux' }, async () => {
++	// Release artifacts are packaged from the parent directory, so the archive
++	// root is one wrapping folder; a flat Task 12 bundle must keep working too.
++	const { mkdirSync, statSync, existsSync } = require('node:fs');
++	const { execFileSync, spawn } = require('node:child_process');
++	const { sha256OfFile } = require('../src/payload.js');
++	const { createWslRunner } = require('../src/distro.js');
++
++	const dir = mkdtempSync(join(tmpdir(), 'picket-payload-wrap-'));
++	const inner = join(dir, 'picket-code-server-linux-x64');
++	mkdirSync(join(inner, 'bin'), { recursive: true });
++	writeFileSync(join(inner, 'bin', 'picket-code-server'), '#!/bin/sh\nexec "$ROOT/node" out/server-main.js\n');
++	writeFileSync(join(inner, 'product.json'), '{}\n');
++	const file = join(dir, 'payload.tar.gz');
++	execFileSync('tar', ['-czf', file, '-C', dir, 'picket-code-server-linux-x64']);
++	const component = { ...COMPONENT, file: 'payload.tar.gz', size: statSync(file).size, sha256: await sha256OfFile(file) };
++
++	const home = mkdtempSync(join(tmpdir(), 'picket-payload-home2-'));
++	const payloadRoot = join(home, '.picket-code-server', 'payloads');
++	const runner = createWslRunner({ wslPath: '/bin/sh', spawn: (wslPath, args) => spawn(wslPath, ['-c', 'exec "$@"', '--', ...args.slice(3)]) });
++
++	const result = await installPayload({ runner, distro: 'X', component, source: { kind: 'file', path: file }, payloadRoot });
++	assert.strictEqual(result.payloadDir, join(payloadRoot, `server-${component.version}`));
++	assert.ok(existsSync(join(result.payloadDir, 'bin', 'picket-code-server')), 'the wrapper directory is stripped');
++	assert.deepStrictEqual(readdirSync(result.payloadDir).sort(), ['bin', 'product.json'], 'no nesting inside the final directory');
 +});
 diff --git a/extensions/picket-remote-wsl/test/preflight.test.js b/extensions/picket-remote-wsl/test/preflight.test.js
 new file mode 100644
@@ -6255,3 +6358,524 @@ index 00000000..22ff350c
 +		await closed(echo);
 +	}
 +});
+diff --git a/test/automation/src/code.ts b/test/automation/src/code.ts
+index 4c0d9bda..8ff230a3 100644
+--- a/test/automation/src/code.ts
++++ b/test/automation/src/code.ts
+@@ -31,6 +31,11 @@ export interface LaunchOptions {
+ 	useInMemorySecretStorage?: boolean;
+ 	readonly extraArgs?: string[];
+ 	readonly remote?: boolean;
++	/**
++	 * Authority used when `remote` is set. Defaults to `test+test` (the test
++	 * resolver); the WSL area targets `picket-wsl+<distro>`.
++	 */
++	readonly remoteAuthority?: string;
+ 	readonly web?: boolean;
+ 	readonly tracing?: boolean;
+ 	snapshots?: boolean;
+diff --git a/test/automation/src/electron.ts b/test/automation/src/electron.ts
+index dda7cb2f..81de7cac 100644
+--- a/test/automation/src/electron.ts
++++ b/test/automation/src/electron.ts
+@@ -60,8 +60,10 @@ export async function resolveElectronConfiguration(options: LaunchOptions): Prom
+ 		if (!workspacePath) {
+ 			throw new Error('Workspace path is required when running remote');
+ 		}
+-		// Replace workspace path with URI
+-		args[0] = `--${workspacePath.endsWith('.code-workspace') ? 'file' : 'folder'}-uri=vscode-remote://test+test/${URI.file(workspacePath).path}`;
++		// Replace workspace path with URI. The authority defaults to the
++		// test resolver's; the WSL smoke area targets `picket-wsl+<distro>`.
++		const remoteAuthority = options.remoteAuthority ?? 'test+test';
++		args[0] = `--${workspacePath.endsWith('.code-workspace') ? 'file' : 'folder'}-uri=vscode-remote://${remoteAuthority}/${URI.file(workspacePath).path}`;
+ 
+ 		if (codePath) {
+ 			if (!extensionsPath) {
+diff --git a/test/smoke/src/areas/wsl/remote.test.ts b/test/smoke/src/areas/wsl/remote.test.ts
+new file mode 100644
+index 00000000..5124e975
+--- /dev/null
++++ b/test/smoke/src/areas/wsl/remote.test.ts
+@@ -0,0 +1,165 @@
++/*---------------------------------------------------------------------------------------------
++ *  Copyright (c) Microsoft Corporation. All rights reserved.
++ *  Licensed under the MIT License. See License.txt in the project root for license information.
++ *--------------------------------------------------------------------------------------------*/
++
++import * as fs from 'fs';
++import * as os from 'os';
++import * as path from 'path';
++import { Application, ApplicationOptions, Logger } from '../../../../automation';
++import { createApp, installAppAfterHandler, installDiagnosticsHandler, suiteCrashPath, suiteLogsPath } from '../../utils';
++
++/**
++ * Layer 4 (UI smoke) coverage for the WSL remote window, driven through the
++ * stand-in `wsl.exe` (`test/wsl-harness/fake-wsl.mjs`) and the real server
++ * payload (see `docs/wsl-verification.md` and `build/wsl/acceptance.sh`).
++ *
++ * The suite is opt-in via environment so the shared smoke matrix is unaffected:
++ * acceptance.sh exports PICKET_WSL_DISTRO / PICKET_WSL_FAKE_HOME /
++ * PICKET_WSL_RUNNER; without them the suite skips before launching Electron.
++ * Behaviour inside the remote extension host (folder identity, login shell,
++ * watcher, 10 MB round trip) lives in the harness extension
++ * (`test/wsl-harness/remote/`); this area asserts what only the UI can see:
++ * the `WSL 目标` view, the distro node from a real listing, and a title bar
++ * branded `WSL` instead of the raw authority.
++ *
++ * Suite title carries a lowercase `wsl` token on purpose: the smoke runner maps
++ * `-f` onto mocha's `grep` (case-sensitive, full nested title), so
++ * `node test/index.js -f wsl` selects exactly this suite.
++ */
++
++// `out/areas/wsl/remote.test.js` → the picket-code repository root.
++const REPO_ROOT = path.resolve(__dirname, '..', '..', '..', '..', '..', '..');
++const DOWNLOAD_DIR = path.join(REPO_ROOT, 'build', 'wsl', 'download');
++
++const DISTRO = process.env.PICKET_WSL_DISTRO ?? '';
++const FAKE_HOME = process.env.PICKET_WSL_FAKE_HOME ?? '';
++const FAKE_WSL = process.env.PICKET_WSL_RUNNER ?? '';
++const ACCEPT_HOME = process.env.PICKET_WSL_ACCEPT_HOME ?? path.join(os.tmpdir(), 'picket-wsl-smoke');
++const FOLDER = path.join(FAKE_HOME, '我的 项目');
++
++function findPayloadTarball(): string | undefined {
++	try {
++		return fs.readdirSync(DOWNLOAD_DIR)
++			.filter(name => /^picket-code-server-.+-linux-x64\.tar\.gz$/.test(name))
++			.map(name => path.join(DOWNLOAD_DIR, name))[0];
++	} catch {
++		return undefined;
++	}
++}
++
++/**
++ * The dev workbench scans `extensions/` and loads the in-tree extension with
++ * the placeholder (empty) catalog. Loading a staged copy with the real catalog
++ * through `--extensionDevelopmentPath` shadows it, which is also how the
++ * release acceptance run works.
++ */
++function stageExtensionWithRealCatalog(): string | undefined {
++	const tarball = findPayloadTarball();
++	const catalog = path.join(DOWNLOAD_DIR, 'catalog.json');
++	if (!tarball || !fs.existsSync(catalog)) {
++		return undefined;
++	}
++	const staging = path.join(ACCEPT_HOME, 'ext');
++	fs.rmSync(staging, { recursive: true, force: true });
++	fs.cpSync(path.join(REPO_ROOT, 'vscode', 'extensions', 'picket-remote-wsl'), staging, { recursive: true });
++	fs.copyFileSync(catalog, path.join(staging, 'payloads', 'catalog.json'));
++	// The 目标 view is declared `when: isWindows`; this suite drives the
++	// stand-in wsl.exe on Linux, where an empty Remote Explorer container would
++	// hide itself and leave nothing to assert. Drop the gate on the copy only.
++	const manifestFile = path.join(staging, 'package.json');
++	const manifest = JSON.parse(fs.readFileSync(manifestFile, 'utf8'));
++	delete manifest.contributes.views.remote[0].when;
++	fs.writeFileSync(manifestFile, JSON.stringify(manifest, null, '\t') + '\n');
++	return staging;
++}
++
++export function setup(logger: Logger): void {
++
++	let staging: string | undefined;
++
++	describe('WSL remote window (wsl)', () => {
++
++		before(function () {
++			if (process.platform !== 'linux') {
++				logger.log('Skipping WSL area: the stand-in wsl.exe path is exercised on Linux; Windows acceptance runs the manual checklist (docs/wsl-verification.md).');
++				this.skip();
++			}
++			if (!DISTRO || !FAKE_HOME || !FAKE_WSL) {
++				logger.log('Skipping WSL area: PICKET_WSL_DISTRO / PICKET_WSL_FAKE_HOME / PICKET_WSL_RUNNER are not set (run build/wsl/acceptance.sh).');
++				this.skip();
++			}
++			staging = stageExtensionWithRealCatalog();
++			if (!staging) {
++				logger.log(`Skipping WSL area: payload tarball or catalog.json not found under ${DOWNLOAD_DIR} (run build/wsl/fetch-payload.sh).`);
++				this.skip();
++			}
++			fs.mkdirSync(FOLDER, { recursive: true });
++		});
++
++		installDiagnosticsHandler(logger);
++
++		before(async function () {
++			this.timeout(5 * 60 * 1000); // resolver: payload install + server start + connect
++			const suiteName = this.test?.parent?.title ?? 'unknown';
++			const defaultOptions: ApplicationOptions = {
++				...this.defaultOptions,
++				logsPath: suiteLogsPath(this.defaultOptions, suiteName),
++				crashesPath: suiteCrashPath(this.defaultOptions, suiteName),
++			};
++
++			this.app = createApp(defaultOptions, opts => ({
++				...opts,
++				remote: true,
++				remoteAuthority: `picket-wsl+${DISTRO}`,
++				// The folder the authority points at must exist in the distro
++				// before the window opens (the folder dialog flow is manual).
++				workspacePath: FOLDER,
++				extensionDevelopmentPath: staging,
++				// Isolated user data dir: the settings seeded below must not leak
++				// into the shared smoke profile other suites run against.
++				userDataDir: fs.mkdtempSync(path.join(os.tmpdir(), 'vscode-wsl-smoke-')),
++				extraEnv: {
++					...(opts.extraEnv ?? {}),
++					PICKET_WSL_RUNNER: FAKE_WSL,
++					PICKET_WSL_FAKE_HOME: FAKE_HOME,
++				},
++			}));
++
++			// The payload source must come from the verified tarball trio; the
++			// dev catalog copy in the staged extension only carries the tag.
++			const userDataDir = (this.app as Application).userDataPath;
++			const tarball = findPayloadTarball();
++			if (userDataDir && tarball) {
++				fs.mkdirSync(path.join(userDataDir, 'User'), { recursive: true });
++				fs.writeFileSync(path.join(userDataDir, 'User', 'settings.json'), JSON.stringify({
++					'picket.wsl.serverPayloadPath': tarball,
++					'picket.wsl.icodePath': '',
++				}, null, 2));
++			}
++
++			await (this.app as Application).start();
++		});
++
++		installAppAfterHandler();
++
++		it('renders the WSL targets view with the distro from a real listing (A5, B1)', async function () {
++			const app = this.app as Application;
++
++			// `workbench.view.remote` is a view container id, not a command, so
++			// open the container the way a user does: click its activity bar icon.
++			await app.code.waitAndClick('.activitybar .action-label[aria-label^="Remote Explorer"]');
++			await app.code.waitForElements('.monaco-pane-view .pane-header .title', true,
++				elements => elements.some(element => (element.textContent ?? '').includes('WSL 目标')));
++			await app.code.waitForElements('.monaco-list-row .monaco-tl-contents', true,
++				elements => elements.some(element => (element.textContent ?? '').includes(DISTRO)));
++		});
++
++		it('brands the window title as WSL, not the raw authority (A6)', async function () {
++			const app = this.app as Application;
++
++			await app.code.waitForTitle(title =>
++				/WSL/.test(title) && !title.includes('picket-wsl+'));
++		});
++	});
++}
+diff --git a/test/smoke/src/main.ts b/test/smoke/src/main.ts
+index 02bee7c0..fb0c381a 100644
+--- a/test/smoke/src/main.ts
++++ b/test/smoke/src/main.ts
+@@ -36,6 +36,7 @@ import { setup as setupChatModelConfigTests } from './areas/chat/chatModelConfig
+ import { setup as setupAccessibilityTests } from './areas/accessibility/accessibility.test';
+ import { setup as setupAgentsWindowTests } from './areas/agentsWindow/agentsWindow.test';
+ import { setup as setupIcodeTests } from './areas/agentsWindow/icode.test';
++import { setup as setupWslTests } from './areas/wsl/remote.test';
+ import { setup as setupBrowserViewTests } from './areas/browserView/browserView.test';
+ import { setup as setupPolicyTests } from './areas/policy/policy.test';
+ 
+@@ -473,6 +474,9 @@ const smokeTestSuite = describe(`VSCode Smoke Tests (${opts.web ? 'Web' : 'Elect
+ 	// account or mock LLM server — only desktop Electron (the fake CLI is
+ 	// spawned directly, which Windows cannot do; the suite skips itself there).
+ 	if (!opts.web && !opts.remote) { setupIcodeTests(logger); }
++	// The WSL area self-skips unless acceptance.sh exports its environment; it
++	// opens its own remote window (remote: true) regardless of opts.remote.
++	setupWslTests(logger);
+ 	if (!opts.web && !opts.remote) { setupBrowserViewTests(logger); }
+ 	// Native policy fixtures modify OS state outside the test profile; opt in only on disposable runners so you don't break your own machine.
+ 	if (!opts.web && !opts.remote && process.env.VSCODE_SMOKE_TEST_POLICY === '1') { setupPolicyTests(logger); }
+diff --git a/test/wsl-harness/fake-wsl.mjs b/test/wsl-harness/fake-wsl.mjs
+new file mode 100755
+index 00000000..38cf0575
+--- /dev/null
++++ b/test/wsl-harness/fake-wsl.mjs
+@@ -0,0 +1,99 @@
++#!/usr/bin/env node
++// Stand-in `wsl.exe` for the Linux acceptance runs (plan Task 14). It executes
++// the extension's distro-side invocations as plain local commands against a
++// scratch HOME (PICKET_FAKE_HOME), so the whole resolver pipeline — distro
++// listing, payload install through stdin, login-shell server launch, runtime
++// file, probe, kill ladder — runs end to end on a Linux desktop. Only the
++// wsl.exe boundary is faked; the server payload, its node and every `sh`
++// script are the real thing.
++//
++// The distro-side children are spawned detached: on real Windows the server
++// outlives the wsl.exe relay and the window, and the lifecycle acceptance
++// relies on the same shape here (a process-group kill of the window must not
++// take the server down).
++import { spawn } from 'node:child_process';
++
++const args = process.argv.slice(2);
++const home = process.env.PICKET_WSL_FAKE_HOME;
++
++if (!home) {
++	console.error('fake-wsl: PICKET_WSL_FAKE_HOME is not set');
++	process.exit(1);
++}
++
++// decodeWslOutput sniffs for NUL bytes: UTF-8 without NULs decodes fine.
++if (args[0] === '--list' && args[1] === '--verbose') {
++	const distro = process.env.PICKET_WSL_DISTRO ?? 'PicketAccept';
++	process.stdout.write(`  ${distro}  Running 2\n`);
++	process.exit(0);
++}
++if (args[0] === '--status') {
++	process.stdout.write('Default Distribution: PicketAccept\nDefault Version: 2\n');
++	process.exit(0);
++}
++if (args[0] === '--list' && args[1] === '--online') {
++	process.stdout.write('NAME            DESCRIPTION\n');
++	process.exit(0);
++}
++if (args[0] === '--set-default' || args[0] === '--unregister' || args[0] === '--install') {
++	process.exit(0);
++}
++
++if (args[0] === '-d' && args[2] === '-e') {
++	const cmd = args.slice(3);
++
++	// Real wsl.exe forwards only the env vars listed in WSLENV. Wholesale
++	// inheritance leaks the calling window's environment (VSCODE_DEV=1) into
++	// the distro and changes server behavior, so build the child env the way
++	// wsl.exe does: HOME points at the fake home, PATH carries over, and only
++	// WSLENV entries join in (`/w` entries never leave Windows).
++	const passthrough = (process.env.WSLENV ?? '').split(':').filter(Boolean).map(entry => {
++		const [name, flags = ''] = entry.split('/');
++		return { name, toWsl: !flags.includes('w') };
++	});
++	const childEnv = { HOME: home, PATH: process.env.PATH ?? '' };
++	for (const { name, toWsl } of passthrough) {
++		if (toWsl && process.env[name] !== undefined) {
++			childEnv[name] = process.env[name];
++		}
++	}
++
++	// The product deliberately asks wslpath instead of guessing the mapping
++	// (remoteUri.js); the fake distro's filesystem is the host's, so a POSIX
++	// path is an identity and only drive-letter inputs need /mnt translation.
++	if (cmd[0] === 'wslpath') {
++		const flag = cmd[1];
++		const value = cmd[2] ?? '';
++		let out = value;
++		if (flag === '-u') {
++			const drive = /^([A-Za-z]):[\\/](.*)$/.exec(value);
++			if (drive) {
++				out = `/mnt/${drive[1].toLowerCase()}/${drive[2].replaceAll('\\', '/')}`;
++			}
++		} else if (flag === '-w') {
++			const mnt = /^\/mnt\/([a-z])\/(.*)$/.exec(value);
++			if (mnt) {
++				out = `${mnt[1].toUpperCase()}:\\${mnt[2].replaceAll('/', '\\')}`;
++			}
++		}
++		process.stdout.write(`${out}\n`);
++		process.exit(0);
++	}
++
++	const child = spawn(cmd[0], cmd.slice(1), {
++		cwd: home,
++		env: childEnv,
++		detached: true,
++		stdio: ['pipe', 'inherit', 'inherit']
++	});
++	process.stdin.pipe(child.stdin);
++	child.stdin.on('error', () => { /* tar died early; its exit code reports the failure */ });
++	child.on('error', error => {
++		console.error(`fake-wsl: ${cmd[0]}: ${error.message}`);
++		process.exit(127);
++	});
++	child.on('exit', code => process.exit(code ?? 1));
++} else {
++	console.error(`fake-wsl: unsupported args ${JSON.stringify(args)}`);
++	process.exit(1);
++}
+diff --git a/test/wsl-harness/remote/extension.js b/test/wsl-harness/remote/extension.js
+new file mode 100644
+index 00000000..aea74f52
+--- /dev/null
++++ b/test/wsl-harness/remote/extension.js
+@@ -0,0 +1,152 @@
++'use strict';
++
++// Acceptance harness for the WSL remote window (plan Task 14). Loads in the
++// remote extension host of a window opened on `picket-wsl+<distro>` and runs
++// the behaviour assertions the UI layer cannot see:
++//
++//   b2 — the opened workspace folder is the folder the authority pointed at
++//   b3 — the server runs under the login shell (profile marker) and is Linux
++//   b4 — a workspace.fs write produces a watcher event within 2 s
++//   b5 — a 10 MB round trip keeps its sha256
++//   b6 — a bogus configured iCode path is never exported into the server
++//
++// Results go out as `WSL-ASSERT ok|fail <name>` lines (they land in the
++// server console/log) and as a JSON file under `<home>/.picket-code-server/`,
++// which acceptance.sh polls for — the file survives the window and needs no
++// log plumbing.
++
++const { execFile } = require('node:child_process');
++const { createHash, randomBytes } = require('node:crypto');
++const { mkdir, writeFile } = require('node:fs/promises');
++const { homedir } = require('node:os');
++const { join } = require('node:path');
++const { promisify } = require('node:util');
++const vscode = require('vscode');
++
++const execFileP = promisify(execFile);
++const RESULTS_FILE = join(homedir(), '.picket-code-server', 'harness-results.json');
++const MEGABYTE = 1024 * 1024;
++
++async function waitForFolder(deadlineMs) {
++	const started = Date.now();
++	while (Date.now() - started < deadlineMs) {
++		const folder = vscode.workspace.workspaceFolders?.[0];
++		if (folder) {
++			return folder;
++		}
++		await new Promise(resolve => setTimeout(resolve, 250));
++	}
++	return undefined;
++}
++
++async function checkB2() {
++	const expected = process.env.WSL_HARNESS_FOLDER;
++	if (!expected) {
++		return { ok: false, detail: 'WSL_HARNESS_FOLDER is not set' };
++	}
++	const folder = await waitForFolder(10_000);
++	if (!folder) {
++		return { ok: false, detail: 'no workspace folder after 10s' };
++	}
++	const actual = folder.uri.fsPath;
++	if (actual !== expected) {
++		return { ok: false, detail: `opened ${actual}, expected ${expected}` };
++	}
++	return { ok: true };
++}
++
++async function checkB3() {
++	const { stdout } = await execFileP('uname', ['-a']);
++	if (!/Linux/i.test(stdout)) {
++		return { ok: false, detail: `uname -a said ${stdout.trim()}` };
++	}
++	const marker = process.env.PICKET_ACCEPT_PROFILE_MARKER;
++	if (marker !== 'from-login-shell') {
++		return { ok: false, detail: `login-shell profile marker not exported (got ${JSON.stringify(marker)})` };
++	}
++	return { ok: true };
++}
++
++async function checkB4(folder) {
++	const name = `.harness-b4-${randomBytes(4).toString('hex')}`;
++	const target = vscode.Uri.joinPath(folder.uri, name);
++	const watcher = vscode.workspace.createFileSystemWatcher(
++		new vscode.RelativePattern(folder, '.harness-b4-*'));
++	try {
++		const event = new Promise((resolve, reject) => {
++			const timer = setTimeout(() => reject(new Error('no watcher event within 2s')), 2_000);
++			watcher.onDidCreate(() => { clearTimeout(timer); resolve(); });
++		});
++		await vscode.workspace.fs.writeFile(target, Buffer.from('b4'));
++		await event;
++		return { ok: true };
++	} catch (error) {
++		return { ok: false, detail: error.message };
++	} finally {
++		watcher.dispose();
++		await vscode.workspace.fs.delete(target, { force: true }).catch(() => { });
++	}
++}
++
++async function sha256(bytes) {
++	return createHash('sha256').update(bytes).digest('hex');
++}
++
++async function checkB5(folder) {
++	const target = vscode.Uri.joinPath(folder.uri, 'harness-b5.bin');
++	const payload = randomBytes(10 * MEGABYTE);
++	const sent = await sha256(payload);
++	try {
++		await vscode.workspace.fs.writeFile(target, payload);
++		const echoed = await vscode.workspace.fs.readFile(target);
++		const returned = await sha256(echoed);
++		if (returned !== sent) {
++			return { ok: false, detail: `sha256 mismatch after round trip` };
++		}
++		return { ok: true };
++	} finally {
++		await vscode.workspace.fs.delete(target, { force: true }).catch(() => { });
++	}
++}
++
++async function checkB6() {
++	if (process.env.WSL_HARNESS_EXPECT_ICODE_MISSING !== '1') {
++		return undefined;
++	}
++	const exported = process.env.PICKET_ICODE_BIN;
++	if (exported === '/nonexistent/icode') {
++		return { ok: false, detail: 'the bogus configured icodePath was exported into the server' };
++	}
++	return { ok: true, detail: `PICKET_ICODE_BIN=${exported ?? '<unset>'} (bogus path not exported)` };
++}
++
++async function main() {
++	const results = {};
++	try {
++		const folder = await waitForFolder(10_000);
++		results.b2 = await checkB2();
++		results.b3 = await checkB3();
++		if (folder) {
++			results.b4 = await checkB4(folder);
++			results.b5 = await checkB5(folder);
++		} else {
++			results.b4 = { ok: false, detail: 'skipped: no workspace folder' };
++			results.b5 = { ok: false, detail: 'skipped: no workspace folder' };
++		}
++		const b6 = await checkB6();
++		if (b6) {
++			results.icode = b6;
++		}
++	} catch (error) {
++		results.harness = { ok: false, detail: error.message };
++	}
++
++	for (const [name, check] of Object.entries(results)) {
++		console.log(`WSL-ASSERT ${check.ok ? 'ok' : 'fail'} ${name}${check.detail ? `: ${check.detail}` : ''}`);
++	}
++	await mkdir(join(RESULTS_FILE, '..'), { recursive: true });
++	await writeFile(RESULTS_FILE, JSON.stringify(results, null, 2)).catch(() => { });
++}
++
++exports.activate = main;
++exports.deactivate = undefined;
+diff --git a/test/wsl-harness/remote/package.json b/test/wsl-harness/remote/package.json
+new file mode 100644
+index 00000000..f316d150
+--- /dev/null
++++ b/test/wsl-harness/remote/package.json
+@@ -0,0 +1,26 @@
++{
++	"name": "picket-wsl-harness",
++	"displayName": "Picket WSL Acceptance Harness",
++	"description": "Runs the B2-B5 behaviour assertions inside the remote extension host during WSL acceptance runs. Never shipped.",
++	"version": "0.0.0",
++	"publisher": "picket",
++	"private": true,
++	"engines": {
++		"vscode": "^1.143.0"
++	},
++	"categories": [
++		"Other"
++	],
++	"main": "./extension.js",
++	"extensionKind": [
++		"workspace"
++	],
++	"activationEvents": [
++		"onStartupFinished"
++	],
++	"capabilities": {
++		"untrustedWorkspaces": {
++			"supported": true
++		}
++	}
++}
