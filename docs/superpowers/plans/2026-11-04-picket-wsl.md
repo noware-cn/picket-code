@@ -1203,7 +1203,7 @@ One entry per milestone, committed with the code so a reviewer can see what was 
 
 ### M1 — payload install, resolver, iCode detection (Tasks 1–7): complete
 
-**State:** `node --test "test/*.test.js"` → 71 pass (catalog 4, distro 9, payload 5, components 7, launch 10, probe 5, remoteUri 7, resolver 10, icode 5, preflight 9); `tsc -p extensions/picket-remote-wsl/tsconfig.json` (checkJs) clean; `npm run transpile-client` rc=0; `bash build/wsl/gate.sh` 4/4 PASS; patch 67 = 18 files, reverse-applies.
+**State:** `node --test "test/*.test.js"` → 79 pass (catalog 4, distro 9, payload 5, components 7, launch 13, probe 5, remoteUri 7, resolver 15, icode 5, preflight 9); `tsc -p extensions/picket-remote-wsl/tsconfig.json` (checkJs) clean; `npm run transpile-client` rc=0; `bash build/wsl/gate.sh` 4/4 PASS; patch 67 = 26 files, reverse-applies.
 
 **Decisions taken during M1 (each also in the SDD ledger):**
 1. `runtime/<distro>.json`, not one `runtime.json` — two distros that mount the same home must not overwrite each other's port and token. Data and extensions directories stay shared, as the spec says.
@@ -1215,5 +1215,6 @@ One entry per milestone, committed with the code so a reviewer can see what was 
 7. `serverPaths`/`runtimeFileFor` and `buildServerArgs` remain the only composers of in-distro paths and argv; every value reaching a shell is an argv entry.
 8. `startServer` takes `extra` and merges it into the runtime record, so Task 7 can store `tunnelMode` and the iCode source without a second write.
 9. The extension's settings are getters over `workspace.getConfiguration`; `embeddedDir` is offered only when `catalog.flavor === 'embedded'`.
+10. The first-start lock is created for real (`mkdir <runtimeFile>.lock`), held across install-and-start, released in `finally`, and the runtime record is re-written before the release so a waiting window can read it. A lock older than one start window is taken over, because a crash would otherwise wedge that distro for the rest of the session.
 
 **Not verified in M1, deferred with owners:** the end-to-end `picket-wsl+<distro>` open (needs Task 8's command; no Windows host in the build environment), the real `wsl.exe` UTF-16 table and `wslpath` (Task 14/L3 on a Windows runner), and the embedded payload's presence in a real build (Task 12).
