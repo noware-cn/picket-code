@@ -82,7 +82,7 @@
 
 ---
 
-### Task 1: Extension skeleton, catalog contract, and patch baseline
+### Task 1: Extension skeleton, catalog contract, and patch baseline ✅
 
 **Files:**
 - Create: `vscode/extensions/picket-remote-wsl/package.json`
@@ -196,7 +196,7 @@ Expected: commit succeeds, the patch reverses cleanly (exit 0). Add `67-picket-r
 
 ---
 
-### Task 2: `wsl.exe` runner, output decoding, distro discovery
+### Task 2: `wsl.exe` runner, output decoding, distro discovery ✅
 
 **Files:**
 - Create: `vscode/extensions/picket-remote-wsl/src/distro.js`
@@ -306,7 +306,7 @@ git add build/patches/67-picket-remote-wsl.patch && git commit -m "chore(wsl): r
 
 ---
 
-### Task 3: Payload sources, checksums, atomic install into the distro
+### Task 3: Payload sources, checksums, atomic install into the distro ✅
 
 **Files:**
 - Create: `vscode/extensions/picket-remote-wsl/src/payload.js`
@@ -408,7 +408,7 @@ git add build/patches/67-picket-remote-wsl.patch && git commit -m "chore(wsl): r
 
 ---
 
-### Task 4: Component manager (state machine, uninstall, cleanup)
+### Task 4: Component manager (state machine, uninstall, cleanup) ✅
 
 **Files:**
 - Create: `vscode/extensions/picket-remote-wsl/src/components.js`
@@ -515,7 +515,7 @@ git add build/patches/67-picket-remote-wsl.patch && git commit -m "chore(wsl): r
 
 ---
 
-### Task 5: Launch, port parsing, watchdog, runtime file, stop
+### Task 5: Launch, port parsing, watchdog, runtime file, stop ✅
 
 **Files:**
 - Create: `vscode/extensions/picket-remote-wsl/src/launch.js`
@@ -612,7 +612,7 @@ git add build/patches/67-picket-remote-wsl.patch && git commit -m "chore(wsl): r
 
 ---
 
-### Task 6: Resolver, remote URIs, activation
+### Task 6: Resolver, remote URIs, activation ✅
 
 **Files:**
 - Create: `vscode/extensions/picket-remote-wsl/src/resolver.js`
@@ -681,7 +681,7 @@ Milestone M1 gate: opening `picket-wsl+<distro>` by hand (`Ctrl+Shift+P` → `Re
 
 ---
 
-### Task 7: iCode detection and tunnel-mode preflight
+### Task 7: iCode detection and tunnel-mode preflight ✅
 
 **Files:**
 - Create: `vscode/extensions/picket-remote-wsl/src/icode.js`
@@ -741,7 +741,7 @@ git add build/patches/67-picket-remote-wsl.patch && git commit -m "chore(wsl): r
 
 ---
 
-### Task 8: Commands, `WSL Targets` view, distro management, first-use interception, diagnostics, nudge
+### Task 8: Commands, `WSL Targets` view, distro management, first-use interception, diagnostics, nudge ✅
 
 **Files:**
 - Create: `vscode/extensions/picket-remote-wsl/src/commands.js`
@@ -842,7 +842,7 @@ Expected: PASS — every suite under `test/` green.
 
 ---
 
-### Task 9: A gallery that needs no account, and a disabled gallery (patch 66)
+### Task 9: A gallery that needs no account, and a disabled gallery (patch 66) ✅
 
 **Files:**
 - Modify: `vscode/src/vs/platform/extensionManagement/common/extensionGalleryManifest.ts`
@@ -913,7 +913,7 @@ Insert `66-gallery-no-account.patch` into `build/patches/apply-list.txt` **befor
 
 ---
 
-### Task 10: Gallery-source and VSIX commands
+### Task 10: Gallery-source and VSIX commands ✅
 
 **Files:**
 - Create: `vscode/extensions/picket-remote-wsl/src/marketplace.js`
@@ -965,7 +965,7 @@ Commit as in Task 7 with message `feat(wsl): extension gallery source and offlin
 Milestone M3 gate: record the three modes, the reload prompt and the VSIX install in the ledger with the observed UI or, where the host cannot show it, the named owner in Task 14.
 
 ---
-### Task 11: stdio tunnel and `auto` wiring
+### Task 11: stdio tunnel and `auto` wiring ✅
 
 **Files:**
 - Create: `vscode/extensions/picket-remote-wsl/src/tunnel.js`
@@ -1053,83 +1053,76 @@ Deviations (ledger R-13): `removeShim` has no tag; the upgrade check is a `start
 
 ---
 
-### Task 14: Automated acceptance — remote-window UI, in-process behaviour, scripts
+### Task 14: Automated acceptance — remote-window UI, in-process behaviour, scripts ✅
 
-**Files:**
-- Create: `vscode/test/wsl-harness/package.json`, `vscode/test/wsl-harness/extension.js` (acceptance extension, never shipped)
-- Create: `vscode/test/smoke/src/areas/wsl/remote.test.ts`
-- Modify: `vscode/test/automation/src/electron.ts` (authority override for the remote launch)
-- Create: `build/wsl/acceptance.sh`
-- Create: `docs/wsl-verification.md`
+Implemented in vscode commits `55e358a2` (three product defects this task found) and `f8ebff08` (seam, harness, smoke); main-repo commit `801ca4f`. Patch 67 re-exported at **53 files / 6881 lines**: the acceptance tree under `vscode/test/` belongs to the feature and ships in the same patch, so a clean 1.143.1 tree reproduces the green run. Reverse-check OK, `bash build/wsl/gate.sh` **6/6 PASS**.
 
-**Interfaces:**
-- Consumes: Tasks 2–13; on Linux the in-tree `vscode-reh-linux-x64/` payload, on Windows a real distro.
-- Produces: `build/wsl/acceptance.sh` with `--l2`, `--remote`, `--ui`, `--lifecycle`, `--icode`, `--all`; each check prints `PASS <name>` or `FAIL <name>: <detail>`, and the script exits non-zero if any failed.
-- Produces (harness): `WSL-ASSERT ok <name>` / `WSL-ASSERT fail <name>: <detail>` lines from inside the remote extension host, covering B2 (opened path equals `/home/<user>/我的 项目`), B3 (`uname -a` contains `Linux`, `node -v` equals the login-shell value), B4 (a `workspace.fs` write produces a watcher event within 2 s), B5 (10 MB round-trip, sha256 equal).
+**Files (actual):**
+- Create: `vscode/test/wsl-harness/fake-wsl.mjs` (99 lines) — the stand-in `wsl.exe`
+- Create: `vscode/test/wsl-harness/remote/{package.json,extension.js}` (152 lines) — assertions that only the remote extension host can make
+- Create: `vscode/test/smoke/src/areas/wsl/remote.test.ts` (165 lines) — A5/A6
+- Modify: `vscode/test/smoke/src/main.ts` (register the area), `vscode/test/automation/src/code.ts` (`getElements`), `vscode/test/automation/src/electron.ts` (`remoteAuthority`)
+- Modify: `vscode/extensions/picket-remote-wsl/extension.js` — the `PICKET_WSL_RUNNER` seam
+- Create: `build/wsl/acceptance.sh` (264 lines), `build/wsl/test/fake-wsl-env.test.mjs`
+- Create: `docs/wsl-verification.md` — the four human checks
 
-- [ ] **Step 1: Write the failing acceptance first**
+**Interfaces (as implemented):**
+- `bash build/wsl/acceptance.sh [--l2|--remote|--ui|--lifecycle|--icode|--all]`; every check prints `PASS <name>` / `FAIL <name>: <detail>` and a failing run exits non-zero. `--all` runs l2 → remote → ui → icode → lifecycle and is the one command CI and the release checklist call.
+- **The seam.** The extension spawns `process.env.PICKET_WSL_RUNNER` instead of `wsl.exe` when it is set. Only the `wsl.exe` boundary is faked: the payload tarball, its bundled node, every `sh` script, the login-shell launch, the probe and the kill ladder are the real ones. `fake-wsl.mjs` executes distro-side invocations as plain local commands against `PICKET_WSL_FAKE_HOME`, and spawns them **detached** — on Windows the server outlives the relay and the window, and `--lifecycle` depends on that same shape here.
+- **Results channel (deviation from the plan's "parse stdout").** The remote harness prints `WSL-ASSERT ok|fail <name>` into the server console *and* writes a JSON summary to `<home>/.picket-code-server/harness-results.json`; `acceptance.sh` polls the file. A file survives the window dying and needs no log plumbing, which is what made the stage flake-free.
+- Checks: b2 opened folder equals `/home/<user>/我的 项目` (space and CJK in one name); b3 `uname -a` contains `Linux` and `PICKET_ACCEPT_PROFILE_MARKER === 'from-login-shell'` exported by `~/.profile`; b4 a `workspace.fs` write raises a watcher event within 2 s; b5 10 MB round trip with equal sha256; b6 only when `WSL_HARNESS_EXPECT_ICODE_MISSING=1`, `PICKET_ICODE_BIN !== '/nonexistent/icode'`. Fixtures reach the distro through `WSLENV`.
+- A5 clicks the activity-bar `Remote Explorer` item and asserts the `WSL 目标` view lists the distro from the real `--list --verbose` parse; A6 asserts the window title ends with `WSL`, not the raw authority. Both skip when `PICKET_WSL_DISTRO` is unset, so the shared CI matrix is unaffected.
 
-Nothing launches the harness yet, so the first run must fail loudly rather than pass vacuously.
+- [x] **Step 1–2: RED** — `bash build/wsl/acceptance.sh --all` fails on every stage before any plumbing exists (`FAIL remote`, `FAIL ui`, `FAIL lifecycle`). The first wired run then failed for six honest reasons, each fixed with the failing stage as the test (see R-14.1–R-14.6).
 
-```bash
-bash build/wsl/acceptance.sh --all   # expect FAIL remote / FAIL ui / FAIL lifecycle
-```
+- [x] **Step 3–4: GREEN (Linux stand-in, 2026-11-04)**
 
-- [ ] **Step 2: Run to verify it fails**
+| Stage | Result |
+| --- | --- |
+| `--l2` | 16/16 `build/wsl/test` cases pass (incl. the fake's env contract) |
+| `--remote` | PASS b2, b3, b4, b5, remote |
+| `--ui` | PASS A5, A6 — smoke runner log shows `renders the WSL targets view with the distro from a real listing (A5, B1)` 759 ms and `brands the window title as WSL, not the raw authority (A6)` |
+| `--lifecycle` | PASS 2 rounds, then PASS 20 rounds (default): one server pid throughout, exactly one at the end |
+| `--icode` | PASS — bogus `picket.wsl.icodePath` never exported |
+| `--all` | PASS everything, exit 0 |
 
-Expected: `FAIL remote: harness not wired`, `FAIL ui: area wsl/remote not found`, `FAIL lifecycle: no runtime.json tool`, exit 1.
+- [x] **Step 5: the four-item checklist, commit and gate** — `docs/wsl-verification.md` holds exactly the four checks the plan listed (native folder dialog, a real `picket-code .`, one look at the layout, a 15-minute pass at M4), each with the command that sets the scene so the person only looks. Committed as `test(wsl): automated acceptance harness for the WSL remote window` (vscode) + `test(wsl): one-command acceptance run for the WSL remote window` (main repo); gate 6/6.
 
-- [ ] **Step 3: Implement the three plumbing pieces**
-
-`electron.ts` gains `options.remoteAuthority` (default `'test+test'`) so the existing `remote: true` path can target `picket-wsl+<distro>`; the smoke area reads `PICKET_WSL_DISTRO` and skips cleanly when it is unset, so the shared CI matrix is unaffected. The Playwright area asserts A5 (`viewlet` contains `WSL 目标`), A6 (title bar ends with `WSL`, not the raw authority) and B1 (clicking the distro node; the dialog's default path is asserted through the harness command, never the native dialog). `acceptance.sh --remote` launches the dev workbench with `--extensionDevelopmentPath` at the harness and a `--folder-uri`, waits for the `WSL-ASSERT` lines, then kills the window. `--lifecycle` opens and closes the window 20 times and asserts one server process; `--icode` points `PICKET_ICODE_BIN` at a missing path and asserts the diagnostics output.
-
-- [ ] **Step 4: Run to verify it passes**
-
-Run: `bash build/wsl/acceptance.sh --remote --ui --lifecycle --icode`
-Expected: PASS for all four on Linux; on Windows the same command with `PICKET_WSL_DISTRO` set. CI keeps running only `--l2` until a Windows runner with a working WSL2 distro is proven.
-
-- [ ] **Step 5: Write the four-item manual checklist, commit and gate**
-
-`docs/wsl-verification.md` records exactly four human checks, each with the command that sets the scene so the person only looks:
-
-1. **The native folder dialog** — the only unreachable one: `showOpenDialog` is an OS window outside the renderer and its return value has no observable API. Look where it opens (must be `/home/<user>`, not `C:\Users\…`) and select a folder whose name contains a space; cancelling is enough if the default path is right.
-2. **A real `picket-code .`** — the shim's logic is covered by L2 argv assertions, but only the real Windows client proves upstream `server.cli.ts` honours `VSCODE_CLIENT_COMMAND` + `VSCODE_CLI_AUTHORITY`. One command, close the window.
-3. **One look at the layout** — automation asserts strings, not that the icon looks native, the title is not truncated, or the empty state is not a blank panel.
-4. **A 15-minute end-to-end pass at M4** — automation checks the inputs it was told about; nobody asserted "does a reload keep my editor", "does dropping a folder work", "do two windows interfere".
-
-Then commit as in Task 7 with message `test(wsl): automated acceptance harness and the four-item manual checklist` and run `bash build/wsl/gate.sh`.
+**Deviations and defects found (ledger R-14):**
+1. **Restricted mode silently drops the harness** (the root cause of a three-hour hunt). `getExtensionUntrustedWorkspaceSupportType` (`extensionManifestPropertiesService.ts:196-229`) returns `false` for any extension that has a `main` and does not declare `capabilities.untrustedWorkspaces`; the enablement filter then removes it (`abstractExtensionService.ts:533` → `filterEnabledExtensions`, which logs only when `isCI`). A freshly opened folder is restricted, so the harness never activated and every assertion hung. Fix: declare `"capabilities": { "untrustedWorkspaces": { "supported": true } }`. The remote scanner had listed it all along.
+2. `workbench.view.remote` is `VIEWLET_ID` (`remoteExplorer.ts:42`), not a command — `quickaccess.runCommand` on it can only say "No matching commands". A5 clicks `.activitybar .action-label[aria-label^="Remote Explorer"]`.
+3. The view is contributed with `when: isWindows && !isWeb`, so on the Linux stand-in the container is empty and `hideIfEmpty` hides it. Acceptance **stages a copy** of the extension with that clause removed — in `acceptance.sh prepare` and again in `remote.test.ts`'s `stageExtensionWithRealCatalog()`. A5 therefore proves "given a listing, the view renders", not the Windows-only gating.
+4. `server_pids` matches `out/server-main.js … --user-data-dir=<scratch>`: `bin/picket-code-server` is an sh wrapper that *runs* node (no `exec`), so a wrapper-shaped pattern counts two processes for one server.
+5. pgrep patterns must not start with `-` (pgrep reads it as its own option and prints usage) and must not contain the script's own command-line text, or the script kills itself.
+6. `prepare` deletes only what it owns (`home`, `user-data`, `ext`, `logs`), so `--all` stages can run back to back without erasing each other's logs.
+7. `watcher.onCreate` is not API — `onDidCreate`.
+8. `--ui` needs `mkdir -p "$SCRATCH/logs"` before the smoke run, and `code.ts` needed a `getElements(selector, true)` accessor to read element attributes.
+9. The harness must be **installed** into the scratch `--extensions-dir` (`<home>/.picket-code-server/extensions/picket.picket-wsl-harness-0.0.0`), because the server scans that directory; `--extensionDevelopmentPath` only reaches the local window.
+10. `build/wsl/test/fake-wsl-env.test.mjs` pins the fake's environment contract (`PICKET_WSL_FAKE_HOME`, `PICKET_WSL_DISTRO`, `WSLENV`); its first URL resolved one directory too shallow.
+11. Three product fixes fell out of the green run: the distro probe swallowed EPIPE on a child that exits immediately; the start lock created its parent directory first; the payload installer extracts into a sibling temp directory and strips one wrapping top-level directory.
 
 ---
 
-### Task 15: User documentation and release notes
+### Task 15: User documentation and release notes ✅
 
-**Files:**
-- Create: `docs/wsl.md`
-- Modify: `docs/roadmap.md` (mark the WSL item as shipping)
-- Modify: `website/docs/guide/wsl.md`
-- Modify: `docs/release-checklist.md`
+Committed as `docs(wsl): user guide, manual checklist and release matrix entry` (main repo `324b3c6`).
 
-**Interfaces:**
-- Consumes: the behavior implemented in Tasks 1–14; no new code.
+**Files (actual):**
+- Create: `docs/wsl.md` (136 lines)
+- Create: `docs/wsl-verification.md` (Task 14)
+- Modify: `docs/roadmap.md` (two places: the feature list and the "already shipped" section)
+- Modify: `docs/release-checklist.md` (platform matrix row)
+- Modify: `website/docs/guide/wsl.md` (marked as the old method)
 
-- [ ] **Step 1: Write `docs/wsl.md`**
+- [x] **Step 1: `docs/wsl.md`** — 前提; 快速上手; 组件三大来源（`serverPayloadPath` / 内置载荷 / `serverPayloadBaseUrl`）与 SHA256 失败; 发行版管理; 登录 shell 与 `server-env-setup`; iCode 检测与 `PICKET_ICODE_BIN`; WSL 里的 `picket-code` 命令; 扩展市场三种模式; 排障（`startTimeoutSeconds`、退出码 99、`tunnelMode`、CA）; 磁盘布局; 停止与清理; 已知限制; 相关文档。Every command, setting and default in it was read out of `extensions/picket-remote-wsl/package.json`, not from memory.
 
-Sections, in this order: 前提（Windows 10/11 + WSL2）; 打开 WSL 文件夹（`WSL 目标` 视图、命令、发行版选择、记住默认、从资源管理器选文件夹时的 `wslpath` 转换）; 发行版管理（添加/设为默认/删除）; WSL 里的 `picket-code` 命令（shim、`~/.local/bin`、interop 关闭时的提示）; 登录 shell 与 `server-env-setup`（`nvm`/`conda` 的 PATH、内网代理与 CA）; 组件从哪来（三条来源、两种形态、离线组件包、SHA256 校验失败怎么办）; iCode 在 WSL 里（检测顺序、`PICKET_ICODE_BIN`、未找到时的提示）; 扩展市场三种模式（默认 Open VSX / 内网自建 / 关闭，以及"从 VSIX 安装"）; 连接方式与排障（`tunnelMode`、`.wslconfig` 两行、`Picket: 诊断 WSL 支持`）; 磁盘布局（`~/.picket-code-server/*`）；停止与清理（`Picket: Stop WSL Server`、`组件…` 里的清理旧版本）; 已知限制（WSL1/ARM64/Alpine/嵌套远程、不做退出即杀、树里没有"最近文件夹"、`picketTag` 与客户端不一致会握手失败）。
+- [x] **Step 2: the three existing docs** — `docs/roadmap.md`: the WSL bullet now says the capability is built in (own `picket-code-server` payload + `noware.picket-remote-wsl`) and links `docs/wsl.md`; the "not done" list keeps SSH and says WSL is done. `website/docs/guide/wsl.md`: title became `在 WSL 中使用（旧方法，已不再需要）` with a `::: tip` pointing at the new page; the body is kept because users on older releases still need it — and the VitePress sidebar already linked `/guide/wsl`, so no nav change was needed. `docs/release-checklist.md`: `Windows x64 + WSL2（远程窗口）` added to the platform matrix, automation = `build/wsl/acceptance.sh --all` + A5/A6, manual = the four items in `docs/wsl-verification.md`.
 
-- [ ] **Step 2: Update the three existing docs**
+- [x] **Step 3: links verified** — every relative link in `docs/wsl.md` and the replaced bullets resolves (`docs/testing.md`, `docs/release-checklist.md`, `docs/branching.md`, `docs/wsl-verification.md`).
 
-`docs/roadmap.md`: replace the WSL bullet's "侧载官方扩展" wording with the built-in extension and link `docs/wsl.md`. `website/docs/guide/wsl.md`: keep the manual-sideload section as "旧方法（不再需要）" with a pointer to the new page; do not delete it, users on older releases still need it. `docs/release-checklist.md`: add a checkbox "L3 WSL 清单全过（见 `docs/testing.md`，含端口转发、登录 shell 环境、`picket-code .`、树视图与 `wslpath` 五项）".
+**Deviation from the plan's wording (R-15.1):** the plan asked the release checklist to name "L3 WSL 清单五项（端口转发、登录 shell 环境、`picket-code .`、树视图与 `wslpath`）". The landed checklist points at `docs/wsl-verification.md`'s four items plus `acceptance.sh --all` instead: port forwarding, login-shell env, tree view and `wslpath` are now automated (b3, A5, fake-wsl paths), and duplicating them as manual steps would invite a ticked box that never ran.
 
-- [ ] **Step 3: Verify links resolve**
-
-Run: `rg -n "docs/wsl.md|wsl-icode.md" docs website | head -40` and open each reference to confirm the target exists and the anchor names match.
-
-- [ ] **Step 4: Commit**
-
-```bash
-git add docs/wsl.md docs/roadmap.md website/docs/guide/wsl.md docs/release-checklist.md
-git commit -m "docs(wsl): user guide, roadmap and release checklist for built-in WSL support"
-```
+**Known UX blemish documented, not patched (R-15.2):** `selectGallery` can show two restart prompts in a row, because upstream raises its own modal per changed setting (M3 note 10). `docs/wsl.md` tells the user to accept the first one.
 
 ---
 
@@ -1203,3 +1196,19 @@ One entry per milestone, committed with the code so a reviewer can see what was 
 10. `gate.sh` reverse-checks only patches 66 and 67, the two this branch authors. Patches 53 and 58 cannot be reversed on their own (one deletes, one overlaps), so listing `apply-list.txt` wholesale would produce false failures.
 
 **Known UX blemish, not patched:** upstream's `onDidChangeConfiguration` handler raises its own modal restart prompt per key, so one `selectGallery` run can show two dialogs in a row. Suppressing it would mean patching behaviour unrelated to this feature; it goes in Task 15's notes instead.
+
+### M4 — stdio tunnel, packaging, CLI shim, acceptance, docs (Tasks 11–15): complete
+
+**State (2026-11-04, final run of this branch):** `node --test "test/*.test.js"` in `extensions/picket-remote-wsl` → **159 pass / 0 fail** (15 suites); `node --test "build/wsl/test/*.test.mjs"` → **16 pass / 0 fail**; `tsc -p extensions/picket-remote-wsl/tsconfig.json` (checkJs, no emit) clean; `npm run transpile-client` rc=0; `bash build/check-contract.sh` → all ok; `bash build/wsl/acceptance.sh --all` → PASS l2 / remote (b2–b6) / ui (A5, A6) / lifecycle (20) / icode, exit 0; `bash build/wsl/gate.sh` → **6 passed, 0 failed**. Patch 66 = 232 lines, patch 67 = 53 files / 6881 lines, both reverse-apply onto `vscode/` at `wsl-baseline`.
+
+**Commits:** vscode `8156133f` (tunnel) → `b2473741` (packaging) → `581ff108` (shim) → `55e358a2` (fixes found by acceptance) → `f8ebff08` (acceptance harness); main repo `66f0899` → `9b372f5` → `a880571` → `801ca4f` → `324b3c6`.
+
+**Decisions taken during M4 (each also in the SDD ledger):**
+1. The tunnel preamble is a magic line plus a windowed length-prefixed frame, not HTTP CONNECT: the relay is our own `wsl.exe` child, so a handshake we control is cheaper to test with a fake than a protocol upgrade.
+2. `tunnelMode: auto` reads `%USERPROFILE%\.wslconfig` and only falls back to `stdio` when the file says `localhostForwarding=false` or `networkingMode=mirrored`; reading the file beats probing ports, and a wrong probe looks exactly like a slow server.
+3. The offline bundle is the same tarball the embedded flavor carries, plus `SHA256SUMS` and `catalog.json` — one artifact to test, three ways to deliver it.
+4. The CLI shim writes a script under `~/.picket-code-server/bin/<tag>/` and a link in `~/.local/bin`, so an upgrade rewrites a file we own and never touches a foreign link (R-13).
+5. Acceptance drives the **real** dev workbench for A5/A6 and the real server for b2–b6; only `wsl.exe` is faked. Anything asserted with a mock would have missed every one of R-14.1–R-14.6.
+6. The four human checks are the ones with no observable API (native dialog, real Windows client, visual layout, a human end-to-end pass). Everything else that used to be on that list is now a stage in `acceptance.sh`.
+
+**Not verified on this machine, deferred with owners:** the Windows-side manual pass (`docs/wsl-verification.md`, all four items), a real `wsl.exe` UTF-16 table and `wslpath`, real Windows `SIGTERM`→`SIGKILL` on a distro-side server, the embedded-payload and offline-bundle shapes in a signed build (asserted structurally by `build/check-contract.sh` and Task 12's packaging tests), and the Windows runner path in CI (only `--l2` runs on the current runners).
