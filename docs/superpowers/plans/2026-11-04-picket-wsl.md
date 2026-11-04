@@ -70,7 +70,7 @@
 
 **In the main repo (`picket-code`):**
 
-- `build/patches/66-product-overrides-merge.patch`, `build/patches/67-picket-remote-wsl.patch` + `build/patches/apply-list.txt`.
+- `build/patches/66-gallery-no-account.patch`, `build/patches/67-picket-remote-wsl.patch` + `build/patches/apply-list.txt`.
 - `build/product.json` — API proposal entry.
 - `build/wsl/assemble.mjs` — stamp `picketTag`, build `catalog.json`, embed payload (both flavors).
 - `build/wsl/check.mjs` — L4 assertions for one built app directory.
@@ -762,7 +762,7 @@ git add build/patches/67-picket-remote-wsl.patch && git commit -m "chore(wsl): r
 - Produces (tree.js): `buildDistroNodes(list: IDistro[], ctx: { activeDistro?: string }): IDistroNode[]` where `IDistroNode = { id, distro, label, description, contextValue: 'activeDistro' | 'inactiveDistro', tooltip }` — `label` is `<name>（WSL 1|2）`, `description` carries `default distro` and `Connected`/`Not Connected`, the default distro sorts first.
 - Produces (manage.js): `manageDistro({ host, runner, action, distro }): Promise<void>` for `action: 'add' | 'setDefault' | 'delete'`; `add` parses `wsl.exe --list --online` and hands the chosen name to a terminal command, `setDefault` runs `-e`-free `['--set-default', distro]`, `delete` requires a modal confirmation and then runs `['--unregister', distro]`. `parseOnlineTable(stdout)` is exported for the parser test.
 - Produces: `ensureComponentInteractive({ distro, home }): Promise<boolean>` — the first-use interception; returns `false` when the user cancels. It reaches the component manager through `createComponents({ distro, home, explicitPath? })`: the third field is how a file the user picked reaches the installer **without** writing `picket.wsl.serverPayloadPath`, so the resolver's factory signature gains the same optional field.
-- Produces: `buildDiagnostics({ runner, components, settings, catalog, appRoot, overridesFile?, readWslConfig? }): Promise<string>` — a copyable multi-line report; `components` is the same factory the resolver uses, called with the primary distro.
+- Produces: `buildDiagnostics({ runner, components, settings, catalog, appRoot, gallery?, readWslConfig? }): Promise<string>` — a copyable multi-line report; `components` is the same factory the resolver uses, called with the primary distro.
 - Produces (nudge.js): `maybeNudge({ host, memento, folders, openFolderInWsl? }): Promise<boolean>` — one warning per install, keyed by `picket.wsl.nudgedUncFolder` in global state.
 
 - [x] **Step 1: Write the failing tests**
@@ -842,114 +842,129 @@ Expected: PASS — every suite under `test/` green.
 
 ---
 
-### Task 9: Product overrides for the extension gallery (patch 66)
+### Task 9: A gallery that needs no account, and a disabled gallery (patch 66)
 
 **Files:**
-- Create: `vscode/src/vs/base/common/productOverrides.ts`
-- Create: `vscode/src/vs/base/test/common/productOverrides.test.ts`
-- Modify: `vscode/src/bootstrap-meta.ts`
-- Create: `build/patches/66-product-overrides-merge.patch` (exported)
-- Test: `vscode/src/vs/base/test/common/productOverrides.test.ts`
+- Modify: `vscode/src/vs/platform/extensionManagement/common/extensionGalleryManifest.ts`
+- Modify: `vscode/src/vs/platform/extensionManagement/common/extensionGalleryManifestService.ts`
+- Modify: `vscode/src/vs/workbench/contrib/extensions/browser/extensions.contribution.ts`
+- Modify: `vscode/src/vs/workbench/services/extensionManagement/electron-browser/extensionGalleryManifestService.ts`
+- Modify: `vscode/src/vs/workbench/services/extensionManagement/test/electron-browser/extensionGalleryManifestService.test.ts`
+- Create: `build/patches/66-gallery-no-account.patch` (exported)
 
 **Interfaces:**
-- Produces: `resolveOverridesPath({ platform, env, dataFolderName, argv }): string | null` — `env.PICKET_PRODUCT_OVERRIDES` wins; else `--user-data-dir=<p>` from `argv`; else the platform default (`env.APPDATA` + `/<dataFolderName>` on win32, `~/Library/Application Support/<dataFolderName>` on darwin, `env.XDG_CONFIG_HOME || ~/.config` + `/<dataFolderName>`); `null` when no base directory is available.
-- Produces: `mergeOverrides(product: object, overrides: object): object` — shallow merge, with a top-level `null` value deleting the key (so `{"extensionsGallery": null}` removes the gallery); unknown keys pass through unchanged.
+- Produces (platform): `ExtensionGalleryDisabledServiceUrl = 'none'`, `ExtensionGalleryNoAuthProvider = 'none'`; `ExtensionGalleryConfig` is exported and its optional fields (`itemUrl`, `publisherUrl`, `resourceUrlTemplate`, `extensionUrlTemplate`, `controlUrl`, `nlsBaseUrl`) become optional, matching what `product.json` actually carries.
+- Produces (platform service): `getExtensionGalleryManifest()` keeps its signature and delegates to the new `protected buildExtensionGalleryManifest(config: ExtensionGalleryConfig | undefined): IExtensionGalleryManifest | null`, so a subclass can build a manifest for a gallery the product did not ship.
+- Produces (workbench service): `doGetExtensionGalleryManifest()` order — `serviceUrl === 'none'` → manifest `null`, status `Unavailable`; else `serviceUrl && authProvider === 'none'` → local manifest with `itemUrl` derived by `galleryItemUrl(serviceUrl)`; else `serviceUrl` → upstream account path; else → `super`.
+- Produces (schema): `extensions.gallery.authProvider` gains the enum value `none` ("the marketplace needs no account"), default stays `github` — an unconfigured build behaves exactly like upstream.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
-`test/common/productOverrides.test.ts` — cases: an explicit env path is returned; `--user-data-dir` is honored; win32 default uses `APPDATA`; a `null` value deletes `extensionsGallery`; a missing `extensionsGallery` in overrides leaves the product value untouched.
+Append a section to `src/vs/workbench/services/extensionManagement/test/electron-browser/extensionGalleryManifestService.test.ts`: `authProvider none` + a configured URL yields `Available` with the expected resource ids and **no** HTTP request (`requestHandler` throws if called); a non-Open-VSX-shaped URL yields no `itemName` resources; `serviceUrl 'none'` yields `null` + `Unavailable` with no request; `authProvider none` without a configured URL falls back to the build gallery.
 
 ```ts
-test('a null override deletes the gallery', () => {
-	const merged = mergeOverrides({ extensionsGallery: { serviceUrl: 'https://open-vsx.org/vscode/gallery' }, nameShort: 'Picket Code' },
-		{ extensionsGallery: null });
-	assert.strictEqual('extensionsGallery' in merged, false);
-	assert.strictEqual(merged.nameShort, 'Picket Code');
-});
+test('authProvider none — the configured gallery is used without an account or a request', async () => {
+	configurationService.setUserConfiguration(ExtensionGalleryServiceUrlConfigKey, 'https://openvsx.corp.local/vscode/gallery');
+	configurationService.setUserConfiguration(ExtensionGalleryAuthProviderConfigKey, 'none');
+	requestHandler = () => { throw new Error('a gallery that needs no account must not be probed'); };
 
-test('user data dir on the command line wins over the platform default', () => {
-	assert.strictEqual(resolveOverridesPath({ platform: 'win32', env: { APPDATA: 'C:\\Users\\u\\AppData\\Roaming' }, dataFolderName: '.picket-code', argv: ['--user-data-dir=D:\\portable'] }),
-		'D:\\portable\\product.overrides.json');
+	const service = createService();
+	const manifest = await service.getExtensionGalleryManifest();
+
+	assert.strictEqual(service.extensionGalleryManifestStatus, ExtensionGalleryManifestStatus.Available);
+	assert.deepStrictEqual(resourceIds(manifest), [ /* extensionquery, latest, stats, item, review-details */ ]);
 });
 ```
 
-- [ ] **Step 2: Run the test to verify it fails**
+- [x] **Step 2: Run the test to verify it fails**
 
-Run: `cd vscode && ./scripts/test.sh --run src/vs/base/test/common/productOverrides.test.ts`
-Expected: FAIL — `Cannot find module …/productOverrides`. If the mocha runner cannot start in this environment, record the blocker in the ledger and gate on Step 4's type check instead.
+`cd vscode && npm run transpile-client && ./node_modules/.bin/mocha out/vs/workbench/services/extensionManagement/test/electron-browser/extensionGalleryManifestService.test.js --ui tdd`
+Expected: the four new cases fail (`requiresSignIn`/`Available` mismatches, missing item resources). `./scripts/test.sh` is **not** used here: it wants the Electron build, while `transpile-client` output runs the suite directly under mocha in under a second.
 
-- [ ] **Step 3: Implement both functions and merge them in `bootstrap-meta.ts`**
+- [x] **Step 3: Implement**
 
-In `bootstrap-meta.ts`, after the existing `VSCODE_DEV` override block, add: resolve the path via `resolveOverridesPath`, `require2` it inside `try/catch`, and `Object.assign` → `mergeOverrides` into `productObj`. Dev keeps its existing `../product.overrides.json` behavior and then applies the user-level file on top.
+1. `extensionGalleryManifest.ts`: the two constants, with the reason each exists.
+2. `common/extensionGalleryManifestService.ts`: lift the body of `getExtensionGalleryManifest()` into `protected buildExtensionGalleryManifest(gallery)`; export the config type and make its optional fields optional.
+3. `extensions.contribution.ts`: `enum: ['github', 'microsoft', 'none']` plus the matching `enumDescriptions` entry and the policy `enumDescriptions` entry.
+4. `workbench/.../extensionGalleryManifestService.ts`: the four-way branch above and `galleryItemUrl()` (`/^(.*)\/vscode\/gallery\/?$/` → `${1}/vscode/item`, otherwise `undefined`, so no 404 links).
 
-- [ ] **Step 4: Run the test to verify it passes**
+- [x] **Step 4: Run the test to verify it passes**
 
-Add `"./vs/base/common/productOverrides.ts"` and `"./vs/base/test/common/productOverrides.test.ts"` to the `include` list of the local gate config `src/tsconfig.icode.json` (git-excluded, not part of any patch), then run `cd vscode && ./node_modules/.bin/tsc -p src/tsconfig.icode.json` and `cd vscode && ./scripts/test.sh --run src/vs/base/test/common/productOverrides.test.ts`.
-Expected: the type check reports no error in either new file, and the suite reports 5 passing.
+`cd vscode && npm run transpile-client && ./node_modules/.bin/mocha out/vs/workbench/services/extensionManagement/test/electron-browser/*.test.js out/vs/platform/extensionManagement/test/common/*.test.js --ui tdd`
+Expected: `50 passing` for the manifest suite (46 before + 4 new) and `173 passing` across the neighbouring extension-management suites (no regression).
 
-- [ ] **Step 5: Export patch 66, register it, and commit**
+Type gate: local config `vscode/src/tsconfig.gallery.json` (git-excluded, `files`-narrowing the four touched files + the test) — `cd vscode && ./node_modules/.bin/tsc -p src/tsconfig.gallery.json`. Expected: 0 errors in the touched files; the only output is 6 pre-existing `Timeout`/`TimeoutHandle` mismatches in `base/parts/ipc` and `platform/progress`, the same class of noise `src/tsconfig.icode.json` reports. Runs in 0.65 s / 325 MB, so it does not hit the OOM that the full tree does.
+
+- [x] **Step 5: Export patch 66, register it, and commit**
 
 ```bash
-cd vscode && git add src/bootstrap-meta.ts src/vs/base/common/productOverrides.ts src/vs/base/test/common/productOverrides.test.ts
-git status --short                     # only those three files
-git commit -m "feat(product): merge user-level product.overrides.json in packaged builds"
-git diff wsl-baseline -- src/bootstrap-meta.ts src/vs/base/common/productOverrides.ts src/vs/base/test/common/productOverrides.test.ts > ../build/patches/66-product-overrides-merge.patch
-cd .. && git apply -R --check build/patches/66-product-overrides-merge.patch --directory=vscode
+cd vscode && git add src/vs/platform/extensionManagement/common/extensionGalleryManifest.ts \
+  src/vs/platform/extensionManagement/common/extensionGalleryManifestService.ts \
+  src/vs/workbench/contrib/extensions/browser/extensions.contribution.ts \
+  src/vs/workbench/services/extensionManagement/electron-browser/extensionGalleryManifestService.ts \
+  src/vs/workbench/services/extensionManagement/test/electron-browser/extensionGalleryManifestService.test.ts
+git status --short                     # only those five files
+git commit -m "feat(gallery): a marketplace that needs no account, and one that is off"
+git diff wsl-baseline -- src/vs/platform/extensionManagement src/vs/workbench/contrib/extensions/browser/extensions.contribution.ts src/vs/workbench/services/extensionManagement > ../build/patches/66-gallery-no-account.patch
+cd .. && git apply -R --check build/patches/66-gallery-no-account.patch --directory=vscode
 ```
 
-Insert `66-product-overrides-merge.patch` into `build/patches/apply-list.txt` **before** `67-picket-remote-wsl.patch`, and commit both in the main repo. Then in the extension, `selectGallery` writes `<userDataDir>/product.overrides.json` with `{ "extensionsGallery": { "serviceUrl": …, "itemUrl": … } }`, `null`, or `undefined`, and offers `Reload Window`.
+Insert `66-gallery-no-account.patch` into `build/patches/apply-list.txt` **before** `67-picket-remote-wsl.patch`, and commit both in the main repo.
 
 ---
 
 ### Task 10: Gallery-source and VSIX commands
 
 **Files:**
+- Create: `vscode/extensions/picket-remote-wsl/src/marketplace.js`
 - Modify: `vscode/extensions/picket-remote-wsl/src/commands.js`
-- Modify: `vscode/extensions/picket-remote-wsl/package.json` (command ids already declared in Task 1; titles adjusted if the spec's wording changed)
-- Test: `vscode/extensions/picket-remote-wsl/test/commands.gallery.test.js`
+- Modify: `vscode/extensions/picket-remote-wsl/src/diagnose.js` (the `Gallery:` line reads a settings snapshot instead of an override file)
+- Modify: `vscode/extensions/picket-remote-wsl/extension.js` (the `gallery` settings bridge, `host.executeCommand`; the two commands leave the stub list)
+- Modify: `vscode/extensions/picket-remote-wsl/test/fixtures/fake-host.js` (`showInputBox`, `executeCommand`, `createFakeGalleryConfig`)
+- Test: `vscode/extensions/picket-remote-wsl/test/marketplace.test.js`, `test/diagnose.test.js`, `test/manifest.test.js`
 
 **Interfaces:**
-- Consumes: `host.executeCommand`, `host.showQuickPick`, `host.showInputBox`, `resolveOverridesPath` semantics from Task 9 (re-implemented in JS, same rules — the extension cannot import `src/`).
-- Produces: `writeGalleryOverride({ host, userDataDir, choice, url }): Promise<void>` and `selectGallery({ host, settings, env })` and `installVsix({ host })`.
+- Produces: `describeGallery({ serviceUrl }): { mode: 'default' } | { mode: 'none' } | { mode: 'custom', serviceUrl }`.
+- Produces: `applyGalleryMode({ mode, url, configuration }): Promise<string>` — throws on a non-`http(s)` URL **before** writing anything; `custom` writes `serviceUrl` (trailing slashes stripped) then `authProvider = 'none'`; `none` writes `serviceUrl = 'none'` and deletes `authProvider`; `default` deletes both (so a later build's default can take effect).
+- Produces: `selectGallery({ host, configuration }): Promise<boolean>` and `installVsix({ host }): Promise<boolean>`.
+- Consumes: `configuration` is a two-method bridge — `get(key)` and `update(key, value)` — implemented in `extension.js` over `vscode.workspace.getConfiguration('extensions.gallery')` with `ConfigurationTarget.Global` (the settings are `scope: APPLICATION`).
+- `buildDiagnostics` takes `gallery?: { serviceUrl?: string }` and prints `default (…)` / `custom (…)` / `none (disabled by extension setting)`.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
-Cases: choosing `默认 Open VSX` writes `https://open-vsx.org/vscode/gallery` + `https://open-vsx.org/vscode/item`; choosing `内网 Open VSX` prompts for a URL and rejects a value that does not start with `http`; choosing `关闭` writes `{ "extensionsGallery": null }`; `installVsix` calls `host.executeCommand('workbench.extensions.installExtension', uri)`; every write is followed by a `Reload Window` prompt.
+`test/marketplace.test.js`: mode detection for the three values; `custom` writes both keys with the trailing slash stripped; a non-`http` URL is refused with nothing written; `none` writes the sentinel and clears the provider; `default` clears both keys; the picker → input box → "重新加载" path calls `workbench.action.reloadWindow`; a rejected URL surfaces the reason; cancelling the picker writes nothing; a VSIX pick hands the file to `workbench.extensions.installExtension`; a failed install is reported.
 
 ```js
-test('closing the gallery writes a null override', async () => {
-	const files = fakeFs();
-	await writeGalleryOverride({ userDataDir: 'C:\\u', choice: '关闭', fs: files });
-	assert.deepStrictEqual(JSON.parse(files.last), { extensionsGallery: null });
-});
-
-test('an intranet URL must be http(s)', async () => {
-	await assert.rejects(() => writeGalleryOverride({ userDataDir: 'C:\\u', choice: '内网 Open VSX', url: 'openvsx.corp.local', fs: fakeFs() }), /http/);
+test('a custom gallery is written with the no-account provider', async () => {
+	const configuration = createFakeGalleryConfig();
+	await applyGalleryMode({ mode: 'custom', url: 'https://openvsx.corp.local/vscode/gallery/', configuration });
+	assert.deepStrictEqual(configuration.writes, [
+		['serviceUrl', 'https://openvsx.corp.local/vscode/gallery'],
+		['authProvider', 'none']
+	]);
 });
 ```
 
-- [ ] **Step 2: Run the test to verify it fails**
+- [x] **Step 2: Run the test to verify it fails**
 
-Run: `cd vscode/extensions/picket-remote-wsl && node --test test/commands.gallery.test.js`
-Expected: FAIL — `writeGalleryOverride is not a function`.
+`cd vscode/extensions/picket-remote-wsl && node --test "test/*.test.js"`
+Expected: FAIL — `Cannot find module …/marketplace.js`, plus the two rewritten `Gallery:` cases of `diagnose.test.js` (which still print the bare URL).
 
-- [ ] **Step 3: Implement in `commands.js`**
+- [x] **Step 3: Implement**
 
-`selectGallery` computes `userDataDir` the same way `resolveOverridesPath` does (env `PICKET_PRODUCT_OVERRIDES` → its dirname; `--user-data-dir`; platform default) and writes `product.overrides.json` atomically. `installVsix` uses `host.showOpenDialog({ filters: { VSIX: ['vsix'] } })` then `workbench.extensions.installExtension`, and relays failures with the extension id from the error.
+`marketplace.js` holds the three modes as data plus the two workflows; `commands.js` gains `selectGallery`/`installVsix` (both in the `COMMANDS` table, so the manifest test keeps the two sides honest) and passes `gallery: { serviceUrl: options.gallery.get('serviceUrl') }` into `buildDiagnostics`; `extension.js` supplies `gallery` and `host.executeCommand` and drops the two ids from the stub loop.
 
-- [ ] **Step 4: Run the test to verify it passes**
+- [x] **Step 4: Run the test to verify it passes**
 
-Run: `cd vscode/extensions/picket-remote-wsl && node --test "test/*.test.js"`
-Expected: PASS — every suite under `test/` green.
+`cd vscode/extensions/picket-remote-wsl && node --test "test/*.test.js"` → `131 passing`. Then `cd vscode && ./node_modules/.bin/tsc -p extensions/picket-remote-wsl/tsconfig.json` (rc=0), `npm run transpile-client`, and `bash build/wsl/gate.sh` → 4/4.
 
-- [ ] **Step 5: Manual smoke on Windows, then commit and re-export**
+- [x] **Step 5: Commit and re-export**
 
-Run `Picket: 选择扩展市场来源` → `关闭` → reload → the Extensions view shows no gallery; switch back to Open VSX → reload → search works. Then commit as in Task 7 with message `feat(wsl): extension gallery source and offline VSIX install commands`.
+Commit as in Task 7 with message `feat(wsl): extension gallery source and offline VSIX install commands`, then re-export patch 67 and re-run the gate. The Windows smoke (three modes + reload + VSIX install through the real UI) moves to Task 14/L3: this host has no `wsl.exe`, and the setting writes are pure `settings.json` edits that the unit tests already pin.
 
-Milestone M3 gate: record both gallery modes and the VSIX install in the ledger with the observed UI.
+Milestone M3 gate: record the three modes, the reload prompt and the VSIX install in the ledger with the observed UI or, where the host cannot show it, the named owner in Task 14.
 
 ---
-
 ### Task 11: stdio tunnel and `auto` wiring
 
 **Files:**
@@ -1245,4 +1260,22 @@ One entry per milestone, committed with the code so a reviewer can see what was 
 12. The tree view is `picketWsl.targets` in the `remote` container, no `remoteName` filter (the official extension sets `"wsl"` but that field is marked for deletion upstream); rows carry `contextValue` `activeDistro`/`inactiveDistro` and a click opens that distro's folder picker.
 13. Test files beyond the plan's test list: `test/nudge.test.js` (4) and `test/manifest.test.js` (5).
 
-**Not verified in M2, deferred with owners:** the Windows smoke of this task (tree rows, folder dialog, reorder after `设为默认发行版`) needs a Windows host and moves to Task 14/L3; the `Gallery` line of the diagnostics reads `product.overrides.json` only once Task 10 supplies `overridesFile`, until then it reports the build's own gallery.
+**Not verified in M2, deferred with owners:** the Windows smoke of this task (tree rows, folder dialog, reorder after `设为默认发行版`) needs a Windows host and moves to Task 14/L3; the `Gallery` line of the diagnostics prints the build's own gallery only; Task 10 replaces that with the settings snapshot (`default` / `custom` / `none`).
+
+### M3 — gallery source, no-account marketplace, offline VSIX (Tasks 9–10): complete
+
+**State:** `node --test "test/*.test.js"` → 131 pass (M2's 117 plus marketplace 11, diagnose's 2 replaced by 3 gallery-mode cases); `tsc -p extensions/picket-remote-wsl/tsconfig.json` (checkJs) clean; `npm run transpile-client` rc=0; core `extensionGalleryManifestService.test.js` 50 passing (was 46) and the extension-management suites 173 passing; core type gate `tsc -p src/tsconfig.gallery.json` clean for the four touched files (6 pre-existing `Timeout` complaints in `ipc.net.ts`/`ipc.ts`/`progress.ts` untouched); `bash build/wsl/gate.sh` 5/5 PASS; patches 66 = 232 lines and 67 = 39 files / 5041 lines, both reverse-apply.
+
+**Decisions taken during M3 (each also in the SDD ledger):**
+1. The marketplace override reuses the two settings upstream already ships (`extensions.gallery.serviceUrl`, `extensions.gallery.authProvider`) instead of inventing a `product.overrides.json`. A user-level product file would be a third mechanism pointing against upstream's grain, and `product.ts` reads `product.json` once at startup with no override layer to hook.
+2. "Needs no account" is expressed as a new enum value `authProvider: 'none'`, not as "serviceUrl set but authProvider absent". `TestConfigurationService.inspect()` reports `userValue: value` and so cannot distinguish "not set" from "set to the default"; an explicit enum is also validated by the settings registry, and the default stays `github`, so existing behaviour is unchanged.
+3. A gallery that is switched off is `serviceUrl: 'none'`, not an empty string — `''` is the upstream default meaning "use the product's gallery", and an empty-looking value is exactly the kind of thing a later edit silently drops.
+4. `itemUrl` is derived from `serviceUrl` by the `/vscode/gallery` suffix rule, and left undefined otherwise. Open VSX and every mirror built from it match; a hand-rolled gallery gets no item link, which is better than pointing "view details" at the wrong host.
+5. `ExtensionGalleryConfig` became exported with optional fields and `buildExtensionGalleryManifest()` became protected, so the no-account branch composes the manifest through the same code the product path uses. The alternative — a second composer — would drift the moment upstream adds a resource.
+6. The three modes write different key sets on purpose: `custom` writes both keys, `none` writes the sentinel and **deletes** `authProvider`, `default` deletes both. A mode switch must not leave the previous mode's opinion behind.
+7. `selectGallery` reloads through `workbench.action.reloadWindow` only after the user accepts the confirmation, because both settings are `scope: APPLICATION` and upstream already raises its own "restart" dialog.
+8. Diagnostics reads the gallery from the extension's settings, not from the build's `product.json`: after Task 10 the two disagree exactly when the user changed the source, and the user's answer is the one worth printing.
+9. `installVsix` hands the picked file to upstream's `workbench.extensions.installExtension` and reports the failure; it does not stage the VSIX into `--extensions-dir` (that is the offline bundle's job, Task 12).
+10. `gate.sh` reverse-checks only patches 66 and 67, the two this branch authors. Patches 53 and 58 cannot be reversed on their own (one deletes, one overlaps), so listing `apply-list.txt` wholesale would produce false failures.
+
+**Known UX blemish, not patched:** upstream's `onDidChangeConfiguration` handler raises its own modal restart prompt per key, so one `selectGallery` run can show two dialogs in a row. Suppressing it would mean patching behaviour unrelated to this feature; it goes in Task 15's notes instead.

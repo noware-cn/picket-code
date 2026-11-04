@@ -4,7 +4,7 @@
 #
 #   1. every node:test suite in the extension passes
 #   2. cross-file signatures still line up (tsc --checkJs, no emit)
-#   3. the exported patch still applies in reverse onto the vscode/ tree
+#   3. the patches exported by this work still apply in reverse onto the vscode/ tree
 #   4. the vscode/ tree is clean, so the next `git diff wsl-baseline` cannot
 #      silently carry someone else's edits
 #
@@ -13,7 +13,6 @@ set -uo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 EXT_DIR="$ROOT_DIR/vscode/extensions/picket-remote-wsl"
-PATCH_FILE="$ROOT_DIR/build/patches/67-picket-remote-wsl.patch"
 
 pass=0
 fail=0
@@ -59,19 +58,25 @@ else
 	report skip "tsc --checkJs" "no tsconfig.json yet"
 fi
 
-# 3. Patch applies in reverse
+# 3. Patches exported by this work apply in reverse onto the vscode/ tree.
+# Only the patches this project produces: earlier ones delete or overlap files that
+# later patches build on, so reversing them individually is not a meaningful check.
+PATCH_FILES="66-gallery-no-account.patch 67-picket-remote-wsl.patch"
 if [ "${1:-}" = "--skip-patch" ]; then
 	report skip "patch reverse-check" "--skip-patch"
-elif [ ! -f "$PATCH_FILE" ]; then
-	report skip "patch reverse-check" "67-picket-remote-wsl.patch not created yet"
 elif [ ! -d "$ROOT_DIR/vscode" ]; then
 	report fail "patch reverse-check" "vscode/ tree missing"
 else
-	if (cd "$ROOT_DIR" && git apply -R --check "$PATCH_FILE" --directory=vscode >/dev/null 2>&1); then
-		report ok "patch reverse-check" "$(basename "$PATCH_FILE")"
-	else
-		report fail "patch reverse-check" "$(basename "$PATCH_FILE") does not reverse"
-	fi
+	for name in $PATCH_FILES; do
+		file="$ROOT_DIR/build/patches/$name"
+		if [ ! -f "$file" ]; then
+			report skip "patch reverse-check" "$name not created yet"
+		elif (cd "$ROOT_DIR" && git apply -R --check "$file" --directory=vscode >/dev/null 2>&1); then
+			report ok "patch reverse-check" "$name"
+		else
+			report fail "patch reverse-check" "$name does not reverse — re-export it"
+		fi
+	done
 fi
 
 # 4. vscode/ tree clean

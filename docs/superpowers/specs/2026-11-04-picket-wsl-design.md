@@ -1,7 +1,8 @@
 # Picket Code 的 WSL 支持 — 设计
 
-状态：**已批准（v5）** — 2026-11-04
+状态：**已批准（v6）** — 2026-11-04
 
+> v6 变更：扩展市场一节改按上游既有机制实现（详见 §4.8 与 §10 的 D-16）。放弃自造的 `<userDataDir>/product.overrides.json`，改为复用 `extensions.gallery.serviceUrl` 与 `extensions.gallery.authProvider` 两个应用级设置：后者新增枚举值 `none`，表示"这个市场不需要账号"，此时客户端用该 URL 本地构造 manifest、不走账号门禁；`serviceUrl = "none"` 表示彻底关闭。补丁 66 相应从"覆盖 product.json"缩为"一条免登录支路 + 一个关闭哨兵"。
 > v5 变更：对照官方 Remote-WSL 1.104.7 的**行为面**逐项核对后补齐 6 处体验缺口（菜单与激活事件、登录 shell 环境、路径转换、默认发行版检测、`WSL Targets` 树视图与发行版管理、失败动作与一次性建议），并把 WSL 内 CLI shim 从非目标移入 v1。不复制其代码、文案与命令 id。
 相关：`docs/wsl-icode.md`（方案比较与 9p 评估）、`noware-cn/picket-code-server`（server 产物）、`spikes/picket-remote-wsl/`（一次性参考实现）
 
@@ -56,7 +57,7 @@ Windows 上的 Picket Code 打开 WSL 发行版里的文件夹时，工作区应
 - **tag 强绑定**：`product.json.commit` 在握手时比对（`remoteExtensionHostAgentServer.ts:351-357`），载荷 tag 必须等于客户端 tag。运行时没有可推导的锚点（`version` 是上游裸 `1.143.1`，发布 tag 是 `v1.143.1-picket.1-rc.4`），所以**构建时往 `product.json` 盖 `picketTag`**。
 - **server 无 vsda**：产物没有校验器，客户端也不签名；不引入任何签名环节。
 - **离线内网的 PATH 不可信**：不依赖发行版 `.bashrc` 导出的 PATH，一律绝对路径 + 显式注入环境变量。
-- **扩展市场**：`productService.extensionsGallery` 是唯一真实来源；设置项 `extensions.gallery.serviceUrl` 走账号服务（本构建已剥离所有认证 provider，配了会永久 `RequiresSignIn`），必须在 `productService` 层覆盖并隐藏该设置项。
+- **扩展市场**：`productService.extensionsGallery` 是 `product.json` 里唯一的市场来源，构建期已内置 Open VSX；运行期换市场走上游自己的两个应用级设置 `extensions.gallery.serviceUrl` / `extensions.gallery.authProvider`。上游一旦看到配了 serviceUrl 就走账号门禁（本构建没有任何认证 provider，配了会永久 `RequiresSignIn`），所以补丁 66 只补一条支路：`authProvider = "none"` 时用该 URL 本地构造 manifest、不查账号；`serviceUrl = "none"` 表示关闭市场。
 - **直连依赖 WSL 的 localhost 中继**：`[wsl2] localhostForwarding=false` 时 Windows 与 VM 的 `127.0.0.1` 是不同 socket，直连必然失败。
 
 ## 4. 方案
@@ -70,7 +71,7 @@ Windows 上的 Picket Code 打开 WSL 发行版里的文件夹时，工作区应
 | 直连 `127.0.0.1:<port>` 为主 | 一律走 stdio 隧道 | 默认路径最省事、延迟最低；隧道作为 `auto` 兜底（§4.6）。 |
 | 跨窗口复用用运行时文件 | 官方式 helper 进程 | 省 ~250 行；一个发行版始终一个 server，避免 data 目录争用。 |
 | iCode 用户自备 | 我们打包 Linux 版 | Linux 形态不由我们控制；只检测 + 注入 + 报错。 |
-| 市场覆盖用核心补丁（B） | 部署期改 product.json | 升级会覆盖，用户不能自助。 |
+| 市场换源复用上游两个设置（补丁 66，B） | 部署期改 product.json；自造 `product.overrides.json` | 上游设置名管理员已经熟悉，可被策略下发、可写进 `settings.json`，升级不丢；自造文件是第三种机制，要自带解析/校验/迁移。 |
 | 离线再加"载荷预置 + VSIX 安装"（C） | 只靠 gallery | 彻底离线时 gallery 必然不可达。 |
 | 内网档 = 自建 Open VSX | 仅文件共享 | 用户确认有自建 Open VSX，可浏览/搜索/安装。 |
 
@@ -91,7 +92,7 @@ Picket Code (Windows)
 │   └─ commands.js     15 条命令（§4.9）
 ├─ resources/payloads/catalog.json      组件目录（始终存在，几百字节）
 ├─ resources/wsl-payloads/             载荷（仅 embedded 形态）
-└─ 核心补丁 66         gallery 覆盖（product.overrides.json）
+└─ 核心补丁 66         gallery 免登录支路 + 关闭哨兵（复用 extensions.gallery.*）
 
 WSL2 发行版
 ├─ ~/.picket-code-server/payloads/server-<tag>/   bin/picket-code-server, node
@@ -190,12 +191,31 @@ WSL2 发行版
 
 ### 4.8 扩展市场三模式（B + C）
 
-**B｜核心补丁 66**
+**上游机制（先看清它怎么做的）**
 
-- 启动时若存在 `<userDataDir>/product.overrides.json`，其 `extensionsGallery` 覆盖 `product.json`；`null` 表示关闭市场。文件缺失/损坏时回退并记日志。
-- 隐藏 `extensions.gallery.serviceUrl` 与 `extensions.gallery.authProvider`，避免用户掉进永久 `RequiresSignIn`。
-- 命令 `Picket: 选择扩展市场来源`：默认 Open VSX / 内网 Open VSX（填 URL）/ 关闭 → 写文件 → 提示重载。客户端生效即可；服务端不需要（`serverServices` 把 manifest 委托给客户端）。
-- 补丁编号 66。
+- 市场的唯一来源是构建期 `product.json` 的 `extensionsGallery`（`platform/product/common/product.ts:34-36` 从 `globalThis._VSCODE_PRODUCT_JSON` 取），本构建已内置 Open VSX，公开场景开箱可用。
+- 换市场是上游已有的两个应用级设置：`extensions.gallery.serviceUrl` 与 `extensions.gallery.authProvider`（`extensions.contribution.ts:344-395`，`included: false`，可被策略 `ExtensionGalleryServiceUrl` 下发）。
+- 但 `extensionGalleryManifestService.ts:127-150` 的逻辑是：**配了 serviceUrl 就走账号门禁** —— 拿不到账号 → `RequiresSignIn`；`Ineligible` → `AccessDenied`；只有 `Eligible` 才去拉 manifest，账号 provider 是 GitHub / Microsoft 两家（`extensionGalleryAccountService.ts:362-366`）。也就是说上游这条腿只服务"微软私有市场"，Open VSX 这类**不需要登录**的 gallery 用不了（本构建又没有账号 provider，会永久 `RequiresSignIn`）。
+
+**B｜补丁 66：给上游机制补一条无账号支路**
+
+- `authProvider` 枚举新增 `none`：配了 `serviceUrl` 且 `authProvider = "none"` 时，跳过账号门禁，直接用该 URL 在本地构造 manifest（`buildExtensionGalleryManifest`），状态 `Available`，不发任何请求（避免 `RequiresSignIn`，也避免向不可达域名探活）。
+- `itemUrl` 由 `serviceUrl` 按 Open VSX 布局推导（`…/vscode/gallery` → `…/vscode/item`）；布局不符时不生成 item 资源，宁可不给链接也不给 404。
+- `serviceUrl = "none"`：manifest 为 `null`、状态 `Unavailable`，不再发任何市场请求（离线部署不必等超时）。
+- 显式配 `authProvider = github | microsoft` 时**完全走上游原路**（含登录门禁与 `AccessDenied` 语义），我们不改。
+- 默认值仍是 `github`，因此**未配置市场时行为与上游逐字节一致**——这是选它而不是 `inspect()` 猜"是否显式设置"的原因：不依赖配置服务的实现细节，也不会让上游语义悄悄变化。
+
+**命令 `Picket: 选择扩展市场来源`**
+
+三选一，写的就是上面两个设置（用户/`settings.json` 级，等同管理员手写）：
+
+| 模式 | 写入 | 说明 |
+|---|---|---|
+| Open VSX（默认） | 删除两个键 | 回到构建内置地址，将来换默认值也能跟上，而不是把地址抄进设置 |
+| 内网/自建 gallery… | `serviceUrl = <URL>`、`authProvider = "none"` | 地址必须 `http(s)://`，末尾 `/` 去掉；Open VSX 兼容即可（浏览/搜索/安装/详情） |
+| 关闭（离线） | `serviceUrl = "none"`、删除 `authProvider` | 扩展只能走"从 VSIX 安装" |
+
+写完提示重载（manifest 在窗口启动时解析一次，上游自己的实现也是弹重启），并提供"重新加载"按钮。诊断命令的 `Gallery:` 行区分 `default (…)` / `custom (…)` / `none (disabled by extension setting)`。
 
 **C｜彻底离线**
 
@@ -262,7 +282,7 @@ WSL2 发行版
 | 63 | iCode 适配器 | 已有 |
 | 64 | changeset 策略 | 已有 |
 | 65 | UI 冒烟用例 | 已有 |
-| **66** | gallery 覆盖 + 隐藏设置项 | 新增 |
+| **66** | gallery 免登录支路（`authProvider: none`）+ 关闭哨兵（`serviceUrl: none`） | 新增 |
 | 配置 | `product.json` 增加 `picketTag`、`noware.picket-remote-wsl: ["resolvers"]`、内置扩展条目 | 新增 |
 
 ### 4.13 `WSL Targets` 树视图与发行版管理
@@ -350,7 +370,7 @@ src/log.js          OutputChannel + 文件
 
 - **M1 组件与 resolver**：`catalog.js` + `components.js` + `payload.js` + `launch.js` + `resolver.js`（含运行时文件复用）+ L1/L2 测试；Windows 上手动打开 `/home/<user>`。
 - **M2 UX 与 iCode**：15 条命令、`WSL Targets` 树视图与发行版管理、诊断、一次性建议（UNC / WSL1 / `/mnt/`）、iCode 检测与注入、`preflight.js`（`.wslconfig` 检测）、首次拦截对话框、失败通知的动作按钮、错误文案逐条落地。
-- **M3 市场三模式与 CLI shim**：补丁 66 + 选择来源命令 + VSIX 安装 + 组件携带扩展包的通道 + `shim.js`（安装/移除 `picket-code .`）。
+- **M3 市场三模式与 CLI shim**：补丁 66（`authProvider: none` 免登录支路 + `serviceUrl: none` 关闭哨兵）+ 选择来源命令 + VSIX 安装 + 组件携带扩展包的通道 + `shim.js`（安装/移除 `picket-code .`）。
 - **M4 打包、隧道与验收**：`picketTag` 盖章、catalog 生成、两形态打包与 `check-contract` 断言、离线组件包、`tunnel.js`、8 项真机清单、文档增补（`docs/wsl-icode.md` 加"A′ 落地版"）。
 
 ## 8. 留给实现者的决定
@@ -385,3 +405,6 @@ src/log.js          OutputChannel + 文件
 | `--list --verbose` 而非 `-l -q` | 只有 verbose 输出带默认发行版标记与 WSL 版本列 | 解析 UTF-16LE 与列对齐；`docker-desktop*` 需过滤 |
 | 失败通知带动作按钮（重试/关闭窗口/查看日志） | 一次启动失败就重启整个窗口，代价太高 | 文案与状态机略复杂 |
 | 端口转发不额外实现 | workbench 的转发请求走已有 agent 连接，server 在 VM 内建连 | 必须在 L3 两模式下各验一次 |
+| 市场换源复用上游 `extensions.gallery.*`（D-16） | 自造 `product.overrides.json` 覆盖 `product.json`，并隐藏两个设置 | 上游设置名可被策略下发、可写 `settings.json`、升级不丢；`included: false` 本来就藏在设置编辑器之外，没有"用户误入"问题。代价是补丁 66 动了 core 的 manifest 服务一处分支，需用例守住"默认配置下与上游一致" |
+| 免登录用新增枚举 `authProvider: none`，而不是"没配就是免登录" | 用 `configurationService.inspect()` 判断 authProvider 是否被显式设置 | `inspect()` 的语义依赖实现细节（测试替身无法如实表达），且会让上游默认语义悄悄变化；显式枚举可被 registry 校验、自解释，默认仍是 `github` → 零行为变更 |
+| 关闭市场用 `serviceUrl: "none"` 哨兵 | 空字符串（上游视为"未配置"）；指向不可达地址 | 空值有既有含义，不能复用；哨兵是一个明确状态，诊断能说清，离线时不发请求也不等超时 |

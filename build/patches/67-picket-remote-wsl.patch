@@ -9,10 +9,10 @@ index 00000000..96fab092
 +tsconfig.json
 diff --git a/extensions/picket-remote-wsl/extension.js b/extensions/picket-remote-wsl/extension.js
 new file mode 100644
-index 00000000..fbda7959
+index 00000000..f1df2956
 --- /dev/null
 +++ b/extensions/picket-remote-wsl/extension.js
-@@ -0,0 +1,172 @@
+@@ -0,0 +1,181 @@
 +'use strict';
 +
 +const { join } = require('node:path');
@@ -146,7 +146,15 @@ index 00000000..fbda7959
 +			const document = await vscode.workspace.openTextDocument({ content: text, language: 'plaintext' });
 +			await vscode.window.showTextDocument(document);
 +		},
-+		uriFor: (parts) => vscode.Uri.from(parts)
++		uriFor: (parts) => vscode.Uri.from(parts),
++		executeCommand: (id, ...args) => vscode.commands.executeCommand(id, ...args)
++	};
++
++	// The marketplace settings are read and written through the same object: `update` on the
++	// user target is what an administrator would put in settings.json by hand.
++	const gallery = {
++		get: (key) => vscode.workspace.getConfiguration('extensions.gallery').get(key),
++		update: async (key, value) => vscode.workspace.getConfiguration('extensions.gallery').update(key, value, vscode.ConfigurationTarget.Global)
 +	};
 +
 +	context.subscriptions.push(...registerCommands({
@@ -159,14 +167,15 @@ index 00000000..fbda7959
 +		memento: context.globalState,
 +		log,
 +		appRoot: vscode.env.appRoot,
++		gallery,
 +		currentFolders: () => vscode.workspace.workspaceFolders ?? [],
 +		currentAuthority: () => vscode.env.remoteAuthority ?? '',
 +		register: (id, run) => vscode.commands.registerCommand(id, run)
 +	}));
 +
-+	// Until the remaining commands land, they exist so the palette and the
-+	// remote indicator do not offer dead entries.
-+	for (const id of ['picket.wsl.selectGallery', 'picket.wsl.installVsix', 'picket.wsl.installCli', 'picket.wsl.removeCli']) {
++	// Until the CLI shim lands, its commands exist so the palette and the remote indicator do
++	// not offer dead entries.
++	for (const id of ['picket.wsl.installCli', 'picket.wsl.removeCli']) {
 +		context.subscriptions.push(vscode.commands.registerCommand(id, () => {
 +			log.info(`${id} is not implemented yet`);
 +		}));
@@ -629,16 +638,17 @@ index 00000000..f612ff0a
 +module.exports = { loadCatalog };
 diff --git a/extensions/picket-remote-wsl/src/commands.js b/extensions/picket-remote-wsl/src/commands.js
 new file mode 100644
-index 00000000..95304245
+index 00000000..23e0345a
 --- /dev/null
 +++ b/extensions/picket-remote-wsl/src/commands.js
-@@ -0,0 +1,350 @@
+@@ -0,0 +1,367 @@
 +'use strict';
 +
 +const { listDistros, distroHome, visibleDistros } = require('./distro.js');
 +const { AUTHORITY_PREFIX, parseAuthority, parseUncPath, toPosixPath, toWindowsPath } = require('./remoteUri.js');
 +const { manageDistro } = require('./manage.js');
 +const { buildDiagnostics } = require('./diagnose.js');
++const { selectGallery, installVsix } = require('./marketplace.js');
 +
 +const LAST_DISTRO = 'picket.wsl.lastDistro';
 +const SERVER_COMPONENT = 'wsl-server';
@@ -659,7 +669,7 @@ index 00000000..95304245
 + *   listDistros?: typeof listDistros,
 + *   distroHome?: typeof distroHome,
 + *   appRoot?: string,
-+ *   overridesFile?: string,
++ *   gallery?: { get(key: string): any, update(key: string, value: any): Promise<void> },
 + *   currentFolders?: () => readonly any[],
 + *   currentAuthority?: () => string
 + * }} options
@@ -903,9 +913,21 @@ index 00000000..95304245
 +			catalog,
 +			components: createComponents,
 +			appRoot: options.appRoot,
-+			overridesFile: options.overridesFile
++			gallery: options.gallery ? { serviceUrl: options.gallery.get('serviceUrl') } : undefined
 +		});
 +		await host.showDocument(report);
++	}
++
++	async function galleryCommand() {
++		if (!options.gallery) {
++			await host.showErrorMessage('扩展市场配置不可用。');
++			return;
++		}
++		await selectGallery({ host, configuration: options.gallery });
++	}
++
++	async function vsixCommand() {
++		await installVsix({ host });
 +	}
 +
 +	async function refreshTargets() {
@@ -938,6 +960,8 @@ index 00000000..95304245
 +		addDistro: () => manage('add'),
 +		setDefaultDistro: (distro) => manage('setDefault', distro),
 +		deleteDistro: (distro) => manage('delete', distro),
++		selectGallery: galleryCommand,
++		installVsix: vsixCommand,
 +		ensureComponentInteractive,
 +		pickDistro
 +	};
@@ -968,7 +992,9 @@ index 00000000..95304245
 +	'picket.wsl.refreshTargets': (api) => () => api.refreshTargets(),
 +	'picket.wsl.addDistro': (api) => () => api.addDistro(),
 +	'picket.wsl.setDefaultDistro': (api) => (node) => api.setDefaultDistro(distroOf(node)),
-+	'picket.wsl.deleteDistro': (api) => (node) => api.deleteDistro(distroOf(node))
++	'picket.wsl.deleteDistro': (api) => (node) => api.deleteDistro(distroOf(node)),
++	'picket.wsl.selectGallery': (api) => () => api.selectGallery(),
++	'picket.wsl.installVsix': (api) => () => api.installVsix()
 +};
 +
 +/**
@@ -1189,16 +1215,17 @@ index 00000000..d587fe9c
 +module.exports = { createComponentManager, markerPath };
 diff --git a/extensions/picket-remote-wsl/src/diagnose.js b/extensions/picket-remote-wsl/src/diagnose.js
 new file mode 100644
-index 00000000..3c7bf372
+index 00000000..8e1ceee8
 --- /dev/null
 +++ b/extensions/picket-remote-wsl/src/diagnose.js
-@@ -0,0 +1,155 @@
+@@ -0,0 +1,153 @@
 +'use strict';
 +
 +const { readFile } = require('node:fs/promises');
 +const { join } = require('node:path');
 +const { listDistros, defaultDistro, distroHome, wslStatus } = require('./distro.js');
 +const { detectIcode } = require('./icode.js');
++const { describeGallery } = require('./marketplace.js');
 +const { chooseTunnelMode, readWslConfigFile, wslConfigPath } = require('./preflight.js');
 +
 +/**
@@ -1211,7 +1238,7 @@ index 00000000..3c7bf372
 + *   catalog?: any,
 + *   components: (ctx: { distro: string, home: string, runner: any }) => { list(): Promise<any[]> },
 + *   appRoot?: string,
-+ *   overridesFile?: string,
++ *   gallery?: { serviceUrl?: string },
 + *   platform?: string,
 + *   readWslConfig?: () => Promise<{ localhostForwarding?: boolean, networkingMode?: string }>
 + * }} options
@@ -1330,18 +1357,15 @@ index 00000000..3c7bf372
 +	});
 +
 +	await section('Gallery', async () => {
-+		let gallery = (await product()).extensionsGallery ?? null;
-+		if (options.overridesFile) {
-+			try {
-+				const overrides = JSON.parse(await readFile(options.overridesFile, 'utf8'));
-+				if ('extensionsGallery' in overrides) {
-+					gallery = overrides.extensionsGallery;
-+				}
-+			} catch {
-+				// An unreadable override file means the build's own gallery stands.
-+			}
++		const configured = describeGallery(options.gallery ?? {});
++		if (configured.mode === 'none') {
++			return 'none (disabled by extension setting)';
 +		}
-+		return gallery ? gallery.serviceUrl : 'none';
++		if (configured.mode === 'custom') {
++			return `custom (${configured.serviceUrl})`;
++		}
++		const gallery = (await product()).extensionsGallery ?? null;
++		return gallery ? `default (${gallery.serviceUrl})` : 'none (not in this build)';
 +	});
 +
 +	return lines.join('\n');
@@ -2128,6 +2152,155 @@ index 00000000..3769f45d
 +}
 +
 +module.exports = { manageDistro, parseOnlineTable, PLAIN_NAME };
+diff --git a/extensions/picket-remote-wsl/src/marketplace.js b/extensions/picket-remote-wsl/src/marketplace.js
+new file mode 100644
+index 00000000..1e33e1a7
+--- /dev/null
++++ b/extensions/picket-remote-wsl/src/marketplace.js
+@@ -0,0 +1,143 @@
++'use strict';
++
++/**
++ * The Extensions Marketplace is a core setting, not ours: `extensions.gallery.serviceUrl` points
++ * the client at a gallery and `extensions.gallery.authProvider` says who vouches for it. Both are
++ * application-scoped, so what a command writes here is exactly what an administrator would paste
++ * into `settings.json` — no second file format, and a value that survives an upgrade.
++ */
++const SERVICE_URL = 'serviceUrl';
++const AUTH_PROVIDER = 'authProvider';
++/** The `authProvider` value for a gallery that authenticates nobody: Open VSX and its mirrors. */
++const NO_ACCOUNT = 'none';
++/** The `serviceUrl` value that turns the gallery off rather than pointing it somewhere. */
++const DISABLED = 'none';
++const RELOAD = '重新加载';
++
++const MODES = [
++	{ id: 'default', label: 'Open VSX（默认）', detail: '使用发行包内置的市场地址' },
++	{ id: 'custom', label: '内网/自建 gallery…', detail: '填一个 Open VSX 兼容的地址，不需要登录' },
++	{ id: 'none', label: '关闭（离线，只用 VSIX）', detail: '不再发市场请求，扩展用 .vsix 离线安装' }
++];
++
++/**
++ * @param {{ serviceUrl?: string }} [config]
++ * @returns {{ mode: 'default' } | { mode: 'none' } | { mode: 'custom', serviceUrl: string }}
++ */
++function describeGallery(config = {}) {
++	const serviceUrl = String(config.serviceUrl ?? '');
++	if (serviceUrl === DISABLED) {
++		return { mode: 'none' };
++	}
++	if (serviceUrl) {
++		return { mode: 'custom', serviceUrl };
++	}
++	return { mode: 'default' };
++}
++
++/**
++ * Writing `undefined` removes the key, which is how "back to the build's own gallery" survives a
++ * later build shipping a different default. Nosy validation stays here rather than in the input
++ * box: the box is a hint, this is the gate.
++ * @param {{ mode: 'default' | 'none' | 'custom', url?: string, configuration: any }} options
++ * @returns {Promise<string>} the value the setting now holds ('' for the default gallery)
++ */
++async function applyGalleryMode({ mode, url, configuration }) {
++	if (mode === 'custom') {
++		const value = String(url ?? '').trim().replace(/\/+$/, '');
++		if (!/^https?:\/\/[^/]+/i.test(value)) {
++			throw new Error('市场地址必须以 http:// 或 https:// 开头，例如 https://openvsx.example.com/vscode/gallery');
++		}
++		await configuration.update(SERVICE_URL, value);
++		await configuration.update(AUTH_PROVIDER, NO_ACCOUNT);
++		return value;
++	}
++	if (mode === 'none') {
++		await configuration.update(SERVICE_URL, DISABLED);
++		await configuration.update(AUTH_PROVIDER, undefined);
++		return DISABLED;
++	}
++	await configuration.update(SERVICE_URL, undefined);
++	await configuration.update(AUTH_PROVIDER, undefined);
++	return '';
++}
++
++/**
++ * @param {{ host: any, configuration: any }} options
++ * @returns {Promise<boolean>} whether a setting was written
++ */
++async function selectGallery({ host, configuration }) {
++	const current = describeGallery({ serviceUrl: configuration.get(SERVICE_URL) });
++	const picked = await host.showQuickPick(
++		MODES.map(mode => ({
++			label: mode.label,
++			description: mode.id === current.mode ? '当前' : undefined,
++			detail: mode.detail,
++			mode: mode.id
++		})),
++		{ placeHolder: '选择扩展市场来源' }
++	);
++	if (!picked) {
++		return false;
++	}
++	const mode = typeof picked === 'string' ? MODES.find(candidate => candidate.label === picked)?.id : picked.mode;
++	if (!mode) {
++		return false;
++	}
++
++	let url;
++	if (mode === 'custom') {
++		url = await host.showInputBox({
++			prompt: 'Open VSX 兼容的 gallery 地址',
++			placeHolder: 'https://openvsx.example.com/vscode/gallery',
++			value: current.mode === 'custom' ? current.serviceUrl : '',
++			validateInput: (value) => (/^https?:\/\/[^/]+/i.test(String(value ?? '').trim()) ? undefined : '必须以 http:// 或 https:// 开头')
++		});
++		if (url === undefined) {
++			return false;
++		}
++	}
++
++	try {
++		await applyGalleryMode({ mode, url, configuration });
++	} catch (error) {
++		await host.showErrorMessage(error.message);
++		return false;
++	}
++
++	// The marketplace is resolved once per window (the manifest service asks for a restart when
++	// the setting changes), so say so instead of pretending the new source is live.
++	const choice = await host.showInformationMessage('扩展市场来源已保存，重新加载窗口后生效。', RELOAD);
++	if (choice === RELOAD) {
++		await host.executeCommand('workbench.action.reloadWindow');
++	}
++	return true;
++}
++
++/**
++ * The air-gapped path: a packaged extension is the only way in when no gallery is reachable.
++ * @param {{ host: any }} options
++ * @returns {Promise<boolean>}
++ */
++async function installVsix({ host }) {
++	const picked = await host.showOpenDialog({
++		canSelectFiles: true,
++		canSelectMany: false,
++		title: '选择 .vsix 扩展包',
++		filters: { '扩展包': ['vsix'] }
++	});
++	const file = Array.isArray(picked) ? picked[0] : picked;
++	if (!file) {
++		return false;
++	}
++	try {
++		await host.executeCommand('workbench.extensions.installExtension', file);
++		await host.showInformationMessage('安装请求已提交，进度见“扩展”视图。');
++		return true;
++	} catch (error) {
++		await host.showErrorMessage(`安装 .vsix 失败：${error.message}`);
++		return false;
++	}
++}
++
++module.exports = { MODES, NO_ACCOUNT, DISABLED, describeGallery, applyGalleryMode, selectGallery, installVsix };
 diff --git a/extensions/picket-remote-wsl/src/nudge.js b/extensions/picket-remote-wsl/src/nudge.js
 new file mode 100644
 index 00000000..f1756287
@@ -3218,10 +3391,10 @@ index 00000000..6679f571
 +});
 diff --git a/extensions/picket-remote-wsl/test/diagnose.test.js b/extensions/picket-remote-wsl/test/diagnose.test.js
 new file mode 100644
-index 00000000..e2c16da4
+index 00000000..7db16f1d
 --- /dev/null
 +++ b/extensions/picket-remote-wsl/test/diagnose.test.js
-@@ -0,0 +1,116 @@
+@@ -0,0 +1,119 @@
 +// RED first: this file must fail until src/diagnose.js exists.
 +const test = require('node:test');
 +const assert = require('node:assert');
@@ -3276,7 +3449,7 @@ index 00000000..e2c16da4
 +}
 +
 +/**
-+ * @param {{ runner?: any, settings?: any, product?: any }} [options]
++ * @param {{ runner?: any, settings?: any, product?: any, gallery?: any }} [options]
 + */
 +async function diagnostics(options = {}) {
 +	const root = await appRoot(options.product);
@@ -3286,6 +3459,7 @@ index 00000000..e2c16da4
 +		catalog: createCatalog(),
 +		components: () => createFakeComponents({ state: 'installed' }),
 +		appRoot: root,
++		gallery: options.gallery,
 +		readWslConfig: async () => ({ localhostForwarding: true })
 +	});
 +}
@@ -3317,20 +3491,22 @@ index 00000000..e2c16da4
 +	assert.match(report, /^Product tag: v9\.9\.9-picket\.7$/m);
 +});
 +
-+test('the effective gallery comes from product.overrides.json when it exists', async () => {
-+	const root = await appRoot({ gallery: { serviceUrl: 'https://open-vsx.org/vscode/gallery', itemUrl: 'https://open-vsx.org/vscode/item' } });
-+	const overrides = join(root, 'product.overrides.json');
-+	await writeFile(overrides, JSON.stringify({ extensionsGallery: null }));
-+	const report = await buildDiagnostics({
-+		runner: happyRunner(),
-+		settings: { tunnelMode: 'auto', icodePath: '', defaultDistro: '' },
-+		catalog: createCatalog(),
-+		components: () => createFakeComponents({ state: 'installed' }),
-+		appRoot: root,
-+		overridesFile: overrides,
-+		readWslConfig: async () => ({})
++test('the gallery line names the build default when nothing is configured', async () => {
++	const report = await diagnostics({ product: { gallery: { serviceUrl: 'https://open-vsx.org/vscode/gallery' } } });
++	assert.match(report, /^Gallery: default \(https:\/\/open-vsx\.org\/vscode\/gallery\)$/m);
++});
++
++test('the gallery line names a configured mirror', async () => {
++	const report = await diagnostics({
++		product: { gallery: { serviceUrl: 'https://open-vsx.org/vscode/gallery' } },
++		gallery: { serviceUrl: 'https://openvsx.corp.local/vscode/gallery' }
 +	});
-+	assert.match(report, /^Gallery: none/m);
++	assert.match(report, /^Gallery: custom \(https:\/\/openvsx\.corp\.local\/vscode\/gallery\)$/m);
++});
++
++test('the gallery line reports a disabled gallery as a state, not a missing value', async () => {
++	const report = await diagnostics({ product: { gallery: { serviceUrl: 'https://open-vsx.org/vscode/gallery' } }, gallery: { serviceUrl: 'none' } });
++	assert.match(report, /^Gallery: none \(disabled by extension setting\)$/m);
 +});
 +
 +test('the components section names the installed payload', async () => {
@@ -3429,16 +3605,16 @@ index 00000000..99a9dc23
 +});
 diff --git a/extensions/picket-remote-wsl/test/fixtures/fake-host.js b/extensions/picket-remote-wsl/test/fixtures/fake-host.js
 new file mode 100644
-index 00000000..4d50c8cf
+index 00000000..8de906e0
 --- /dev/null
 +++ b/extensions/picket-remote-wsl/test/fixtures/fake-host.js
-@@ -0,0 +1,138 @@
+@@ -0,0 +1,176 @@
 +'use strict';
 +
 +/**
 + * A stand-in for the slice of `vscode` that the command layer touches, so the
 + * command layer can be tested without an extension host.
-+ * @param {{ quickPick?: any, openDialog?: any, info?: any[], warning?: any[], confirm?: boolean, folderOpen?: boolean }} [options]
++ * @param {{ quickPick?: any, openDialog?: any, info?: any[], warning?: any[], confirm?: boolean, folderOpen?: boolean, inputBox?: any, executeCommand?: (id: string, ...args: any[]) => any }} [options]
 + */
 +function createFakeHost(options = {}) {
 +	/** @type {string[]} */
@@ -3451,6 +3627,8 @@ index 00000000..4d50c8cf
 +	const terminals = [];
 +	/** @type {string[]} */
 +	const documents = [];
++	/** @type {any[][]} */
++	const executed = [];
 +	const state = { refreshed: 0, progress: 0 };
 +	const infoQueue = [...(options.info ?? [])];
 +	const warningQueue = [...(options.warning ?? [])];
@@ -3461,6 +3639,7 @@ index 00000000..4d50c8cf
 +		opened,
 +		terminals,
 +		documents,
++		executed,
 +		state,
 +		get lastActions() {
 +			return actionSets.length === 0 ? [] : actionSets[actionSets.length - 1];
@@ -3503,6 +3682,15 @@ index 00000000..4d50c8cf
 +		/** @param {any} uri @param {any} opts */
 +		async openFolder(uri, opts) {
 +			opened.push({ uri, opts });
++		},
++		/** @param {any} [opts] */
++		async showInputBox(opts) {
++			return typeof options.inputBox === 'function' ? options.inputBox(opts) : options.inputBox;
++		},
++		/** @param {string} id @param {...any} args */
++		async executeCommand(id, ...args) {
++			executed.push([id, ...args]);
++			return options.executeCommand ? options.executeCommand(id, ...args) : undefined;
 +		},
 +		/** @param {string} command */
 +		runInTerminal(command) {
@@ -3570,7 +3758,33 @@ index 00000000..4d50c8cf
 +	};
 +}
 +
-+module.exports = { createFakeHost, createFakeComponents, createCatalog };
++/**
++ * The `extensions.gallery` settings, as the extension sees them: `get` reads the effective
++ * value, `update` records the write so a test can assert what the command asked for.
++ * @param {{ serviceUrl?: string, authProvider?: string }} [initial]
++ */
++function createFakeGalleryConfig(initial = {}) {
++	const values = { ...initial };
++	/** @type {Array<[string, any]>} */
++	const writes = [];
++	return {
++		values,
++		writes,
++		/** @param {string} key */
++		get(key) { return values[key]; },
++		/** @param {string} key @param {any} value */
++		async update(key, value) {
++			writes.push([key, value]);
++			if (value === undefined) {
++				delete values[key];
++			} else {
++				values[key] = value;
++			}
++		}
++	};
++}
++
++module.exports = { createFakeHost, createFakeComponents, createCatalog, createFakeGalleryConfig };
 diff --git a/extensions/picket-remote-wsl/test/fixtures/fake-wsl.js b/extensions/picket-remote-wsl/test/fixtures/fake-wsl.js
 new file mode 100755
 index 00000000..ac0353a7
@@ -3911,10 +4125,10 @@ index 00000000..118dde5d
 +});
 diff --git a/extensions/picket-remote-wsl/test/manifest.test.js b/extensions/picket-remote-wsl/test/manifest.test.js
 new file mode 100644
-index 00000000..67d09963
+index 00000000..ea81f5d3
 --- /dev/null
 +++ b/extensions/picket-remote-wsl/test/manifest.test.js
-@@ -0,0 +1,63 @@
+@@ -0,0 +1,66 @@
 +// RED first: the manifest and the code must agree about which commands exist.
 +const test = require('node:test');
 +const assert = require('node:assert');
@@ -3944,16 +4158,18 @@ index 00000000..67d09963
 +	assert.deepStrictEqual(stray, [], `registered but not in the manifest: ${stray.join(', ')}`);
 +});
 +
-+test('the command layer owns the ten commands of this milestone', () => {
++test('the command layer owns the twelve commands of this milestone', () => {
 +	assert.deepStrictEqual(Object.keys(COMMANDS).sort(), [
 +		'picket.wsl.addDistro',
 +		'picket.wsl.components',
 +		'picket.wsl.deleteDistro',
 +		'picket.wsl.diagnose',
++		'picket.wsl.installVsix',
 +		'picket.wsl.openFolder',
 +		'picket.wsl.refreshTargets',
 +		'picket.wsl.reopenInWindows',
 +		'picket.wsl.reopenInWsl',
++		'picket.wsl.selectGallery',
 +		'picket.wsl.setDefaultDistro',
 +		'picket.wsl.stopServer'
 +	]);
@@ -3962,7 +4178,8 @@ index 00000000..67d09963
 +test('the only file that imports vscode is the one that can', () => {
 +	// log.js is the one vscode-bound helper: it owns an OutputChannel.
 +	const sources = ['catalog.js', 'distro.js', 'components.js', 'payload.js', 'launch.js', 'probe.js',
-+		'remoteUri.js', 'resolver.js', 'icode.js', 'preflight.js', 'tree.js', 'manage.js', 'diagnose.js', 'nudge.js', 'commands.js'];
++		'remoteUri.js', 'resolver.js', 'icode.js', 'preflight.js', 'tree.js', 'manage.js', 'diagnose.js',
++		'nudge.js', 'commands.js', 'marketplace.js'];
 +	for (const name of sources) {
 +		const text = readFileSync(join(root, 'src', name), 'utf8');
 +		assert.doesNotMatch(text, /require\(['"]vscode['"]\)/, `${name} must stay testable without an extension host`);
@@ -3977,6 +4194,129 @@ index 00000000..67d09963
 +	const menu = manifest.contributes.menus['view/item/context'].map(entry => entry.command);
 +	assert.ok(menu.includes('picket.wsl.setDefaultDistro'));
 +	assert.ok(menu.includes('picket.wsl.deleteDistro'));
++});
+diff --git a/extensions/picket-remote-wsl/test/marketplace.test.js b/extensions/picket-remote-wsl/test/marketplace.test.js
+new file mode 100644
+index 00000000..273ba537
+--- /dev/null
++++ b/extensions/picket-remote-wsl/test/marketplace.test.js
+@@ -0,0 +1,117 @@
++// RED first: this file must fail until src/marketplace.js exists.
++const test = require('node:test');
++const assert = require('node:assert');
++const { describeGallery, applyGalleryMode, selectGallery, installVsix } = require('../src/marketplace.js');
++const { createFakeHost, createFakeGalleryConfig } = require('./fixtures/fake-host.js');
++
++test('an unset serviceUrl means the build gallery stands', () => {
++	assert.deepStrictEqual(describeGallery({}), { mode: 'default' });
++	assert.deepStrictEqual(describeGallery({ serviceUrl: '' }), { mode: 'default' });
++});
++
++test('a URL means a gallery the deployment configured', () => {
++	assert.deepStrictEqual(
++		describeGallery({ serviceUrl: 'https://openvsx.corp.local/vscode/gallery' }),
++		{ mode: 'custom', serviceUrl: 'https://openvsx.corp.local/vscode/gallery' }
++	);
++});
++
++test('the disabled sentinel is a mode of its own, not a URL', () => {
++	assert.deepStrictEqual(describeGallery({ serviceUrl: 'none' }), { mode: 'none' });
++});
++
++test('a custom gallery is written with the no-account provider', async () => {
++	const configuration = createFakeGalleryConfig();
++	await applyGalleryMode({ mode: 'custom', url: 'https://openvsx.corp.local/vscode/gallery/', configuration });
++
++	// The trailing slash would double up in every derived resource URL.
++	assert.deepStrictEqual(configuration.writes, [
++		['serviceUrl', 'https://openvsx.corp.local/vscode/gallery'],
++		['authProvider', 'none']
++	]);
++});
++
++test('a custom gallery without http(s) is refused before anything is written', async () => {
++	const configuration = createFakeGalleryConfig();
++	await assert.rejects(
++		() => applyGalleryMode({ mode: 'custom', url: 'openvsx.corp.local', configuration }),
++		/http/
++	);
++	assert.deepStrictEqual(configuration.writes, []);
++});
++
++test('turning the gallery off writes the sentinel and clears the account provider', async () => {
++	const configuration = createFakeGalleryConfig({ serviceUrl: 'https://x/vscode/gallery', authProvider: 'none' });
++	await applyGalleryMode({ mode: 'none', configuration });
++
++	assert.deepStrictEqual(configuration.writes, [['serviceUrl', 'none'], ['authProvider', undefined]]);
++});
++
++test('going back to the default clears both keys instead of copying the URL', async () => {
++	// Copying Open VSX's URL into the setting would freeze it: a later build that ships a
++	// different default could never take effect.
++	const configuration = createFakeGalleryConfig({ serviceUrl: 'none', authProvider: 'none' });
++	await applyGalleryMode({ mode: 'default', configuration });
++
++	assert.deepStrictEqual(configuration.writes, [['serviceUrl', undefined], ['authProvider', undefined]]);
++});
++
++test('picking an intranet gallery asks for a URL and then offers a reload', async () => {
++	const configuration = createFakeGalleryConfig();
++	const host = createFakeHost({
++		quickPick: '内网/自建 gallery…',
++		inputBox: 'https://openvsx.corp.local/vscode/gallery',
++		info: ['重新加载']
++	});
++
++	await selectGallery({ host, configuration });
++
++	assert.deepStrictEqual(configuration.values, {
++		serviceUrl: 'https://openvsx.corp.local/vscode/gallery',
++		authProvider: 'none'
++	});
++	assert.deepStrictEqual(host.executed.at(-1), ['workbench.action.reloadWindow']);
++});
++
++test('a rejected URL surfaces the reason and leaves the setting alone', async () => {
++	const configuration = createFakeGalleryConfig();
++	const host = createFakeHost({ quickPick: '内网/自建 gallery…', inputBox: 'openvsx.corp.local' });
++
++	await selectGallery({ host, configuration });
++
++	assert.deepStrictEqual(configuration.writes, []);
++	assert.match(host.messages.at(-1), /http/);
++});
++
++test('cancelling the picker changes nothing', async () => {
++	const configuration = createFakeGalleryConfig();
++	const host = createFakeHost({ quickPick: undefined });
++
++	await selectGallery({ host, configuration });
++
++	assert.deepStrictEqual(configuration.writes, []);
++	assert.deepStrictEqual(host.messages, []);
++});
++
++test('installing a VSIX hands the picked file to the extensions view', async () => {
++	const uri = { scheme: 'file', fsPath: '/tmp/picket.vsix', path: '/tmp/picket.vsix' };
++	const host = createFakeHost({ openDialog: [uri] });
++
++	await installVsix({ host });
++
++	assert.strictEqual(host.executed.length, 1);
++	assert.strictEqual(host.executed[0][0], 'workbench.extensions.installExtension');
++	assert.strictEqual(host.executed[0][1], uri);
++});
++
++test('a failed VSIX install is reported, not swallowed', async () => {
++	const uri = { scheme: 'file', fsPath: '/tmp/broken.vsix', path: '/tmp/broken.vsix' };
++	const host = createFakeHost({
++		openDialog: [uri],
++		executeCommand: () => { throw new Error('not a valid extension'); }
++	});
++
++	await installVsix({ host });
++
++	assert.match(host.messages.at(-1), /not a valid extension/);
 +});
 diff --git a/extensions/picket-remote-wsl/test/nudge.test.js b/extensions/picket-remote-wsl/test/nudge.test.js
 new file mode 100644
