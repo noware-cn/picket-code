@@ -28,6 +28,7 @@
 - Never build a shell command string by concatenation; `wsl.exe` invocations take an argv array, and in-distro work is one of `wsl.exe -d <d> -e sh -c '<constant script with positional args>'`.
 - Extension source is CommonJS; test files are `*.test.js` run by `node --test`.
 - Do not run `npm run build-fast`, `npm run compile`, or a full-tree `tsc` in `vscode/` (removed copilot extension / OOM). Emit is `cd vscode && npm run transpile-client`.
+- **Gate after every commit step:** `bash build/wsl/gate.sh`. It fails when a suite fails, when `tsc --checkJs` reports a cross-file signature error, when patch 67 no longer reverses, or when `vscode/` is dirty. The dirty check is meaningful right after a commit; mid-task dirt is expected, so run the gate at the end of a task, not after every edit. Two local type-check configs are git-excluded and never enter a patch: `vscode/extensions/picket-remote-wsl/tsconfig.json` (checkJs over the extension) and `vscode/src/tsconfig.entry.json`.
 
 ## Review Focus
 
@@ -185,7 +186,7 @@ git diff wsl-baseline -- extensions/picket-remote-wsl > ../build/patches/67-pick
 cd .. && git apply -R --check build/patches/67-picket-remote-wsl.patch --directory=vscode
 ```
 
-Expected: commit succeeds, the patch reverses cleanly (exit 0). Add `67-picket-remote-wsl.patch` to `build/patches/apply-list.txt` after `65-...`, and commit both in the main repo with `feat(wsl): add picket-remote-wsl skeleton (patch 67)`.
+Expected: commit succeeds, the patch reverses cleanly (exit 0). Add `67-picket-remote-wsl.patch` to `build/patches/apply-list.txt` after `65-...`, and commit both in the main repo with `feat(wsl): add picket-remote-wsl skeleton (patch 67)`. Then run `bash build/wsl/gate.sh` and expect four PASS lines (the `node --test` line passes with 4 tests from this task).
 
 ---
 
@@ -288,7 +289,7 @@ Expected: FAIL — `Cannot find module '../src/distro.js'`.
 Run: `cd vscode/extensions/picket-remote-wsl && node --test test/distro.test.js`
 Expected: PASS, 7 tests.
 
-- [ ] **Step 5: Commit and re-export the patch**
+- [ ] **Step 5: Commit, re-export the patch, run the gate**
 
 ```bash
 cd vscode && git add extensions/picket-remote-wsl && git commit -m "feat(wsl): wsl.exe runner with UTF-16LE-safe decoding and distro discovery"
@@ -750,7 +751,7 @@ git add build/patches/67-picket-remote-wsl.patch && git commit -m "chore(wsl): r
 
 **Interfaces:**
 - Consumes: everything from Tasks 2–7, plus `vscode.window`/`vscode.commands` passed in as a `host` object so tests need no VS Code runtime: `host = { showQuickPick(items, options), showOpenDialog(options), showInformationMessage(msg, ...actions), showErrorMessage(msg, ...actions), withProgress(options, task), openFolder(uri, options), executeCommand(id, ...args), showWarningMessage(msg, ...actions) }`.
-- Produces: `registerCommands({ host, log, resolver, components, settings, extensionPath }): vscode.Disposable[]` registering every command id from Task 1 except the two CLI-shim ones (Task 13) and the two gallery ones (Task 11).
+- Produces: `registerCommands({ host, log, resolver, components, settings, extensionPath }): vscode.Disposable[]` registering every command id from Task 1 except the two CLI-shim ones (Task 13) and the two gallery ones (Task 10).
 - Produces (tree.js): `buildDistroNodes(list: IDistro[], ctx: { activeDistro?: string }): IDistroNode[]` where `IDistroNode = { id, label, description, contextValue: 'activeDistro' | 'inactiveDistro', tooltip }` — `label` appends `（WSL 1）`/`（WSL 2）`, `description` appends `default distro` and `Connected`/`Not Connected`, and the default distro sorts first.
 - Produces (manage.js): `manageDistro({ host, runner, action, distro }): Promise<void>` for `action: 'add' | 'setDefault' | 'delete'`; `add` parses `wsl.exe --list --online` and hands the chosen name to a terminal command, `setDefault` runs `-e`-free `['--set-default', distro]`, `delete` requires a modal confirmation and then runs `['--unregister', distro]`.
 - Produces: `ensureComponentInteractive({ host, components, catalog, settings, extensionPath }): Promise<boolean>` — the first-use interception; returns `false` when the user cancels.
