@@ -1,6 +1,8 @@
 # Picket Code 的 WSL 支持 — 设计
 
-状态：**已批准（v4）** — 2026-11-04
+状态：**已批准（v5）** — 2026-11-04
+
+> v5 变更：对照官方 Remote-WSL 1.104.7 的**行为面**逐项核对后补齐 6 处体验缺口（菜单与激活事件、登录 shell 环境、路径转换、默认发行版检测、`WSL Targets` 树视图与发行版管理、失败动作与一次性建议），并把 WSL 内 CLI shim 从非目标移入 v1。不复制其代码、文案与命令 id。
 相关：`docs/wsl-icode.md`（方案比较与 9p 评估）、`noware-cn/picket-code-server`（server 产物）、`spikes/picket-remote-wsl/`（一次性参考实现）
 
 ## 1. 意图与 why
@@ -22,6 +24,10 @@ Windows 上的 Picket Code 打开 WSL 发行版里的文件夹时，工作区应
 - 载荷来源三条，优先级一致：显式路径/从文件安装 → 内嵌（仅 embedded 形态）→ 内网/公网 URL。
 - 扩展市场三种模式：默认 Open VSX、内网自建 Open VSX、彻底离线。
 - iCode 由用户在发行版内自备；扩展负责检测、注入路径、缺失时给可执行说明。
+- `WSL Targets` 树视图列出发行版（含 WSL 版本、默认标记、连接状态），并支持连接、设为默认、删除、添加发行版。
+- 启动 server 走发行版**登录 shell**，让 `nvm` / `pyenv` / `conda` 装的工具在远程扩展宿主里可见；另留 `server-env-setup` 注入钩子。
+- Windows ↔ WSL 路径双向转换（`wslpath -u` / `-w`），`Open Folder in WSL…` 用系统文件夹对话框，`Reopen Folder in Windows` 反向可用。
+- WSL 内 `picket-code .` 可用（CLI shim）。
 - 连接方式三档 `auto | direct | stdio`：默认直连，检测到 `localhostForwarding=false` 或镜像网络模式时自动走 stdio 隧道。
 - 任何失败都能被一句话解释清楚（列出尝试过的来源与原因）。
 
@@ -32,7 +38,7 @@ Windows 上的 Picket Code 打开 WSL 发行版里的文件夹时，工作区应
 - WSL-on-Web / exec server 连接路径。
 - iCode 载荷与版本钉死：iCode 由用户自备，扩展只做检测与注入，不负责安装。
 - 常驻 helper 进程（daemon）：跨窗口复用用运行时文件（§4.4）；`localhostForwarding=false` 用 §4.6 的 per-window 隧道，不需要 daemon。
-- WSL 内 CLI shim（`picket-code .`）：可选，不进第一版验收。
+- `WSL Targets` 树里"该发行版最近打开的文件夹"：没有公开 API 能取最近工作区，官方走私有通道；v1 只列发行版。
 - 遥测。
 
 ### 反目标（这样算失败，哪怕技术上跑通）
@@ -79,7 +85,10 @@ Picket Code (Windows)
 │   ├─ preflight.js    WSL 版本、.wslconfig、连接方式选择
 │   ├─ resolver.js     authority → {host, port, token}，运行时文件复用
 │   ├─ tunnel.js       stdio 隧道（auto 兜底）
-│   └─ commands.js     打开/重开/停止/日志/诊断/组件/市场来源/VSIX
+│   ├─ tree.js         WSL Targets 树视图的数据源
+│   ├─ manage.js       添加/设默认/删除发行版
+│   ├─ shim.js         在发行版内安装/移除 CLI shim
+│   └─ commands.js     15 条命令（§4.9）
 ├─ resources/payloads/catalog.json      组件目录（始终存在，几百字节）
 ├─ resources/wsl-payloads/             载荷（仅 embedded 形态）
 └─ 核心补丁 66         gallery 覆盖（product.overrides.json）
@@ -92,7 +101,7 @@ WSL2 发行版
 └─ ~/.picket-code-server/logs/
 ```
 
-启动链路：`spawn('wsl.exe', ['-d', distro, '-e', 'env', 'PICKET_ICODE_BIN=<abs>', '<server-bin>', ...flags])`，从 stdout 解析 `Extension host agent listening on <port>`，按连接方式交还 `{host, port, connectionToken}`。
+启动链路：`spawn('wsl.exe', ['-d', distro, '-e', 'sh', '-lc', 'exec "$0" "$@"', '<server-bin>', ...flags])`（登录 shell，叠加 `PICKET_ICODE_BIN=<abs>` 与可选的 `server-env-setup`），从 stdout 解析 `Extension host agent listening on <port>`，按连接方式交还 `{host, port, connectionToken}`。
 
 ### 4.3 组件目录与发布形态
 
@@ -145,7 +154,8 @@ WSL2 发行版
 - authority：`picket-wsl+<distro>`，`<distro>` 为空时取默认发行版。
 - 复用：启动前读发行版内 `runtime/<distro>.json`；`probe()` 通过且 tag 匹配 → 直接复用（跨窗口、跨重载），不新起进程。
 - 探活：`GET http://127.0.0.1:<port>/vscode-remote-resource?tkn=<token>`，**400 = 端口通且 token 对**，403 = token 错，拒绝 = 已死。超时 2 s，重试窗口 `picket.wsl.probeRetrySeconds`（默认 60）。走隧道时探隧道端口。
-- 启动参数：`--host=127.0.0.1 --port=0 --connection-token=<t> --use-host-proxy --without-browser-env-var --disable-websocket-compression --accept-server-license-terms --user-data-dir=... --extensions-dir=... --log=trace`；token 由 4 段 `crypto.randomInt` 拼接。
+- 启动方式：`wsl.exe -d <d> -e sh -lc 'exec "$0" "$@"' <payload>/bin/picket-code-server <args…>`。走登录 shell 是为了让发行版 profile 里的 `PATH`（`nvm` / `pyenv` / `conda`）与代理变量生效；二进制与参数一律以**位置参数**传递，不拼 shell 字符串。`<home>/.picket-code-server/server-env-setup` 若存在则先 `source`（与官方同名习惯），供内网注入 `LD_LIBRARY_PATH` / 私有 CA / 代理。
+- 启动参数：`--host=127.0.0.1 --port=0 --connection-token=<t> --use-host-proxy --without-browser-env-var --disable-websocket-compression --accept-server-license-terms --user-data-dir=... --extensions-dir=... --log=trace`；token 由 4 段 `crypto.randomInt` 拼接。profile 可能往 stdout 打横幅：端口解析按行匹配，非匹配行只进日志。
 - 看护：收到输出即重置计时；默认 90 s 无输出判失败（`picket.wsl.startTimeoutSeconds`）；`exit 99` → "发行版不兼容"。
 - 落盘：成功后写 `runtime/<distro>.json`（含 pid），失败清理。
 - 停止：`Picket: Stop WSL Server` → 按运行时文件杀进程树 → `wsl.exe -d <d> -e pkill -f 'picket-code-server.*<tag>'` → 删运行时文件。不做"退出即杀"。
@@ -205,8 +215,14 @@ WSL2 发行版
 7. `Picket: 诊断 WSL 支持` — WSL 版本、发行版、`.wslconfig` 关键项、连接方式、组件来源命中、iCode 位置、市场模式、运行时文件状态；可复制。
 8. `Picket: 选择扩展市场来源`。
 9. `Picket: 从 VSIX 安装扩展…`。
+10. `Picket: 添加发行版…` — `wsl --list --online` → 选择 → 在终端里执行 `wsl --install -d <name>`（需要提权时提示用户手动执行）。
+11. `Picket: 设为默认发行版` — `wsl --set-default <name>`。
+12. `Picket: 删除发行版…` — 模态确认"将永久删除该发行版及其全部数据" → `wsl --unregister <name>`。
+13. `Picket: 在 WSL 中安装命令行…` — 写入 shim 与 `~/.local/bin` 符号链接（§4.15）。
+14. `Picket: 从 WSL 中移除命令行`。
+15. `Picket: 刷新 WSL 目标` — 树视图标题栏按钮；重新枚举发行版。
 
-常驻：沿用远程指示器；`\\wsl.localhost` 本地窗口里一次性提示"重开可获得原生性能"。
+常驻：命令面板里的命令用 `when` 限定在 Windows 且非 Web（`isWindows && !isWeb`），`Reopen Folder in WSL/Windows` 再按 `remoteName` 与 `workspaceFolderCount` 收窄；同时把"连接 / 连接指定发行版 / 在新窗口连接 / Reopen in Windows / 查看日志 / 诊断"挂进核心的**远程指示器**（`statusBar/remoteIndicator`），并用 `resourceLabelFormatters` 让远端路径显示 `WSL` 后缀——官方把入口放在这里，用户不经过命令面板也能发现。`\\wsl.localhost` 本地窗口里一次性提示"重开可获得原生性能"。
 
 ### 4.10 首次使用拦截（仅 `ondemand`）
 
@@ -249,12 +265,38 @@ WSL2 发行版
 | **66** | gallery 覆盖 + 隐藏设置项 | 新增 |
 | 配置 | `product.json` 增加 `picketTag`、`noware.picket-remote-wsl: ["resolvers"]`、内置扩展条目 | 新增 |
 
+### 4.13 `WSL Targets` 树视图与发行版管理
+
+视图 id `picketWsl.targets`，挂在核心的 `remote` 视图容器（proposal `contribViewsRemote`），名称 `WSL 目标`，`when: isWindows && !isWeb`。
+
+- 一级节点 = 发行版：名称 + `（WSL 1）`/`（WSL 2）` 后缀，`default distro` 追加描述，`isDefault` 排首位；`active`（当前窗口 authority 指向它）用图标与 tooltip 区分 `Connected` / `Not Connected`；`docker-desktop*` 过滤掉（除非它是默认发行版）。
+- 二级节点**不做**（§2 非目标）。
+- 行内与右键：连接当前窗口 / 连接新窗口（`vscode.openFolder` 带 `remoteAuthority`，分别 `forceReuseWindow` / `forceNewWindow`）、设为默认发行版、删除发行版、刷新。
+- 标题栏：添加发行版、刷新。
+- 空状态（`viewsWelcome`）：未安装 WSL → 安装指引；已装 WSL 但无发行版 → "添加发行版"按钮。
+- 发行版名与状态一律来自 `wsl --list --verbose`（§4.4），不读注册表。
+
+### 4.14 登录 shell 与 server 环境
+
+- `sh -lc` 启动（§4.5）让 profile 生效，达到与官方"读 `env --null` 注入 `extensionHostEnv`"同样的效果，且没有 shim 依赖。
+- `<home>/.picket-code-server/server-env-setup`（可选，用户可写）在启动前被 source；文档说明它是内网注入代理 / CA / `LD_LIBRARY_PATH` 的唯一入口。
+- `PICKET_ICODE_BIN` 仍显式注入，覆盖 profile 里的值；iCode 检测顺序：设置项 → 登录 shell 里的 `command -v icode`。
+- 已知限制：只写在 `.bashrc` 且对非交互 shell 提前 return 的 PATH 拿不到——用 `server-env-setup` 兜底，诊断命令会显示 `node` / `git` 是否在 `PATH` 里。
+
+### 4.15 WSL 内 CLI shim（`picket-code .`）
+
+- 载荷已自带 `bin/remote-cli/picket-code`：上游 `server.cli.ts` 在 `VSCODE_CLIENT_COMMAND` 存在时把命令转发给桌面 CLI，并用 `VSCODE_CLI_AUTHORITY` 把文件/文件夹参数映射成远端 URI。我们只需设置这两个变量。
+- `Picket: 在 WSL 中安装命令行…` 写入 `<home>/.picket-code-server/bin/<tag>/bin/picket-code`（设 `VSCODE_CLIENT_COMMAND=<Windows 可执行文件，经 wslpath -u 转换>`、`VSCODE_CLI_AUTHORITY=picket-wsl+${WSL_DISTRO_NAME:-}`，再 `exec` 载荷的 remote-cli，参数原样透传），并在 `<home>/.local/bin/picket-code` 建符号链接（已存在且不属于我们则跳过并提示）。
+- `picket-code -` 的 stdin 重定向与 `--file` / `--folder-uri` 等参数由上游 CLI 处理，shim 不解释参数。
+- `[interop] enabled=false` 时 shim 无法调起 Windows 可执行文件：错误信息点名这一行。
+- 组件卸载或 `Picket: 从 WSL 中移除命令行` 时删除符号链接与脚本。
+
 ## 5. 组件清单
 
 ### 扩展 `extensions/picket-remote-wsl/`（内置）
 
 ```
-package.json        9 条命令、设置项、enabledApiProposals:["resolvers"]、extensionKind:["ui"]
+package.json        15 条命令、菜单/视图/资源标签贡献、enabledApiProposals、extensionKind:["ui"]
 extension.js        activate/deactivate、日志、注册
 src/catalog.js      读 catalog、校验与 product.json 一致性、embedded 判定
 src/components.js   状态机（absent/installing/installed/outdated/broken）、安装/更新/卸载/清理
@@ -267,9 +309,12 @@ src/tunnel.js       stdio 隧道
 src/probe.js        400/403/拒绝 三态
 src/resolver.js     复用、连接方式选择、探活、重启、dispose
 src/remoteUri.js    UNC ↔ 远程 URI
-src/commands.js     9 条命令
+src/commands.js     15 条命令与首次拦截
 src/diagnose.js     诊断报告
-src/nudge.js        一次性 UNC 提示
+src/nudge.js        一次性建议（UNC / WSL1 / /mnt/）
+src/tree.js         WSL Targets 树视图
+src/manage.js       添加/设默认/删除发行版
+src/shim.js         安装/移除 CLI shim
 src/log.js          OutputChannel + 文件
 ```
 
@@ -295,8 +340,8 @@ src/log.js          OutputChannel + 文件
 | 层 | 内容 | 在哪里跑 |
 |---|---|---|
 | L1 纯逻辑 | 目录解析与一致性、来源优先级、SHA256SUMS 解析、组件状态机、发行版输出解析、端口解析、参数构造、运行时文件读写、`.wslconfig` 解析、连接方式选择、UNC↔URI、探活三态、代理选项 | `node --test`，Linux CI |
-| L2 伪 `wsl.exe` | `-l -q` / `-e test` / `-e env` / `-e sh -lc 'command -v icode'` / 启动与日志输出 / 隧道 preamble；验证解析、看护超时、exit 99、复用、停止兜底、隧道二进制管道、离线 zip 安装 | Linux CI |
-| L3 真机 | Windows + WSL2：① 零网络首次打开（embedded）② ondemand 三条来源各一次 ③ 连续两次打开同发行版（复用）④ UNC vs 远程比较 ⑤ 停止后重开 ⑥ VSIX 离线安装 ⑦ 内网 Open VSX 切换 ⑧ `localhostForwarding=false` 隧道 + 大文件 + 20 次重连 | 发布前人工（RC 亦需全过） |
+| L2 伪 `wsl.exe` | `--list --verbose`（UTF-16LE + `*` 标记 + version 列）/ `--status` / `-e printenv HOME` / 登录 shell 启动的 argv 形态 / `-e sh -lc 'command -v icode'` / 启动与日志输出 / `wslpath -u` 与 `-w` / 树视图数据（三元组、`docker-desktop` 过滤、active/default 标记）/ 删除与设默认的 argv / shim 的参数映射（假 remote-cli）/ 隧道 preamble；验证解析、看护超时、exit 99、复用、停止兜底、隧道二进制管道、离线 zip 安装 | Linux CI |
+| L3 真机 | Windows + WSL2：① 零网络首次打开（embedded）② ondemand 三条来源各一次 ③ 连续两次打开同发行版（复用）④ UNC vs 远程比较 ⑤ 停止后重开 ⑥ VSIX 离线安装 ⑦ 内网 Open VSX 切换 ⑧ `localhostForwarding=false` 隧道 + 大文件 + 20 次重连 ⑨ 端口转发：WSL 里起 3000 端口服务，direct 与 stdio 两模式各访问一次 ⑩ `nvm` 装的 node 在远程任务里可见 ⑪ `picket-code .` 打开当前目录 ⑫ 树视图连接/设默认/删除/添加 ⑬ `docker-desktop` 不在列表 ⑭ `wslpath` 双向（中文与含空格路径） | 发布前人工（RC 亦需全过） |
 | L4 构建 | 两种形态的 catalog 一致性、防夹带、白名单、体积阈值、离线组件包自洽 | CI |
 
 真机清单并入 `docs/testing.md` 的六层矩阵。
@@ -304,8 +349,8 @@ src/log.js          OutputChannel + 文件
 ## 7. 里程碑
 
 - **M1 组件与 resolver**：`catalog.js` + `components.js` + `payload.js` + `launch.js` + `resolver.js`（含运行时文件复用）+ L1/L2 测试；Windows 上手动打开 `/home/<user>`。
-- **M2 UX 与 iCode**：9 条命令、诊断、UNC 提示、iCode 检测与注入、`preflight.js`（`.wslconfig` 检测）、首次拦截对话框、错误文案逐条落地。
-- **M3 市场三模式**：补丁 66 + 选择来源命令 + VSIX 安装 + 组件携带扩展包的通道。
+- **M2 UX 与 iCode**：15 条命令、`WSL Targets` 树视图与发行版管理、诊断、一次性建议（UNC / WSL1 / `/mnt/`）、iCode 检测与注入、`preflight.js`（`.wslconfig` 检测）、首次拦截对话框、失败通知的动作按钮、错误文案逐条落地。
+- **M3 市场三模式与 CLI shim**：补丁 66 + 选择来源命令 + VSIX 安装 + 组件携带扩展包的通道 + `shim.js`（安装/移除 `picket-code .`）。
 - **M4 打包、隧道与验收**：`picketTag` 盖章、catalog 生成、两形态打包与 `check-contract` 断言、离线组件包、`tunnel.js`、8 项真机清单、文档增补（`docs/wsl-icode.md` 加"A′ 落地版"）。
 
 ## 8. 留给实现者的决定
@@ -334,3 +379,9 @@ src/log.js          OutputChannel + 文件
 | 不做退出即杀 | 重载/重启不掉历史 | 需显式停止命令与 pid 清理 |
 | iCode 缺失不阻塞 | 编辑器/终端/搜索仍可用 | 靠一次性提示与诊断兜住 |
 | stdio 隧道作为 auto 兜底 | 直连依赖 localhost 中继 | ~250 行，80% 是流边界与进程生命周期 |
+| v1 做 `WSL Targets` 树视图与管理 | 官方的主入口就是这棵树；只有命令面板会明显损害发现性 | +~250 行、多一个 proposal（`contribViewsRemote`）；树里不做"最近文件夹" |
+| 登录 shell 启动 server | 官方靠 CLI shim 读 `env --null` 才有完整 PATH；`sh -lc` 达到同样效果且无 shim 依赖 | profile 横幅进日志；只写在 `.bashrc` 的 PATH 仍可能缺失，用 `server-env-setup` 兜底 |
+| CLI shim 进 v1 | walkthrough 最后一步就是 `code .`；上游 `server.cli.ts` 已实现转发 | 需要 interop；符号链接进 `~/.local/bin` 需告知用户 |
+| `--list --verbose` 而非 `-l -q` | 只有 verbose 输出带默认发行版标记与 WSL 版本列 | 解析 UTF-16LE 与列对齐；`docker-desktop*` 需过滤 |
+| 失败通知带动作按钮（重试/关闭窗口/查看日志） | 一次启动失败就重启整个窗口，代价太高 | 文案与状态机略复杂 |
+| 端口转发不额外实现 | workbench 的转发请求走已有 agent 连接，server 在 VM 内建连 | 必须在 L3 两模式下各验一次 |

@@ -4,18 +4,21 @@
 
 **Goal:** Ship a built-in `picket-remote-wsl` extension so Windows Picket Code can open folders inside a WSL2 distro, with the workspace running on a Picket Code server installed from a catalog-checked payload.
 
-**Architecture:** A UI-kind built-in extension registers the `picket-wsl` remote authority resolver. It enumerates distros via an injectable `wsl.exe` runner, ensures a server payload exists inside the distro (`~/.picket-code-server/payloads/server-<tag>/`), spawns `picket-code-server`, parses its listening port, and answers the resolver with `{ host: '127.0.0.1', port, connectionToken }` — or with a stdio-tunnelled local port when WSL's localhost forwarding is off. Payloads come from an explicit path, an embedded copy (intranet flavor only), or an intranet/public URL, and are always SHA256-checked against `payloads/catalog.json`.
+**Architecture:** A UI-kind built-in extension registers the `picket-wsl` remote authority resolver, contributes a `WSL 目标` tree view, and starts the server through the distro's login shell. It enumerates distros via an injectable `wsl.exe` runner, ensures a server payload exists inside the distro (`~/.picket-code-server/payloads/server-<tag>/`), spawns `picket-code-server`, parses its listening port, and answers the resolver with `{ host: '127.0.0.1', port, connectionToken }` — or with a stdio-tunnelled local port when WSL's localhost forwarding is off. Payloads come from an explicit path, an embedded copy (intranet flavor only), or an intranet/public URL, and are always SHA256-checked against `payloads/catalog.json`.
 
 **Tech Stack:** Plain CommonJS JavaScript inside `vscode/extensions/picket-remote-wsl/` (no compile step), `node --test` for L1/L2, `vscode.proposed.resolvers` API, `wsl.exe`, Node `http`/`net`/`child_process`, and repo build scripts under `build/wsl/` (Node ESM) for packaging and contract checks.
 
-**Spec:** `docs/superpowers/specs/2026-11-04-picket-wsl-design.md` (v4, commit `f74c929`)
+**Spec:** `docs/superpowers/specs/2026-11-04-picket-wsl-design.md` (v5)
 
 ## Global Constraints
 
 - Authority format is exactly `picket-wsl+<distro>`; `<distro>` empty means the default distro. Resolver registers prefix `picket-wsl`.
-- Extension id is `noware.picket-remote-wsl`; `extensionKind: ["ui"]`; `enabledApiProposals: ["resolvers"]`; matching entry `"noware.picket-remote-wsl": ["resolvers"]` in `build/product.json` → `extensionEnabledApiProposals`.
+- Extension id is `noware.picket-remote-wsl`; `extensionKind: ["ui"]`; `enabledApiProposals: ["resolvers", "contribViewsRemote"]`; matching entry `"noware.picket-remote-wsl": ["resolvers", "contribViewsRemote"]` in `build/product.json` → `extensionEnabledApiProposals`. Activation events are `onStartupFinished` and `onResolveRemoteAuthority:picket-wsl` (core emits the second one per authority prefix, `extHostExtensionService.ts:849`).
 - In-distro layout, all under the distro user's `$HOME`: `~/.picket-code-server/payloads/server-<tag>/`, `~/.picket-code-server/runtime/<distro>.json`, `~/.picket-code-server/data/`, `~/.picket-code-server/extensions/`, `~/.picket-code-server/logs/`.
 - Server flags, verbatim: `--host=127.0.0.1 --port=0 --connection-token=<token> --use-host-proxy --without-browser-env-var --disable-websocket-compression --accept-server-license-terms --user-data-dir=<data> --extensions-dir=<ext> --log=trace`.
+- Server start goes through the distro login shell: `wsl.exe -d <d> -e sh -lc '<constant script>' <binary> <setupFile> <icodeBin> <flags...>` where the script is `setup="$1"; icode="$2"; shift 2; [ -f "$setup" ] && . "$setup"; [ -n "$icode" ] && export PICKET_ICODE_BIN="$icode"; exec "$0" "$@"`. Values travel as argv, never inside the script text; `setupFile` is `<home>/.picket-code-server/server-env-setup` (may not exist), `icodeBin` is `""` when unset.
+- Distro enumeration uses `wsl.exe --list --verbose` (UTF-16LE). The default distro is the row whose first column is `*`; the last column is the WSL major version. `-l -q` is not used: it carries neither. Rows matching `docker-desktop*` are hidden unless they are the default.
+- WSL ↔ Windows path conversion is `wslpath -u` (Windows→Linux) and `wslpath -w` (Linux→Windows), executed inside the distro; failures surface `wslpath failed: <stderr>`.
 - Port is read from server stdout with `Extension host agent listening on (\d+)`; connection token is 4 segments joined by `-`, each from `crypto.randomInt(0x100000000).toString(16).padStart(8, '0')`.
 - Liveness probe: `GET http://<host>:<port>/vscode-remote-resource?tkn=<token>` — 400 = alive, 403 = token mismatch, anything else (refused/timeout) = dead. Timeout 2 s.
 - Start watchdog: 90 s without any server output fails the start (`picket.wsl.startTimeoutSeconds`, default 90). Server exit code 99 = distro not supported.
@@ -28,11 +31,12 @@
 
 ## Review Focus
 
-1. **`wsl.exe -l -q` emits UTF-16LE.** A UTF-8-only decoder yields distro names with embedded NULs, so every distro lookup fails with a confusing "distro not found". Pinned by a test in Task 2 that feeds UTF-16LE and UTF-8 buffers to the decoder.
+1. **`wsl.exe --list --verbose` emits UTF-16LE, and it is the only form that carries the default marker and the WSL version.** A UTF-8-only decoder yields distro names with embedded NULs, so every distro lookup fails with a confusing "distro not found"; using `-l -q` instead loses the `*` column and the `VERSION` column, so "the default distro" silently becomes "the first row". Pinned by a test in Task 2 that feeds UTF-16LE and UTF-8 buffers to the decoder and asserts the `*`/version columns.
 2. **Distro names with spaces, dots or non-ASCII** (`Ubuntu 22.04 LTS`, `Ubuntu-24.04`). They travel through an authority string, a URI, and `-d <name>`. Pinned in Task 2 (enumeration keeps trailing whitespace out, drops `\r`) and Task 6 (authority round-trips through `remoteUriFor`).
 3. **Two windows opening the same distro at the same time.** Both see "installed" and both spawn a server, so two servers race for `data/`. Pinned by the first-start lock test in Task 5.
 4. **Disk full or an interrupted `tar` stream** leaves a half-extracted `payloads/server-<tag>/` that later starts fail on with no explanation. Pinned by the atomic-install test in Task 3 (writes to `.tmp-<rand>` then renames; a failure leaves nothing behind).
-5. **Noisy stdout from the distro**: a shell profile banner or `wsl.exe`'s own warnings before the listening line, or server output after it. Pinned by the port-parser test in Task 5 (banner lines before and unrelated lines after are ignored) and the tunnel preamble test in Task 11.
+5. **Noisy stdout from the distro**: a shell profile banner or `wsl.exe`'s own warnings before the listening line, or server output after it. Starting through a **login shell** makes banners more likely, not less. Pinned by the port-parser test in Task 5 (banner lines before and unrelated lines after are ignored) and the tunnel preamble test in Task 12.
+6. **A login shell is not an interactive shell.** Many distros return early from `.bashrc` for non-interactive shells, so a `PATH` export that lives only there stays invisible to the server; conversely a `PATH` export in `.profile` is picked up. The `server-env-setup` hook is the documented escape hatch, and `Picket: 诊断 WSL 支持` prints whether `node` and `git` resolve — pinned by the `buildServerArgs` argv test in Task 5 plus a line of the diagnostics test in Task 9.
 
 ---
 
@@ -53,7 +57,10 @@
 - `.../src/tunnel.js` — stdio tunnel.
 - `.../src/resolver.js` — authority resolution, reuse, restart, dispose.
 - `.../src/remoteUri.js` — UNC ↔ remote URI conversion.
-- `.../src/commands.js` — the nine commands.
+- `.../src/commands.js` — command registration and the first-use interception.
+- `.../src/tree.js` — `WSL Targets` tree data (distro rows, badges, context values).
+- `.../src/manage.js` — add / set-default / delete distro.
+- `.../src/shim.js` — install and remove the in-distro `picket-code` CLI shim.
 - `.../src/diagnose.js` — diagnostic report.
 - `.../src/nudge.js` — one-time hint in `\\wsl.localhost` windows.
 - `.../src/log.js` — OutputChannel + log file path.
@@ -89,7 +96,7 @@
 **Interfaces:**
 - Produces: `loadCatalog(extensionPath: string): Promise<ICatalog>` where `ICatalog = { tag: string | null, flavor: 'embedded' | 'ondemand', components: ICatalogComponent[] }` and `ICatalogComponent = { id: string, kind: 'server' | 'extensions', version: string, file: string, size: number, sha256: string, embedded: boolean, embeddedPath?: string }`. Missing or malformed catalog resolves to `{ tag: null, flavor: 'ondemand', components: [] }` — never throws.
 - Produces: `createLog(context: vscode.ExtensionContext): { info(msg: string): void, error(msg: string): void, show(): void, logFile: string }`.
-- Produces: command ids `picket.wsl.openFolder`, `picket.wsl.reopenInWsl`, `picket.wsl.reopenInWindows`, `picket.wsl.showLog`, `picket.wsl.stopServer`, `picket.wsl.components`, `picket.wsl.diagnose`, `picket.wsl.selectGallery`, `picket.wsl.installVsix`, and settings `picket.wsl.{defaultDistro,serverPayloadPath,serverPayloadBaseUrl,icodePath,startTimeoutSeconds,probeRetrySeconds,tunnelMode,caFile}`.
+- Produces: command ids `picket.wsl.openFolder`, `picket.wsl.reopenInWsl`, `picket.wsl.reopenInWindows`, `picket.wsl.stopServer`, `picket.wsl.components`, `picket.wsl.showLog`, `picket.wsl.diagnose`, `picket.wsl.addDistro`, `picket.wsl.setDefaultDistro`, `picket.wsl.deleteDistro`, `picket.wsl.selectGallery`, `picket.wsl.installVsix`, `picket.wsl.installCli`, `picket.wsl.removeCli`, `picket.wsl.refreshTargets`, and settings `picket.wsl.{defaultDistro,serverPayloadPath,serverPayloadBaseUrl,icodePath,startTimeoutSeconds,probeRetrySeconds,tunnelMode,caFile}`.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -150,7 +157,9 @@ Expected: FAIL — `Cannot find module '../src/catalog.js'`.
 
 - [ ] **Step 3: Create the extension manifest, `catalog.js`, `log.js`, `.vscodeignore`**
 
-`package.json` fields to get right: `"name": "picket-remote-wsl"`, `"publisher": "noware"`, `"main": "./extension.js"`, `"extensionKind": ["ui"]`, `"enabledApiProposals": ["resolvers"]`, `"engines": { "vscode": "^1.143.0" }`, `"activationEvents": ["onStartupFinished"]`, the nine command ids with `Picket:`-prefixed titles from the spec §4.9, and the eight settings from Global Constraints. `.vscodeignore` excludes `test/**` and `**/*.map`.
+`package.json` fields to get right: `"name": "picket-remote-wsl"`, `"publisher": "noware"`, `"main": "./extension.js"`, `"extensionKind": ["ui"]`, `"enabledApiProposals": ["resolvers", "contribViewsRemote"]`, `"engines": { "vscode": "^1.143.0" }`, `"activationEvents": ["onStartupFinished", "onResolveRemoteAuthority:picket-wsl"]`, the fifteen command ids with `Picket:`-prefixed titles from spec §4.9, and the eight settings from Global Constraints.
+
+Also in the manifest, because discovery is the difference between "works" and "findable": `contributes.menus.commandPalette` entries with `when: "isWindows && !isWeb"` (plus `remoteName`/`workspaceFolderCount` narrowing for the reopen commands), `contributes.menus["statusBar/remoteIndicator"]` entries for connect / connect-distro / connect-new-window / reopen-in-windows / show-log / diagnose in group `remote_10_picket-wsl_0_local` (and `_1_open` for the connected-window ones), `contributes.views.remote` with `picketWsl.targets` named `WSL 目标` and `when: "isWindows && !isWeb"` plus `view/title` entries for `picket.wsl.refreshTargets` and `picket.wsl.addDistro`, two `contributes.viewsWelcome` entries (WSL missing, no distros), and `contributes.resourceLabelFormatters` for scheme `vscode-remote` / authority `picket-wsl+*` with `label: "${path}"`, `separator: "/"`, `tildify: true`, `workspaceSuffix: "WSL"`. `.vscodeignore` excludes `test/**` and `**/*.map`.
 
 `catalog.js` exports only `loadCatalog`. Validation rule: a component is kept only if `id`, `kind`, `version`, `file` are non-empty strings, `sha256` matches `/^[0-9a-f]{64}$/`, and `size` is a positive integer; when `embedded` is true, `embeddedPath` must be a relative path that does not contain `..`.
 
@@ -190,17 +199,18 @@ Expected: commit succeeds, the patch reverses cleanly (exit 0). Add `67-picket-r
 **Interfaces:**
 - Produces: `decodeWslOutput(buffer: Buffer): string` — if the buffer contains a `0x00` byte, decode as `utf16le`, else `utf8`; strip `\uFEFF`, split on `/\r?\n/`, trim each line, drop empty lines, join with `\n`.
 - Produces: `createWslRunner({ wslPath = 'wsl.exe', spawn = require('node:child_process').spawn, cwd, timeoutMs = 30000 }): IWslRunner` with `IWslRunner = { exec(args: string[], opts?: { input?: string | Buffer, timeoutMs?: number }): Promise<{ code: number, stdout: string, stderr: string }>, spawn(args: string[]): { child, stdout, stderr } }`. `exec` rejects only on spawn error (`ENOENT`) or timeout; non-zero exit codes resolve with `code`.
-- Produces: `listDistros(runner): Promise<string[]>`, `defaultDistro(runner): Promise<string>`, `distroHome(runner, distro): Promise<string>`, `isWsl1(runner, distro): Promise<boolean>`, `distroStatus(runner, distro): Promise<'missing' | 'ok'>`.
+- Produces: `parseDistroTable(stdout: string): IDistro[]` where `IDistro = { name: string, isDefault: boolean, version: '1' | '2', state: string }`, parsed from `wsl.exe --list --verbose` (header row skipped; the `*` column carries the default; the last column is the WSL major version; `state` keeps whatever the column says).
+- Produces: `listDistros(runner): Promise<IDistro[]>`, `defaultDistro(runner): Promise<string>` (first `isDefault`, else the first row), `visibleDistros(list): IDistro[]` (drops names matching `/^docker-desktop/i` unless `isDefault`), `distroHome(runner, distro)`, `isWsl1(runner, distro)`, `distroStatus(runner, distro): Promise<'missing' | 'ok'>`, and `wslStatus(runner): Promise<{ installed: boolean, kernelUpdateRequired: boolean }>` from `wsl.exe --status` (`installed` is false when the command fails with stderr matching `/not installed|not enabled/i`; `kernelUpdateRequired` when stderr matches `/kernel/i`).
 - Consumes: nothing from earlier tasks.
 
 - [ ] **Step 1: Write the failing test**
 
-`test/distro.test.js` — cases: UTF-16LE buffer decodes; UTF-8 buffer decodes; `listDistros` drops `\r` and blank lines and keeps a name with a space; a fake runner returning code 1 for an unknown distro makes `distroStatus` report `'missing'`; `distroHome` returns the single non-empty line of `-e printenv HOME`.
+`test/distro.test.js` — cases: a UTF-16LE verbose table decodes with the `*` marker and the version column; a UTF-8 buffer without NULs decodes; `visibleDistros` hides `docker-desktop` unless it is the default; a non-zero exit for an unknown distro makes `distroStatus` report `'missing'`; `wslStatus` reports `installed: false` for `WSL is not installed`; `distroHome` returns the single non-empty line of `-e printenv HOME`.
 
 ```js
 const test = require('node:test');
 const assert = require('node:assert');
-const { decodeWslOutput, listDistros, distroHome, distroStatus } = require('../src/distro.js');
+const { decodeWslOutput, parseDistroTable, listDistros, visibleDistros, distroHome, distroStatus, wslStatus } = require('../src/distro.js');
 
 function runner(responses) {
 	return { exec: async (args) => {
@@ -211,23 +221,49 @@ function runner(responses) {
 	}, spawn: () => { throw new Error('not used'); } };
 }
 
-test('decodes UTF-16LE distro listings', () => {
-	const buf = Buffer.from('Ubuntu-24.04\r\nDebian\r\n\r\n', 'utf16le');
-	assert.deepStrictEqual(decodeWslOutput(buf).split('\n'), ['Ubuntu-24.04', 'Debian']);
+const TABLE = [
+	'  NAME            STATE           VERSION',
+	'* Ubuntu-24.04    Running         2',
+	'  Ubuntu 22.04 LTS Stopped        1',
+	'  docker-desktop  Running         2',
+	''
+].join('\r\n');
+
+test('decodes a UTF-16LE verbose table with marker and version', () => {
+	const list = parseDistroTable(decodeWslOutput(Buffer.from(TABLE, 'utf16le')));
+	assert.deepStrictEqual(list, [
+		{ name: 'Ubuntu-24.04', isDefault: true, version: '2', state: 'Running' },
+		{ name: 'Ubuntu 22.04 LTS', isDefault: false, version: '1', state: 'Stopped' },
+		{ name: 'docker-desktop', isDefault: false, version: '2', state: 'Running' }
+	]);
 });
 
 test('decodes UTF-8 output without NUL bytes', () => {
 	assert.strictEqual(decodeWslOutput(Buffer.from('Ubuntu 22.04 LTS\r\n')), 'Ubuntu 22.04 LTS');
 });
 
-test('lists distros keeping names with spaces', async () => {
-	const r = runner({ '-l -q': { code: 0, stdout: Buffer.from('Ubuntu 22.04 LTS\r\nDebian\r\n\r\n', 'utf16le'), stderr: '' } });
-	assert.deepStrictEqual(await listDistros(r), ['Ubuntu 22.04 LTS', 'Debian']);
+test('hides docker-managed distros unless they are the default', () => {
+	const list = parseDistroTable(TABLE);
+	assert.deepStrictEqual(visibleDistros(list).map(d => d.name), ['Ubuntu-24.04', 'Ubuntu 22.04 LTS']);
+	const promoted = parseDistroTable(TABLE.replace('* Ubuntu-24.04', '  Ubuntu-24.04').replace('  docker-desktop', '* docker-desktop'));
+	assert.ok(visibleDistros(promoted).some(d => d.name === 'docker-desktop'));
+});
+
+test('lists distros through the runner', async () => {
+	const r = runner({ '--list --verbose': { code: 0, stdout: Buffer.from(TABLE, 'utf16le'), stderr: '' } });
+	const list = await listDistros(r);
+	assert.strictEqual(list[0].name, 'Ubuntu-24.04');
+	assert.strictEqual(list[0].isDefault, true);
 });
 
 test('reports a missing distro from a non-zero exit', async () => {
 	const r = runner({ '-d Nope -e true': { code: 1, stdout: '', stderr: '' } });
 	assert.strictEqual(await distroStatus(r, 'Nope'), 'missing');
+});
+
+test('reports WSL as not installed from --status', async () => {
+	const r = runner({ '--status': { code: 1, stdout: '', stderr: 'WSL is not installed. Run wsl --install.' } });
+	assert.deepStrictEqual(await wslStatus(r), { installed: false, kernelUpdateRequired: false });
 });
 
 test('reads $HOME from the distro', async () => {
@@ -243,14 +279,14 @@ Expected: FAIL — `Cannot find module '../src/distro.js'`.
 
 - [ ] **Step 3: Implement `distro.js`**
 
-`exec` collects stdout/stderr as raw `Buffer`s (no `setEncoding`), resolves on `close` with the exit code, rejects on spawn `error` and on timeout (kill the child, reject with `Timed out after <ms> ms: wsl.exe <args>`). Args are always `['-d', distro, '-e', ...]` — no shell, no string building. `listDistros` splits on newlines, and `distroStatus` maps `code === 0` to `'ok'`, anything else to `'missing'`.
+`exec` collects stdout/stderr as raw `Buffer`s (no `setEncoding`), resolves on `close` with the exit code, rejects on spawn `error` and on timeout (kill the child, reject with `Timed out after <ms> ms: wsl.exe <args>`). Args are always `['-d', distro, '-e', ...]` — no shell, no string building. `parseDistroTable` skips the header, then matches `/^(\*|\s)\s*(.+?)\s+(\w+)\s+(\d)\s*$/` per line and uses `\1 === '*'` for `isDefault`; a line that does not match is dropped and logged, never treated as a distro. `listDistros` calls `['--list', '--verbose']` and pipes the buffer through `decodeWslOutput`. `isWsl1` reads `version === '1'` from the same table. `distroStatus` maps `code === 0` to `'ok'`, anything else to `'missing'`.
 
-`test/fixtures/fake-wsl.js`: a Node script invoked as `node fake-wsl.js <args...>` that prints canned UTF-16LE output for `-l -q`, `printenv HOME`, and exits 1 for unknown distros. It exists so Task 4's L2 tests can exercise the real spawn path on Linux.
+`test/fixtures/fake-wsl.js`: a Node script invoked as `node fake-wsl.js <args...>` that prints the canned UTF-16LE verbose table for `--list --verbose`, the `--status` failure text, `printenv HOME`, and exits 1 for unknown distros. It exists so Task 4's L2 tests can exercise the real spawn path on Linux.
 
 - [ ] **Step 4: Run the test to verify it passes**
 
 Run: `cd vscode/extensions/picket-remote-wsl && node --test test/distro.test.js`
-Expected: PASS, 5 tests.
+Expected: PASS, 7 tests.
 
 - [ ] **Step 5: Commit and re-export the patch**
 
@@ -482,8 +518,8 @@ git add build/patches/67-picket-remote-wsl.patch && git commit -m "chore(wsl): r
 
 **Interfaces:**
 - Consumes: `IWslRunner` (Task 2).
-- Produces: `serverPaths(home: string, tag: string)` → `{ payloadDir, binary, dataDir, extensionsDir, runtimeFile, logDir }` (all POSIX strings; `binary` ends with `/bin/picket-code-server`; `runtimeFile` is `<home>/.picket-code-server/runtime.json`).
-- Produces: `buildServerArgs({ paths, connectionToken, icodeBin, distro }): string[]` — the flags from Global Constraints, in that order, with `PICKET_ICODE_BIN` supplied through `env` like `['-d', distro, '-e', 'env', 'PICKET_ICODE_BIN=' + icodeBin, binary, ...flags]` when `icodeBin` is set, else `['-d', distro, '-e', binary, ...flags]`.
+- Produces: `serverPaths(home: string, tag: string)` → `{ payloadDir, binary, dataDir, extensionsDir, runtimeFile, logDir, envSetupFile }` (all POSIX strings; `binary` ends with `/bin/picket-code-server`; `runtimeFile` is `<home>/.picket-code-server/runtime.json`; `envSetupFile` is `<home>/.picket-code-server/server-env-setup`; `remoteCli` is `<payloadDir>/bin/remote-cli/picket-code`; `cliLink` is `<home>/.local/bin/picket-code`).
+- Produces: `LAUNCH_SCRIPT = 'setup="$1"; icode="$2"; shift 2; [ -f "$setup" ] && . "$setup"; [ -n "$icode" ] && export PICKET_ICODE_BIN="$icode"; exec "$0" "$@"'` and `buildServerArgs({ paths, connectionToken, icodeBin, distro }): string[]` → `['-d', distro, '-e', 'sh', '-lc', LAUNCH_SCRIPT, paths.binary, paths.envSetupFile, icodeBin ?? '', ...flags]` with the flags from Global Constraints in that order. The script is a constant; every value is an argv entry, so paths and flags with spaces, quotes or non-ASCII never reach a shell parser.
 - Produces: `createPortParser(): { feed(text: string): void, port: number | undefined }` — first match of `Extension host agent listening on (\d+)`.
 - Produces: `newConnectionToken(): string`.
 - Produces: `lockAndRead(runner, distro, runtimeFile): Promise<IRuntimeInfo | undefined>` and `writeRuntime(runner, runtimeFile, info: IRuntimeInfo)`, `clearRuntime(runner, runtimeFile)`, `IRuntimeInfo = { port: number, token: string, tag: string, pid: number, startedAt: string }`.
@@ -507,14 +543,22 @@ test('serverPaths composes the documented layout', () => {
 	assert.strictEqual(p.runtimeFile, '/home/u/.picket-code-server/runtime.json');
 });
 
-test('buildServerArgs emits the documented flags and env', () => {
+test('buildServerArgs launches through a login shell with argv-passed values', () => {
 	const p = serverPaths('/home/u', 'T');
 	const args = buildServerArgs({ paths: p, connectionToken: 'a-b-c-d', icodeBin: '/usr/local/bin/icode', distro: 'Ubuntu' });
-	assert.deepStrictEqual(args.slice(0, 6), ['-d', 'Ubuntu', '-e', 'env', 'PICKET_ICODE_BIN=/usr/local/bin/icode', p.binary]);
+	assert.deepStrictEqual(args.slice(0, 9), ['-d', 'Ubuntu', '-e', 'sh', '-lc', LAUNCH_SCRIPT, p.binary, p.envSetupFile, '/usr/local/bin/icode']);
+	assert.ok(!args.includes('env'));   // PICKET_ICODE_BIN travels inside the launch script, not a second binary
 	assert.ok(args.includes('--without-browser-env-var'));
 	assert.ok(args.includes('--port=0'));
 	assert.ok(args.includes(`--user-data-dir=${p.dataDir}`));
 	assert.ok(args.includes('--connection-token=a-b-c-d'));
+});
+
+test('a space and a quote inside the icode path stay one argv entry', () => {
+	const p = serverPaths('/home/u', 'T');
+	const args = buildServerArgs({ paths: p, connectionToken: 'x', icodeBin: "/home/u/my tools/it's icode", distro: 'Ubuntu 22.04 LTS' });
+	assert.strictEqual(args[1], 'Ubuntu 22.04 LTS');
+	assert.strictEqual(args[8], "/home/u/my tools/it's icode");
 });
 
 test('the port parser ignores banners and trailing noise', () => {
@@ -542,17 +586,17 @@ Expected: FAIL — modules not found.
 
 - [ ] **Step 3: Implement `launch.js` and `probe.js`**
 
-`startServer` spawns through `runner.spawn(args)`, wires `stdout`/`stderr` text through `createPortParser` plus a rolling 40-line buffer, resets the watchdog on every chunk, and resolves on the first parsed port with a new `IRuntimeInfo`. Failure paths: timeout (`Start timed out after <ms> ms`, appending the last 40 lines), exit 99 (message mentions WSL1/unsupported distro), any other non-zero exit. `lockAndRead` is one `sh -c` call that prints the lock byte and the runtime file in one shot, so a single round trip decides reuse; a `0` byte means "no lock" and `undefined` is returned. `writeRuntime` writes to `<runtimeFile>.tmp` then `mv`s; `clearRuntime` removes the lock and the runtime file. `stopServer` runs `runner.exec(['-d', distro, '-e', 'kill', '-TERM', String(info.pid)])`, waits 5 s, probes once (`probeServer`), then `runner.exec(['-d', distro, '-e', 'sh', '-c', 'kill -9 "$1"', 'sh', String(info.pid)])`, then `sh -c 'pkill -f "picket-code-server.*$1"'` for stragglers, then clears the runtime file — each step logged, and a failure in one step does not abort the next.
+`startServer` spawns through `runner.spawn(args)`, wires `stdout`/`stderr` text through `createPortParser` plus a rolling 40-line buffer, resets the watchdog on every chunk, and resolves on the first parsed port with a new `IRuntimeInfo`. Because the launch goes through a login shell, profile banners are expected: any line that is not the listening line is logged, never parsed. If `paths.envSetupFile` exists it was already sourced by the launch script, so nothing here re-reads it. Failure paths: timeout (`Start timed out after <ms> ms`, appending the last 40 lines), exit 99 (message mentions WSL1/unsupported distro), any other non-zero exit. `lockAndRead` is one `sh -c` call that prints the lock byte and the runtime file in one shot, so a single round trip decides reuse; a `0` byte means "no lock" and `undefined` is returned. `writeRuntime` writes to `<runtimeFile>.tmp` then `mv`s; `clearRuntime` removes the lock and the runtime file. `stopServer` runs `runner.exec(['-d', distro, '-e', 'kill', '-TERM', String(info.pid)])`, waits 5 s, probes once (`probeServer`), then `runner.exec(['-d', distro, '-e', 'sh', '-c', 'kill -9 "$1"', 'sh', String(info.pid)])`, then `sh -c 'pkill -f "picket-code-server.*$1"'` for stragglers, then clears the runtime file — each step logged, and a failure in one step does not abort the next.
 
 - [ ] **Step 4: Run the tests to verify they pass**
 
 Run: `cd vscode/extensions/picket-remote-wsl && node --test test/launch.test.js test/probe.test.js`
-Expected: PASS, 8 tests.
+Expected: PASS — every case in `launch.test.js` and `probe.test.js`.
 
 - [ ] **Step 5: Commit and re-export the patch**
 
 ```bash
-cd vscode && git add extensions/picket-remote-wsl && git commit -m "feat(wsl): server launch, port parsing, watchdog, runtime file and stop"
+cd vscode && git add extensions/picket-remote-wsl && git commit -m "feat(wsl): server launch through the distro login shell, port parsing, watchdog, runtime file and stop"
 git diff wsl-baseline -- extensions/picket-remote-wsl > ../build/patches/67-picket-remote-wsl.patch
 cd .. && git apply -R --check build/patches/67-picket-remote-wsl.patch --directory=vscode
 git add build/patches/67-picket-remote-wsl.patch && git commit -m "chore(wsl): refresh patch 67"
@@ -573,13 +617,13 @@ git add build/patches/67-picket-remote-wsl.patch && git commit -m "chore(wsl): r
 - Consumes: `createComponentManager` (Task 4), `startServer`/`stopServer`/`lockAndRead`/`writeRuntime`/`probeServer` (Task 5), `listDistros`/`defaultDistro`/`distroHome`/`distroStatus` (Task 2).
 - Produces: `createResolver({ runner, components, settings, log, tunnelFactory }): IResolver` with `resolve(remoteAuthority: string): Promise<ResolverResultLike>` where `ResolverResultLike = { host: string, port: number, connectionToken: string }`, plus `stop(distro): Promise<void>` and `dispose(): void`.
 - Produces: `parseAuthority(authority: string): string` — strips the leading `picket-wsl+` and returns the distro, or `''`.
-- Produces (remoteUri.js): `remoteUriFor(distro: string, posixPath: string): { scheme: 'vscode-remote', authority: string, path: string }` and `parseUncPath(path: string): { distro: string, posixPath: string } | undefined` for `\\wsl.localhost\<distro>\<posix>` and `\\wsl$\<distro>\<posix>`.
+- Produces (remoteUri.js): `remoteUriFor(distro: string, posixPath: string): { scheme: 'vscode-remote', authority: string, path: string }`, `parseUncPath(path: string): { distro: string, posixPath: string } | undefined` for `\\wsl.localhost\<distro>\<posix>` and `\\wsl$\<distro>\<posix>`, plus `toPosixPath(runner, distro, windowsPath): Promise<string>` (`wslpath -u`) and `toWindowsPath(runner, distro, posixPath): Promise<string>` (`wslpath -w`). Both trim the output, reject with `wslpath failed: <stderr>` on a non-zero exit, and are the only place a Windows path is turned into a Linux one.
 
 - [ ] **Step 1: Write the failing tests**
 
 `test/resolver.test.js` — cases: an empty distro resolves to the default one; a live runtime file whose `tag` matches the catalog is reused without spawning; a runtime file for a different tag triggers a new start; a dead probe (refused) triggers a restart and clears the stale runtime file; a missing distro rejects with `Distro "X" not found`; a payload that is absent and unreachable rejects with a message containing `No source for wsl-server`.
 
-`test/remoteUri.test.js` — cases: `remoteUriFor('Ubuntu-24.04', '/home/u/proj')` → authority `picket-wsl+Ubuntu-24.04`, path `/home/u/proj`; `parseAuthority('picket-wsl+Ubuntu 22.04 LTS')` → `'Ubuntu 22.04 LTS'`; UNC paths in both `wsl.localhost` and `wsl$` forms parse; a Windows path returns undefined.
+`test/remoteUri.test.js` — cases: `remoteUriFor('Ubuntu-24.04', '/home/u/proj')` → authority `picket-wsl+Ubuntu-24.04`, path `/home/u/proj`; `parseAuthority('picket-wsl+Ubuntu 22.04 LTS')` → `'Ubuntu 22.04 LTS'`; UNC paths in both `wsl.localhost` and `wsl$` forms parse; a Windows path returns undefined; `toPosixPath` turns `C:\\Users\\u\\我的 项目` into `/mnt/c/Users/u/我的 项目` and `toWindowsPath` reverses it; a `wslpath` non-zero exit rejects with the stderr text.
 
 ```js
 test('an empty distro resolves to the default distro', async () => {
@@ -592,6 +636,12 @@ test('UNC paths parse for both prefixes', () => {
 	assert.deepStrictEqual(parseUncPath('\\\\wsl$\\Debian\\srv\\app'), { distro: 'Debian', posixPath: '/srv/app' });
 	assert.strictEqual(parseUncPath('C:\\Users\\u'), undefined);
 });
+
+test('wslpath converts in both directions', async () => {
+	const r = { exec: async (args) => ({ code: 0, stdout: args[3] === '-u' ? '/mnt/c/Users/u/我的 项目\r\n' : 'C:\\Users\\u\\我的 项目\r\n', stderr: '' }) };
+	assert.strictEqual(await toPosixPath(r, 'Ubuntu', 'C:\\Users\\u\\我的 项目'), '/mnt/c/Users/u/我的 项目');
+	assert.strictEqual(await toWindowsPath(r, 'Ubuntu', '/mnt/c/Users/u/我的 项目'), 'C:\\Users\\u\\我的 项目');
+});
 ```
 
 - [ ] **Step 2: Run the tests to verify they fail**
@@ -601,12 +651,12 @@ Expected: FAIL — modules not found.
 
 - [ ] **Step 3: Implement `resolver.js`, `remoteUri.js`, and wire `extension.js`**
 
-`resolve` order: parse authority → `listDistros` (reject `Distro "<x>" not found` listing the available ones) → `distroHome` → `lockAndRead` → if a runtime exists and `probeServer` is `'alive'` and `tag` matches, return `{ host: '127.0.0.1', port, connectionToken: token }` → otherwise `components.ensure('wsl-server')`, `startServer`, `writeRuntime`, and return the fresh coordinates. Concurrent resolves for the same distro share one in-flight promise. `extension.js` registers `vscode.workspace.registerRemoteAuthorityResolver('picket-wsl', { resolve: (authority) => resolver.resolve(authority).then(result => new (require('vscode').ResolvedAuthority)(result.host, result.port, result.connectionToken)) })` and disposes it on deactivate together with `resolver.dispose()`.
+`resolve` order: parse authority → `listDistros` (reject `Distro "<x>" not found` listing `visibleDistros(list).map(d => d.name)`) → `distroHome` → `lockAndRead` → if a runtime exists and `probeServer` is `'alive'` and `tag` matches, return `{ host: '127.0.0.1', port, connectionToken: token }` → otherwise `components.ensure('wsl-server')`, `startServer`, `writeRuntime`, and return the fresh coordinates. Concurrent resolves for the same distro share one in-flight promise. `extension.js` registers `vscode.workspace.registerRemoteAuthorityResolver('picket-wsl', { resolve: (authority) => resolver.resolve(authority).then(result => new (require('vscode').ResolvedAuthority)(result.host, result.port, result.connectionToken)) })` and disposes it on deactivate together with `resolver.dispose()`.
 
 - [ ] **Step 4: Run the tests to verify they pass**
 
 Run: `cd vscode/extensions/picket-remote-wsl && node --test test/resolver.test.js test/remoteUri.test.js`
-Expected: PASS, 7 tests. Then `cd vscode && npm run transpile-client` still succeeds.
+Expected: PASS, 8 tests. Then `cd vscode && npm run transpile-client` still succeeds.
 
 - [ ] **Step 5: Manual smoke on Windows, then commit and re-export**
 
@@ -683,19 +733,26 @@ git add build/patches/67-picket-remote-wsl.patch && git commit -m "chore(wsl): r
 
 ---
 
-### Task 8: Commands, first-use interception, diagnostics, nudge
+### Task 8: Commands, `WSL Targets` view, distro management, first-use interception, diagnostics, nudge
 
 **Files:**
 - Create: `vscode/extensions/picket-remote-wsl/src/commands.js`
+- Create: `vscode/extensions/picket-remote-wsl/src/tree.js`
+- Create: `vscode/extensions/picket-remote-wsl/src/manage.js`
 - Create: `vscode/extensions/picket-remote-wsl/src/diagnose.js`
 - Create: `vscode/extensions/picket-remote-wsl/src/nudge.js`
 - Modify: `vscode/extensions/picket-remote-wsl/extension.js`
+- Modify: `vscode/extensions/picket-remote-wsl/package.json` (views, viewsWelcome, view/item/context menus, the three distro commands)
 - Test: `vscode/extensions/picket-remote-wsl/test/commands.test.js`
+- Test: `vscode/extensions/picket-remote-wsl/test/tree.test.js`
+- Test: `vscode/extensions/picket-remote-wsl/test/manage.test.js`
 - Test: `vscode/extensions/picket-remote-wsl/test/diagnose.test.js`
 
 **Interfaces:**
 - Consumes: everything from Tasks 2–7, plus `vscode.window`/`vscode.commands` passed in as a `host` object so tests need no VS Code runtime: `host = { showQuickPick(items, options), showOpenDialog(options), showInformationMessage(msg, ...actions), showErrorMessage(msg, ...actions), withProgress(options, task), openFolder(uri, options), executeCommand(id, ...args), showWarningMessage(msg, ...actions) }`.
-- Produces: `registerCommands({ host, log, resolver, components, settings, extensionPath }): vscode.Disposable[]` registering the nine command ids.
+- Produces: `registerCommands({ host, log, resolver, components, settings, extensionPath }): vscode.Disposable[]` registering every command id from Task 1 except the two CLI-shim ones (Task 13) and the two gallery ones (Task 11).
+- Produces (tree.js): `buildDistroNodes(list: IDistro[], ctx: { activeDistro?: string }): IDistroNode[]` where `IDistroNode = { id, label, description, contextValue: 'activeDistro' | 'inactiveDistro', tooltip }` — `label` appends `（WSL 1）`/`（WSL 2）`, `description` appends `default distro` and `Connected`/`Not Connected`, and the default distro sorts first.
+- Produces (manage.js): `manageDistro({ host, runner, action, distro }): Promise<void>` for `action: 'add' | 'setDefault' | 'delete'`; `add` parses `wsl.exe --list --online` and hands the chosen name to a terminal command, `setDefault` runs `-e`-free `['--set-default', distro]`, `delete` requires a modal confirmation and then runs `['--unregister', distro]`.
 - Produces: `ensureComponentInteractive({ host, components, catalog, settings, extensionPath }): Promise<boolean>` — the first-use interception; returns `false` when the user cancels.
 - Produces: `buildDiagnostics({ runner, components, settings, probe, appRoot }): Promise<string>` — a copyable multi-line report.
 
@@ -706,11 +763,34 @@ git add build/patches/67-picket-remote-wsl.patch && git commit -m "chore(wsl): r
 - `openFolder` with an `ondemand` catalog and an absent component shows the three actions and, on `从文件安装…`, calls `showOpenDialog` and installs from the chosen file.
 - `openFolder` on `取消` resolves without opening a folder.
 - `openFolder` on an installed component goes straight to `host.openFolder` with `{ forceNewWindow: true, remoteAuthority: 'picket-wsl+Ubuntu' }`.
-- `diagnose` output contains lines for WSL version, distro list, tunnel mode, component state, iCode path, gallery mode, and a `picketTag` read from a fixture `product.json`.
+- `diagnose` output contains lines for WSL version, distro list, tunnel mode, component state, iCode path, gallery mode, `node`/`git` presence, and a `picketTag` read from a fixture `product.json`.
+
+`test/tree.test.js` — cases: two distros, one default, produce two nodes with the default first; a WSL1 distro's label carries `（WSL 1）`; the node whose name equals `activeDistro` gets `contextValue: 'activeDistro'` and a `Connected` tooltip; a `docker-desktop` row from Task 2's `visibleDistros` never reaches the tree.
+
+`test/manage.test.js` — cases: `setDefault` sends exactly `['--set-default', 'Debian']`; `delete` without confirmation runs nothing; `delete` after an affirmative confirmation sends `['--unregister', 'Debian']`; `add` parses a `--list --online` table into a pick list and then issues the install command through the host's terminal hook.
 
 `test/diagnose.test.js` — asserts the report's section headers, and that a failing runner call becomes `unavailable: <reason>` instead of rejecting.
 
 ```js
+test('the tree puts the default distro first and marks the active one', () => {
+	const nodes = buildDistroNodes([
+		{ name: 'Debian', isDefault: false, version: '2', state: 'Stopped' },
+		{ name: 'Ubuntu-24.04', isDefault: true, version: '2', state: 'Running' },
+		{ name: 'Old', isDefault: false, version: '1', state: 'Stopped' }
+	], { activeDistro: 'Debian' });
+	assert.deepStrictEqual(nodes.map(n => n.label), ['Ubuntu-24.04（WSL 2）', 'Debian（WSL 2）', 'Old（WSL 1）']);
+	assert.strictEqual(nodes[1].contextValue, 'activeDistro');
+	assert.match(nodes[1].tooltip, /Connected/);
+});
+
+test('deleting a distro asks before unregistering', async () => {
+	const host = fakeHost({ confirm: false });
+	const calls = [];
+	const runner = { exec: async (a) => { calls.push(a.join(' ')); return { code: 0, stdout: '', stderr: '' }; } };
+	await manage.manageDistro({ host, runner, action: 'delete', distro: 'Debian' });
+	assert.deepStrictEqual(calls, []);
+});
+
 test('the embedded flavor never shows the install picker', async () => {
 	const host = fakeHost();
 	const ctx = fakeContext({ flavor: 'embedded', state: 'absent' });
@@ -729,12 +809,12 @@ test('the ondemand flavor offers three actions', async () => {
 
 - [ ] **Step 2: Run the tests to verify they fail**
 
-Run: `cd vscode/extensions/picket-remote-wsl && node --test test/commands.test.js test/diagnose.test.js`
+Run: `cd vscode/extensions/picket-remote-wsl && node --test test/commands.test.js test/tree.test.js test/manage.test.js test/diagnose.test.js`
 Expected: FAIL — modules not found.
 
 - [ ] **Step 3: Implement the three modules and register them in `extension.js`**
 
-`openFolder` flow: quick-pick distro (`settings.defaultDistro` first, remembered after use) → path input defaulting to `<home>` → `ensureComponentInteractive` → `host.openFolder(uri, { forceNewWindow: true, remoteAuthority: 'picket-wsl+' + distro })`. `ensureComponentInteractive` in the `embedded` flavor calls `components.ensure` inside `withProgress` with no dialog; in `ondemand` it shows the three actions and routes to `payload.chooseSource` with `{ explicitPath: settings.serverPayloadPath }`, the file picker path, or the base URL. `reopenInWsl` accepts the current window's `vscode.env.remoteAuthority` or a UNC path from `remoteUri.parseUncPath`; `reopenInWindows` reopens the same folder with an empty remote authority. `nudge.js` shows a one-time warning when `remoteUri.parseUncPath(vscode.workspace.workspaceFolders?.[0]?.uri.fsPath)` succeeds and a global-state flag is unset. `diagnose.js` runs each probe in `try/catch` and prints `unavailable: <message>` on failure.
+`extension.js` creates the view once (`vscode.window.createTreeView('picketWsl.targets', { treeDataProvider })`), refreshes it on activation and after every manage action, and registers `picket.wsl.refreshTargets` as the view's refresh button. `openFolder` flow: quick-pick distro (`settings.defaultDistro` first, remembered after use; rows come from `visibleDistros(await listDistros(runner))`) → `host.showOpenDialog({ canSelectFolders: true, defaultUri: Uri.parse('vscode-remote://picket-wsl+<distro>/home/<user>') })`, whose picked path goes through `toPosixPath` when it is a Windows path (a `\\wsl.localhost\` pick is already posix via `parseUncPath`) → `ensureComponentInteractive` → `host.openFolder(uri, { forceNewWindow: true, remoteAuthority: 'picket-wsl+' + distro })`. `ensureComponentInteractive` in the `embedded` flavor calls `components.ensure` inside `withProgress` with no dialog; in `ondemand` it shows the three actions and routes to `payload.chooseSource` with `{ explicitPath: settings.serverPayloadPath }`, the file picker path, or the base URL. `reopenInWsl` accepts the current window's `vscode.env.remoteAuthority` or a UNC path from `remoteUri.parseUncPath`; `reopenInWindows` reopens the same folder with an empty remote authority. `nudge.js` shows a one-time warning when `remoteUri.parseUncPath(vscode.workspace.workspaceFolders?.[0]?.uri.fsPath)` succeeds and a global-state flag is unset. `diagnose.js` runs each probe in `try/catch` and prints `unavailable: <message>` on failure.
 
 - [ ] **Step 4: Run the tests to verify they pass**
 
@@ -743,7 +823,7 @@ Expected: PASS — every suite under `test/` green.
 
 - [ ] **Step 5: Manual smoke on Windows, then commit and re-export**
 
-`cd vscode && npm run transpile-client`, launch the dev workbench, run `Picket: Open Folder in WSL…`, pick a distro, pick `/home/<user>`, confirm the window reopens as `picket-wsl+<distro>` and the explorer lists native Linux files. Then commit as in Task 7 with message `feat(wsl): commands, first-use interception, diagnostics and nudge`.
+`cd vscode && npm run transpile-client`, launch the dev workbench, then: (a) open the WSL view and confirm the distro rows show WSL version, default, and connection state; (b) run `Picket: Open Folder in WSL…`, pick a distro, pick a folder through the dialog, confirm the window reopens as `picket-wsl+<distro>` with native Linux files; (c) `Picket: 设为默认发行版` on a second distro and confirm the tree reorders. Then commit as in Task 7 with message `feat(wsl): commands, WSL targets view, distro management, diagnostics and nudge`. Also record that the returned-vs-fresh `quick pick` path was exercised, since that is where `distroStatus` caching bugs show up.
 
 ---
 
@@ -961,7 +1041,65 @@ git commit -m "build(wsl): assemble catalog for both flavors, offline bundle, an
 
 ---
 
-### Task 13: User documentation and release notes
+### Task 13: In-distro CLI shim (`picket-code .`)
+
+**Files:**
+- Create: `vscode/extensions/picket-remote-wsl/src/shim.js`
+- Modify: `vscode/extensions/picket-remote-wsl/src/commands.js` (two commands)
+- Test: `vscode/extensions/picket-remote-wsl/test/shim.test.js`
+
+**Interfaces:**
+- Consumes: `IWslRunner` (Task 2), `serverPaths` (Task 5), `toPosixPath` (Task 6).
+- Produces: `shQuote(value: string): string` — POSIX single-quoting (`'` becomes `'\''`).
+- Produces: `shimScript({ clientPath, authority, remoteCliPath }): string` — a `#!/bin/sh` script that exports `VSCODE_CLIENT_COMMAND=<clientPath>`, `VSCODE_CLI_AUTHORITY=<authority>`, then `exec <remoteCliPath> "$@"`; all three interpolations go through `shQuote`.
+- Produces: `installShim({ runner, distro, home, tag, clientPath }): Promise<{ status: 'installed' | 'foreign-link' | 'failed', scriptPath, linkPath, message? }>` and `removeShim({ runner, distro, home, tag }): Promise<void>`. Writes land through `runner.exec(['-d', distro, '-e', 'sh', '-c', SCRIPT, 'sh', ...args])` — one constant script, values as positional arguments.
+
+- [ ] **Step 1: Write the failing test**
+
+`test/shim.test.js` — cases: `shimScript` sets both variables and ends with `exec '<path>' "$@"`; a client path containing a single quote is escaped so it cannot break out of the quoting; `installShim` writes the script and the `~/.local/bin/picket-code` symlink (asserted from the argv of the `sh -c` call); an existing symlink pointing somewhere else yields `status: 'foreign-link'` and leaves it alone; `removeShim` removes both paths.
+
+```js
+const test = require('node:test');
+const assert = require('node:assert');
+const { shQuote, shimScript } = require('../src/shim.js');
+
+test('quotes single quotes so the script cannot break out', () => {
+	assert.strictEqual(shQuote("it's"), "'it'\\''s'");
+});
+
+test('the shim exports the client command and authority, then execs the payload CLI', () => {
+	const script = shimScript({
+		clientPath: '/mnt/c/Users/u/AppData/Local/Programs/Picket Code/Picket Code.exe',
+		authority: 'picket-wsl+Ubuntu 22.04 LTS',
+		remoteCliPath: '/home/u/.picket-code-server/payloads/server-T/bin/remote-cli/picket-code'
+	});
+	assert.match(script, /VSCODE_CLIENT_COMMAND='\/mnt\/c\/Users\/u\/AppData\/Local\/Programs\/Picket Code\/Picket Code\.exe'/);
+	assert.match(script, /VSCODE_CLI_AUTHORITY='picket-wsl\+Ubuntu 22\.04 LTS'/);
+	assert.match(script, /exec '\/home\/u\/\.picket-code-server\/payloads\/server-T\/bin\/remote-cli\/picket-code' "\$@"$/);
+});
+```
+
+- [ ] **Step 2: Run the test to verify it fails**
+
+Run: `cd vscode/extensions/picket-remote-wsl && node --test test/shim.test.js`
+Expected: FAIL — `Cannot find module '../src/shim.js'`.
+
+- [ ] **Step 3: Implement `shim.js` and the two commands**
+
+The script is written to `<home>/.picket-code-server/bin/<tag>/bin/picket-code` (mode 755) and symlinked to `<home>/.local/bin/picket-code`. `installShim` asks the distro for the current link target while creating the directory, in one round trip; a symlink that resolves outside our script yields `foreign-link` with a message naming the path, and nothing is overwritten. `clientPath` is the extension host's own executable (`process.execPath`, the Windows `Picket Code.exe`) converted with `toPosixPath` in the target distro. When the exec fails with 126/127 the script prints one line pointing at `[interop] enabled=false` in `/etc/wsl.conf` — the one case where a Windows executable cannot be started from the distro at all. `picket.wsl.installCli` / `picket.wsl.removeCli` act on the current window's distro (else the default one) and report the link path.
+
+- [ ] **Step 4: Run the test to verify it passes**
+
+Run: `cd vscode/extensions/picket-remote-wsl && node --test test/`
+Expected: PASS — every suite under `test/` green.
+
+- [ ] **Step 5: Manual smoke on Windows, then commit and re-export**
+
+Run `Picket: 在 WSL 中安装命令行…` in a WSL window, then in that distro's terminal run `picket-code .` from a project directory: a new window opens with `picket-wsl+<distro>`. Confirm `picket-code --version` prints the payload CLI's version, and that uninstalling removes `~/.local/bin/picket-code`. Commit as in Task 7 with message `feat(wsl): in-distro picket-code CLI shim`.
+
+---
+
+### Task 14: User documentation and release notes
 
 **Files:**
 - Create: `docs/wsl.md`
@@ -970,15 +1108,15 @@ git commit -m "build(wsl): assemble catalog for both flavors, offline bundle, an
 - Modify: `docs/release-checklist.md`
 
 **Interfaces:**
-- Consumes: the behavior implemented in Tasks 1–12; no new code.
+- Consumes: the behavior implemented in Tasks 1–13; no new code.
 
 - [ ] **Step 1: Write `docs/wsl.md`**
 
-Sections, in this order: 前提（Windows 10/11 + WSL2）; 打开 WSL 文件夹（命令、发行版选择、记住默认）; 组件从哪来（三条来源、两种形态、离线组件包、SHA256 校验失败怎么办）; iCode 在 WSL 里（检测顺序、`PICKET_ICODE_BIN`、未找到时的提示）; 扩展市场三种模式（默认 Open VSX / 内网自建 / 关闭，以及"从 VSIX 安装"）; 连接方式与排障（`tunnelMode`、`.wslconfig` 两行、`Picket: 诊断 WSL 支持`）; 磁盘布局（`~/.picket-code-server/*`）；停止与清理（`Picket: Stop WSL Server`、`组件…` 里的清理旧版本）; 已知限制（WSL1/ARM64/Alpine/嵌套远程、不做退出即杀、`picketTag` 与客户端不一致会握手失败）。
+Sections, in this order: 前提（Windows 10/11 + WSL2）; 打开 WSL 文件夹（`WSL 目标` 视图、命令、发行版选择、记住默认、从资源管理器选文件夹时的 `wslpath` 转换）; 发行版管理（添加/设为默认/删除）; WSL 里的 `picket-code` 命令（shim、`~/.local/bin`、interop 关闭时的提示）; 登录 shell 与 `server-env-setup`（`nvm`/`conda` 的 PATH、内网代理与 CA）; 组件从哪来（三条来源、两种形态、离线组件包、SHA256 校验失败怎么办）; iCode 在 WSL 里（检测顺序、`PICKET_ICODE_BIN`、未找到时的提示）; 扩展市场三种模式（默认 Open VSX / 内网自建 / 关闭，以及"从 VSIX 安装"）; 连接方式与排障（`tunnelMode`、`.wslconfig` 两行、`Picket: 诊断 WSL 支持`）; 磁盘布局（`~/.picket-code-server/*`）；停止与清理（`Picket: Stop WSL Server`、`组件…` 里的清理旧版本）; 已知限制（WSL1/ARM64/Alpine/嵌套远程、不做退出即杀、树里没有"最近文件夹"、`picketTag` 与客户端不一致会握手失败）。
 
 - [ ] **Step 2: Update the three existing docs**
 
-`docs/roadmap.md`: replace the WSL bullet's "侧载官方扩展" wording with the built-in extension and link `docs/wsl.md`. `website/docs/guide/wsl.md`: keep the manual-sideload section as "旧方法（不再需要）" with a pointer to the new page; do not delete it, users on older releases still need it. `docs/release-checklist.md`: add a checkbox "L3 WSL 清单全过（见 `docs/testing.md`）".
+`docs/roadmap.md`: replace the WSL bullet's "侧载官方扩展" wording with the built-in extension and link `docs/wsl.md`. `website/docs/guide/wsl.md`: keep the manual-sideload section as "旧方法（不再需要）" with a pointer to the new page; do not delete it, users on older releases still need it. `docs/release-checklist.md`: add a checkbox "L3 WSL 清单全过（见 `docs/testing.md`，含端口转发、登录 shell 环境、`picket-code .`、树视图与 `wslpath` 五项）".
 
 - [ ] **Step 3: Verify links resolve**
 
@@ -995,8 +1133,8 @@ git commit -m "docs(wsl): user guide, roadmap and release checklist for built-in
 
 ## Self-Review
 
-**Spec coverage:** §4.2 architecture → File Structure + Tasks 1–11; §4.3 catalog/flavors → Tasks 1, 12; §4.4 payload install → Task 3; §4.5 resolver semantics → Task 6; §4.6 tunnel → Task 11; §4.7 iCode → Task 7; §4.8 gallery → Tasks 9, 10; §4.9 UX commands → Task 8; §4.10 first-use interception → Task 8; §4.11 failure copy → Task 8 (diagnose + messages) ; §4.12 patch numbering → Tasks 1, 9; §5 components → File Structure; §6 test layers → Tasks 2–12 and `docs/testing.md`; §7 milestones → M1 ends after Task 7, M2 after Task 8, M3 after Task 10, M4 after Tasks 11–12. Gaps found and closed while writing: `unpackOfflineBundle` was in the spec's offline bundle but had no owner (added to Task 3); the first-start lock had no owner (Task 5); `picketTag` stamping needed a concrete place, now `build/wsl/assemble.mjs` rather than a core patch.
+**Spec coverage:** §4.2 architecture → File Structure + Tasks 1–11; §4.3 catalog/flavors → Tasks 1, 12; §4.4 payload install → Task 3; §4.5 resolver semantics → Task 6; §4.6 tunnel → Task 11; §4.7 iCode → Task 7; §4.8 gallery → Tasks 9, 10; §4.9 UX commands → Task 8; §4.10 first-use interception → Task 8; §4.11 failure copy → Task 8 (diagnose + messages); §4.12 patch numbering → Tasks 1, 9; §4.13 tree view and distro management → Task 8; §4.14 login shell and `server-env-setup` → Tasks 5, 7; §4.15 CLI shim → Task 13; §5 components → File Structure; §6 test layers → Tasks 2–13 and `docs/testing.md`; §7 milestones → M1 ends after Task 7, M2 after Task 8, M3 after Task 13, M4 after Tasks 11–12 and 14. Gaps found and closed while writing: `unpackOfflineBundle` was in the spec's offline bundle but had no owner (added to Task 3); the first-start lock had no owner (Task 5); `picketTag` stamping needed a concrete place, now `build/wsl/assemble.mjs` rather than a core patch.
 
-**Type consistency:** `ICatalogComponent` (Task 1) is consumed unchanged in Tasks 3, 4, 12. `IWslRunner` (Task 2) is the only process boundary in Tasks 3–8 and 11. `serverPaths`/`buildServerArgs` (Task 5) are the only places that compose in-distro paths. `probeServer` returns the three-value union used verbatim by Task 6. `chooseTunnelMode` (Task 7) is consumed only by Task 11.
+**Type consistency:** `ICatalogComponent` (Task 1) is consumed unchanged in Tasks 3, 4, 12. `IWslRunner` (Task 2) is the only process boundary in Tasks 3–8 and 11–13. `IDistro` (Task 2) is the single shape consumed by `visibleDistros`, `buildDistroNodes` and `defaultDistro`; `toPosixPath`/`toWindowsPath` (Task 6) are the only path translators, used by Task 8's folder dialog and Task 13's `clientPath`. `serverPaths`/`buildServerArgs` (Task 5) are the only places that compose in-distro paths. `probeServer` returns the three-value union used verbatim by Task 6. `chooseTunnelMode` (Task 7) is consumed only by Task 11.
 
-**Known deviations from the spec text:** (1) the spec puts the catalog at `resources/payloads/catalog.json`; this plan puts it at `<extensionPath>/payloads/catalog.json` because build-time assembly can write into the packaged extension directory without patching gulpfile packaging and `context.extensionPath` is the one path an extension can trust. (2) the spec names `runtime/<distro>.json`; this plan uses a single `<home>/.picket-code-server/runtime.json` because each distro has its own `$HOME`, so the distro in the path would be redundant and could drift from the directory it lives in. Update spec §4.2/§4.3/§4.5 when Task 12 lands.
+**Known deviations from the spec text:** (0) the tree view lists distros only — no public API exposes recent workspaces per remote, and it is now listed in spec §2 non-goals. (1) the spec puts the catalog at `resources/payloads/catalog.json`; this plan puts it at `<extensionPath>/payloads/catalog.json` because build-time assembly can write into the packaged extension directory without patching gulpfile packaging and `context.extensionPath` is the one path an extension can trust. (2) the spec names `runtime/<distro>.json`; this plan uses a single `<home>/.picket-code-server/runtime.json` because each distro has its own `$HOME`, so the distro in the path would be redundant and could drift from the directory it lives in. Update spec §4.2/§4.3/§4.5 when Task 12 lands.
