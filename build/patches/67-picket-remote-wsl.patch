@@ -1648,10 +1648,10 @@ index 00000000..cf40b908
 +module.exports = { detectIcode };
 diff --git a/extensions/picket-remote-wsl/src/launch.js b/extensions/picket-remote-wsl/src/launch.js
 new file mode 100644
-index 00000000..93979e6f
+index 00000000..efe2caac
 --- /dev/null
 +++ b/extensions/picket-remote-wsl/src/launch.js
-@@ -0,0 +1,351 @@
+@@ -0,0 +1,352 @@
 +'use strict';
 +
 +const { randomBytes } = require('node:crypto');
@@ -1687,6 +1687,7 @@ index 00000000..93979e6f
 +		root,
 +		payloadDir,
 +		binary: `${payloadDir}/bin/picket-code-server`,
++		node: `${payloadDir}/node`,
 +		remoteCli: `${payloadDir}/bin/remote-cli/picket-code`,
 +		cliLink: `${home}/.local/bin/picket-code`,
 +		dataDir: `${root}/data`,
@@ -2720,10 +2721,10 @@ index 00000000..f736d42b
 +module.exports = { AUTHORITY_PREFIX, parseAuthority, remoteUriFor, parseUncPath, toPosixPath, toWindowsPath };
 diff --git a/extensions/picket-remote-wsl/src/resolver.js b/extensions/picket-remote-wsl/src/resolver.js
 new file mode 100644
-index 00000000..cad3f9b8
+index 00000000..0a6bcf5c
 --- /dev/null
 +++ b/extensions/picket-remote-wsl/src/resolver.js
-@@ -0,0 +1,252 @@
+@@ -0,0 +1,324 @@
 +'use strict';
 +
 +const { listDistros, defaultDistro, visibleDistros, distroHome } = require('./distro.js');
@@ -2732,6 +2733,7 @@ index 00000000..cad3f9b8
 +const { parseAuthority } = require('./remoteUri.js');
 +const { detectIcode } = require('./icode.js');
 +const { chooseTunnelMode, readWslConfigFile, wslConfigPath } = require('./preflight.js');
++const { createStdioTunnel } = require('./tunnel.js');
 +
 +/** @typedef {{ port: number, token: string, tag: string, pid: number, startedAt: string, tunnelMode?: string, icode?: string }} IRuntimeInfo */
 +/** @typedef {{ host: string, port: number, connectionToken: string }} IResolverResult */
@@ -2754,7 +2756,8 @@ index 00000000..cad3f9b8
 + *   warn?: (message: string) => void,
 + *   startServer?: typeof startServer,
 + *   stopServer?: typeof stopServer,
-+ *   probe?: (target: { host: string, port: number, token: string }) => Promise<'alive' | 'bad-token' | 'dead'>
++ *   probe?: (target: { host: string, port: number, token: string }) => Promise<'alive' | 'bad-token' | 'dead'>,
++ *   createTunnel?: typeof createStdioTunnel
 + * }} options
 + */
 +function createResolver(options) {
@@ -2766,8 +2769,11 @@ index 00000000..cad3f9b8
 +	const platform = options.platform ?? process.platform;
 +	const readWslConfig = options.readWslConfig ?? (() => readWslConfigFile(wslConfigPath()));
 +	const warn = options.warn ?? (() => { });
++	const createTunnel = options.createTunnel ?? createStdioTunnel;
 +	/** @type {Map<string, Promise<IResolverResult>>} */
 +	const inFlight = new Map();
++	/** @type {Map<string, Promise<{ localPort: number, dispose(): Promise<void> }>>} */
++	const tunnels = new Map();
 +	/** @type {Set<string>} */
 +	const warned = new Set();
 +
@@ -2806,9 +2812,72 @@ index 00000000..cad3f9b8
 +		throw new Error(`Distro "${requested}" not found. Installed: ${known}`);
 +	}
 +
-+	/** @param {IRuntimeInfo} info @returns {IResolverResult} */
-+	function coordinates(info) {
-+		return { host: '127.0.0.1', port: info.port, connectionToken: info.token };
++	/** @param {string} distro @param {number} port */
++	function tunnelKey(distro, port) {
++		return `${distro}:${port}`;
++	}
++
++	/**
++	 * The recorded port is inside the VM. When the tunnel is the only way in, the
++	 * address this window can dial is the tunnel's, and it is created on first use
++	 * and shared by every later request for the same server.
++	 * @param {IRuntimeInfo} info
++	 * @param {string} distro
++	 * @param {ReturnType<typeof serverPaths>} paths
++	 * @returns {Promise<{ host: string, port: number }>}
++	 */
++	async function endpointFor(info, distro, paths) {
++		if (info.tunnelMode !== 'stdio') {
++			return { host: '127.0.0.1', port: info.port };
++		}
++		const key = tunnelKey(distro, info.port);
++		let pending = tunnels.get(key);
++		if (!pending) {
++			pending = createTunnel({ runner, distro, serverPort: info.port, nodePath: paths.node, log });
++			pending.catch(() => tunnels.delete(key));
++			tunnels.set(key, pending);
++		}
++		const tunnel = await pending;
++		log.info(`stdio tunnel for ${distro}: 127.0.0.1:${tunnel.localPort} carries port ${info.port}`);
++		return { host: '127.0.0.1', port: tunnel.localPort };
++	}
++
++	/** @param {string} distro @param {number} port */
++	async function disposeTunnel(distro, port) {
++		const key = tunnelKey(distro, port);
++		const pending = tunnels.get(key);
++		if (!pending) {
++			return;
++		}
++		tunnels.delete(key);
++		await pending.then(tunnel => tunnel.dispose(), () => { /* never bootstrapped */ });
++	}
++
++	/**
++	 * @param {IRuntimeInfo} info
++	 * @param {string} distro
++	 * @param {ReturnType<typeof serverPaths>} paths
++	 * @returns {Promise<'alive' | 'bad-token' | 'dead'>}
++	 */
++	async function probeRecorded(info, distro, paths) {
++		try {
++			const endpoint = await endpointFor(info, distro, paths);
++			return await probe({ host: endpoint.host, port: endpoint.port, token: info.token });
++		} catch (error) {
++			log.info(`The server recorded for ${distro} could not be reached: ${error.message}`);
++			return 'dead';
++		}
++	}
++
++	/**
++	 * @param {IRuntimeInfo} info
++	 * @param {string} distro
++	 * @param {ReturnType<typeof serverPaths>} paths
++	 * @returns {Promise<IResolverResult>}
++	 */
++	async function coordinates(info, distro, paths) {
++		const endpoint = await endpointFor(info, distro, paths);
++		return { host: endpoint.host, port: endpoint.port, connectionToken: info.token };
 +	}
 +
 +	/** @param {string} distro @returns {Promise<IResolverResult>} */
@@ -2820,21 +2889,22 @@ index 00000000..cad3f9b8
 +
 +		const stored = await lockAndRead(runner, distro, runtimeFile);
 +		if (stored && stored.tag === version) {
-+			const verdict = await probe({ host: '127.0.0.1', port: stored.port, token: stored.token });
++			const verdict = await probeRecorded(stored, distro, paths);
 +			if (verdict === 'alive') {
 +				log.info(`Reusing ${paths.binary} on port ${stored.port} for ${distro}`);
-+				return coordinates(stored);
++				return coordinates(stored, distro, paths);
 +			}
 +			log.info(`The recorded server for ${distro} answered "${verdict}"; starting a new one`);
++			await disposeTunnel(distro, stored.port);
 +		}
 +
 +		const acquired = await acquireLock(runner, distro, runtimeFile) || await takeOverStaleLock(distro, runtimeFile);
 +		if (!acquired) {
 +			// Another window owns the lock; its server is the one we want.
-+			const adopted = await waitForServer(distro, runtimeFile, version);
++			const adopted = await waitForServer(distro, runtimeFile, version, paths);
 +			if (adopted) {
 +				log.info(`Another window started the server for ${distro} on port ${adopted.port}; adopting it`);
-+				return coordinates(adopted);
++				return coordinates(adopted, distro, paths);
 +			}
 +			throw new Error(`Another window is starting the server for ${distro}, but it did not appear within ${formatSeconds(timeoutMs())}`);
 +		}
@@ -2885,12 +2955,12 @@ index 00000000..cad3f9b8
 +	 * @param {string} version
 +	 * @returns {Promise<IRuntimeInfo | undefined>}
 +	 */
-+	async function waitForServer(distro, runtimeFile, version) {
++	async function waitForServer(distro, runtimeFile, version, paths) {
 +		const deadline = Date.now() + timeoutMs();
 +		const interval = Math.max(10, (settings.probeRetrySeconds ?? 2) * 1000);
 +		while (Date.now() < deadline) {
 +			const info = await readRuntime(runner, distro, runtimeFile).catch(() => undefined);
-+			if (info && info.tag === version && await probe({ host: '127.0.0.1', port: info.port, token: info.token }) === 'alive') {
++			if (info && info.tag === version && await probeRecorded(info, distro, paths) === 'alive') {
 +				return info;
 +			}
 +			await new Promise(resolve => setTimeout(resolve, Math.min(interval, Math.max(1, deadline - Date.now()))));
@@ -2934,7 +3004,7 @@ index 00000000..cad3f9b8
 +		// second one.
 +		await writeRuntime(runner, runtimeFile, info, distro)
 +			.catch(error => log.error(`Could not write ${runtimeFile}: ${error.message}`));
-+		return coordinates(info);
++		return coordinates(info, distro, paths);
 +	}
 +
 +	return {
@@ -2969,8 +3039,11 @@ index 00000000..cad3f9b8
 +				dataDir: serverPaths(home, serverVersion()).dataDir
 +			});
 +		},
-+		dispose() {
++		async dispose() {
 +			inFlight.clear();
++			const pending = [...tunnels.values()];
++			tunnels.clear();
++			await Promise.all(pending.map(promise => promise.then(tunnel => tunnel.dispose(), () => { /* never bootstrapped */ })));
 +		}
 +	};
 +}
@@ -3015,6 +3088,245 @@ index 00000000..83dc02a7
 +}
 +
 +module.exports = { buildDistroNodes };
+diff --git a/extensions/picket-remote-wsl/src/tunnel.js b/extensions/picket-remote-wsl/src/tunnel.js
+new file mode 100644
+index 00000000..b6882e48
+--- /dev/null
++++ b/extensions/picket-remote-wsl/src/tunnel.js
+@@ -0,0 +1,233 @@
++'use strict';
++
++const net = require('node:net');
++
++/**
++ * Runs *inside* the distro. It is handed the port the server announced and dials
++ * 127.0.0.1 from there, so the bytes that follow cross only the pipe wsl.exe
++ * gives us. The ready line is the proof that all three layers hold: wsl.exe
++ * started, an in-VM node ran, and the server's listener answered.
++ */
++const PIPE_SCRIPT = `
++const net = require('node:net');
++const socket = net.connect(Number(process.argv[1]), '127.0.0.1');
++socket.setNoDelay(true);
++socket.on('error', (error) => { process.stderr.write(String(error.message) + '\\n'); process.exit(1); });
++socket.on('close', () => process.exit(0));
++process.stdin.on('error', () => process.exit(1));
++process.stdout.on('error', () => process.exit(1));
++socket.on('connect', () => {
++	process.stdout.write('PICKET-TUNNEL-READY\\n');
++	process.stdin.pipe(socket);
++	socket.pipe(process.stdout);
++});
++`;
++
++const READY = 'PICKET-TUNNEL-READY\n';
++const KILL_TIMEOUT_MS = 1000;
++
++/**
++ * Only used when Windows no longer forwards `127.0.0.1` into the VM. One
++ * listener per window, one child per connection — a child per window would be
++ * faster but would serialise every socket behind one pipe, and a websocket
++ * connection is not the only thing the workbench opens.
++ * @param {{
++ *   runner: { spawn(args: string[]): { child: import('node:child_process').ChildProcess, stdout: import('node:stream').Readable | null, stderr: import('node:stream').Readable | null } },
++ *   distro: string,
++ *   serverPort: number,
++ *   nodePath: string,
++ *   log?: { info(...parts: unknown[]): void, error(...parts: unknown[]): void },
++ *   preambleTimeoutMs?: number
++ * }} options
++ * @returns {Promise<{ localPort: number, dispose(): Promise<void> }>}
++ */
++function createStdioTunnel(options) {
++	const { runner, distro, serverPort, nodePath } = options;
++	const log = options.log ?? { info() { }, error() { } };
++	const preambleTimeoutMs = options.preambleTimeoutMs ?? 15000;
++	const host = '127.0.0.1';
++
++	/** @type {Set<import('node:child_process').ChildProcess>} */
++	const children = new Set();
++	/** @type {Set<net.Socket>} */
++	const sockets = new Set();
++	/** @type {{ resolve(): void, reject(error: Error): void } | undefined} */
++	let pendingBootstrap;
++	let localPort = 0;
++	let disposed = false;
++
++	/**
++	 * @param {import('node:child_process').ChildProcess} child
++	 * @returns {Promise<void>}
++	 */
++	function kill(child) {
++		if (child.exitCode !== null || child.signalCode !== null) {
++			children.delete(child);
++			return Promise.resolve();
++		}
++		return new Promise(resolve => {
++			let timer = /** @type {any} */ (undefined);
++			const finish = () => {
++				clearTimeout(timer);
++				children.delete(child);
++				resolve();
++			};
++			timer = setTimeout(finish, KILL_TIMEOUT_MS);
++			timer.unref?.();
++			child.once('exit', finish);
++			child.once('error', finish);
++			child.kill();
++		});
++	}
++
++	/**
++	 * Carries one accepted socket through its own child. Resolves once the
++	 * preamble has arrived; the pipes are what actually matter afterwards.
++	 * @param {net.Socket} socket
++	 * @returns {Promise<void>}
++	 */
++	function relay(socket) {
++		const spawned = runner.spawn(['-d', distro, '-e', nodePath, '-e', PIPE_SCRIPT, String(serverPort)]);
++		const child = spawned.child;
++		children.add(child);
++		// The runner contract promises stdout and stderr, not stdin: the writable
++		// end is only ever reachable through the child itself.
++		const stdin = child.stdin;
++
++		const stdout = spawned.stdout;
++		return new Promise((resolve, reject) => {
++			if (!stdout || !stdin) {
++				void kill(child);
++				reject(new Error('tunnel child has no stdio pipes'));
++				return;
++			}
++			let settled = false;
++			let stderr = '';
++			let buffered = Buffer.alloc(0);
++			let timer = /** @type {any} */ (undefined);
++
++			/** @param {string} reason */
++			const fail = (reason) => {
++				if (settled) {
++					return;
++				}
++				settled = true;
++				clearTimeout(timer);
++				socket.destroy();
++				void kill(child);
++				reject(new Error(stderr ? `${reason}: ${stderr.trim().split('\n').pop()}` : reason));
++			};
++
++			/** @param {Buffer} chunk */
++			const onStdout = (chunk) => {
++				buffered = Buffer.concat([buffered, chunk]);
++				const at = buffered.indexOf(READY);
++				if (at === -1) {
++					return;
++				}
++				settled = true;
++				clearTimeout(timer);
++				stdout.removeListener('data', onStdout);
++				const rest = buffered.subarray(at + READY.length);
++				if (rest.length > 0) {
++					socket.write(rest);
++				}
++				stdout.pipe(socket);
++				socket.pipe(stdin);
++				socket.resume();
++				resolve();
++			};
++
++			timer = setTimeout(() => fail('tunnel preamble timeout'), preambleTimeoutMs);
++			timer.unref?.();
++
++			spawned.stderr?.on('data', (chunk) => {
++				stderr = (stderr + String(chunk)).slice(-8192);
++			});
++			stdout.on('data', onStdout);
++
++			socket.on('error', () => { /* the client went away; the child goes with it */ });
++			socket.on('close', () => {
++				if (!settled) {
++					fail('tunnel socket closed before the preamble');
++					return;
++				}
++				void kill(child);
++			});
++
++			child.once('error', error => fail(`tunnel child failed: ${error.message}`));
++			child.once('close', (code) => {
++				if (!settled) {
++					fail(`tunnel child exited with code ${code} before the preamble`);
++				}
++			});
++		});
++	}
++
++	/**
++	 * Resolves only once a relay has proven the whole path; a tunnel that reports
++	 * success but cannot carry a byte would fail at the worst possible moment —
++	 * after the window has opened and asked for its workbench.
++	 * @returns {Promise<void>}
++	 */
++	function bootstrap() {
++		return new Promise((resolve, reject) => {
++			const socket = net.connect(localPort, host);
++			socket.on('error', (error) => {
++				const pending = pendingBootstrap;
++				pendingBootstrap = undefined;
++				socket.destroy();
++				pending?.reject(error);
++			});
++			pendingBootstrap = {
++				resolve: () => { pendingBootstrap = undefined; socket.destroy(); resolve(); },
++				reject: (error) => { pendingBootstrap = undefined; socket.destroy(); reject(error); }
++			};
++		});
++	}
++
++	async function dispose() {
++		if (disposed) {
++			return;
++		}
++		disposed = true;
++		for (const socket of [...sockets]) {
++			socket.destroy();
++		}
++		sockets.clear();
++		if (localPort !== 0) {
++			await new Promise(/** @param {(value?: void) => void} resolve */ resolve => server.close(() => resolve()));
++		}
++		await Promise.all([...children].map(kill));
++	}
++
++	const server = net.createServer({ pauseOnConnect: true }, (socket) => {
++		sockets.add(socket);
++		socket.on('close', () => sockets.delete(socket));
++		const relayed = relay(socket);
++		relayed.catch(() => { /* already reported to whoever is listening */ });
++		const first = pendingBootstrap;
++		if (first) {
++			pendingBootstrap = undefined;
++			relayed.then(first.resolve, first.reject);
++		}
++	});
++
++	return new Promise((resolve, reject) => {
++		server.once('error', reject);
++		server.listen(0, host, () => {
++			server.removeListener('error', reject);
++			localPort = /** @type {import('node:net').AddressInfo} */ (server.address()).port;
++			log.info(`stdio tunnel for ${distro}: ${host}:${localPort} → ${distro}:${serverPort}`);
++			bootstrap().then(
++				() => resolve({ localPort, dispose }),
++				async (error) => {
++					await dispose();
++					reject(error);
++				}
++			);
++		});
++	});
++}
++
++module.exports = { PIPE_SCRIPT, createStdioTunnel };
 diff --git a/extensions/picket-remote-wsl/test/catalog.test.js b/extensions/picket-remote-wsl/test/catalog.test.js
 new file mode 100644
 index 00000000..350ec874
@@ -4600,10 +4912,10 @@ index 00000000..69414920
 +});
 diff --git a/extensions/picket-remote-wsl/test/resolver.test.js b/extensions/picket-remote-wsl/test/resolver.test.js
 new file mode 100644
-index 00000000..4e2e66f8
+index 00000000..c1a5d499
 --- /dev/null
 +++ b/extensions/picket-remote-wsl/test/resolver.test.js
-@@ -0,0 +1,384 @@
+@@ -0,0 +1,469 @@
 +// RED first: this file must fail until src/resolver.js exists.
 +const test = require('node:test');
 +const assert = require('node:assert');
@@ -4988,6 +5300,91 @@ index 00000000..4e2e66f8
 +	assert.strictEqual(starts.length, 1);
 +	assert.ok(runner.state.released >= 1, 'the stale lock is cleared before the new one is taken');
 +});
++
++test('a recorded stdio server is reached through a tunnel, and the probe goes through it too', async () => {
++	const runtime = { port: 41234, token: 'tok', tag: VERSION, pid: 7, startedAt: 'then', tunnelMode: 'stdio' };
++	const runner = makeRunner({ runtime });
++	const { starts, startServer } = startsRecording();
++	/** @type {any[]} */
++	const created = [];
++	/** @type {number[]} */
++	const probed = [];
++	let disposed = 0;
++	const resolver = createResolver({
++		runner, catalog: catalog(), settings: {}, log: silentLog(), startServer,
++		components: () => { throw new Error('must not install when the recorded server is alive'); },
++		createTunnel: async (options) => {
++			created.push(options);
++			return { localPort: 6000 + created.length, dispose: async () => { disposed += 1; } };
++		},
++		probe: async (target) => { probed.push(target.port); return 'alive'; }
++	});
++
++	const result = await resolver.resolve('picket-wsl+Ubuntu');
++	assert.deepStrictEqual(result, { host: '127.0.0.1', port: 6001, connectionToken: 'tok' });
++	assert.deepStrictEqual(probed, [6001], 'the VM port is not dialable from the host, so the probe must use the tunnel');
++	assert.strictEqual(created.length, 1);
++	assert.strictEqual(created[0].serverPort, 41234);
++	assert.strictEqual(created[0].nodePath, `/home/u/.picket-code-server/payloads/server-${VERSION}/node`);
++	assert.strictEqual(starts.length, 0);
++
++	await resolver.resolve('picket-wsl+Ubuntu');
++	assert.strictEqual(created.length, 1, 'one tunnel per server, not one per resolve');
++
++	await resolver.dispose();
++	assert.strictEqual(disposed, 1);
++});
++
++test('a fresh start on a host without localhost forwarding answers with the tunnel port', async () => {
++	const runner = makeRunner();
++	const { starts } = startsRecording();
++	const startServer = async (options) => {
++		starts.push(options);
++		return { port: 5555, token: 'fresh-token', tag: VERSION, pid: 1234, startedAt: 'now', ...(options.extra ?? {}) };
++	};
++	/** @type {any[]} */
++	const created = [];
++	const resolver = createResolver({
++		runner, catalog: catalog(), settings: {}, log: silentLog(), startServer,
++		platform: 'win32',
++		readWslConfig: async () => ({ localhostForwarding: false }),
++		components: () => ({ ensure: async () => ({ payloadDir: `/home/u/.picket-code-server/payloads/server-${VERSION}` }) }),
++		createTunnel: async (options) => {
++			created.push(options);
++			return { localPort: 6200, dispose: async () => { } };
++		}
++	});
++
++	const result = await resolver.resolve('picket-wsl+Ubuntu');
++	assert.strictEqual(result.port, 6200);
++	assert.strictEqual(result.connectionToken, 'fresh-token');
++	assert.strictEqual(starts.length, 1);
++	assert.strictEqual(created.length, 1);
++	assert.strictEqual(created[0].serverPort, 5555);
++	assert.strictEqual(starts[0].extra.tunnelMode, 'stdio', 'the record carries the mode so a later window knows to tunnel');
++});
++
++test('a tunnel that cannot bootstrap is treated as a dead server, not as an error', async () => {
++	const runtime = { port: 41234, token: 'tok', tag: VERSION, pid: 7, startedAt: 'then', tunnelMode: 'stdio' };
++	const runner = makeRunner({ runtime });
++	const { starts, startServer } = startsRecording();
++	let attempts = 0;
++	const resolver = createResolver({
++		runner, catalog: catalog(), settings: {}, log: silentLog(), startServer,
++		components: () => ({ ensure: async () => ({ payloadDir: `/home/u/.picket-code-server/payloads/server-${VERSION}` }) }),
++		readWslConfig: async () => ({ localhostForwarding: false }),
++		createTunnel: async () => {
++			attempts += 1;
++			throw new Error('tunnel preamble timeout');
++		},
++		probe: async () => 'alive'
++	});
++
++	const result = await resolver.resolve('picket-wsl+Ubuntu');
++	assert.strictEqual(result.port, 5555);
++	assert.strictEqual(attempts, 1);
++	assert.strictEqual(starts.length, 1, 'an unreachable tunnel means the recorded server is gone');
++});
 diff --git a/extensions/picket-remote-wsl/test/tree.test.js b/extensions/picket-remote-wsl/test/tree.test.js
 new file mode 100644
 index 00000000..864c9d17
@@ -5038,4 +5435,199 @@ index 00000000..864c9d17
 +
 +test('no distros produce no nodes rather than an error', () => {
 +	assert.deepStrictEqual(buildDistroNodes([], {}), []);
++});
+diff --git a/extensions/picket-remote-wsl/test/tunnel.test.js b/extensions/picket-remote-wsl/test/tunnel.test.js
+new file mode 100644
+index 00000000..22ff350c
+--- /dev/null
++++ b/extensions/picket-remote-wsl/test/tunnel.test.js
+@@ -0,0 +1,189 @@
++'use strict';
++
++const test = require('node:test');
++const assert = require('node:assert/strict');
++const net = require('node:net');
++const { spawn } = require('node:child_process');
++const { once } = require('node:events');
++
++const { PIPE_SCRIPT, createStdioTunnel } = require('../src/tunnel.js');
++
++const silentLog = { info() { }, error() { } };
++
++/** @param {net.Server} server */
++function listen(server) {
++	return new Promise(resolve => server.listen(0, '127.0.0.1', () => resolve(server.address())));
++}
++
++/** @param {net.Server} server */
++function closed(server) {
++	return new Promise(resolve => server.close(() => resolve()));
++}
++
++/**
++ * The tunnel's only process boundary is `IWslRunner.spawn`, so a fake runner that
++ * keeps the argv shape but runs the payload with the host's own node is a
++ * faithful stand-in for wsl.exe: the script and the port are the only things
++ * that matter, and asserting the whole argv keeps the real form honest.
++ */
++function fakeRunner(overrides = {}) {
++	const spawned = [];
++	return {
++		spawned,
++		exec: async () => ({ code: 0, stdout: '', stderr: '' }),
++		spawn(args) {
++			assert.deepEqual(args.slice(0, 5), ['-d', 'Ubuntu', '-e', '/payloads/server-1.0.0/node', '-e']);
++			assert.equal(args[5], PIPE_SCRIPT);
++			assert.match(args[6], /^\d+$/);
++			const child = overrides.spawn
++				? overrides.spawn(args)
++				: spawn(process.execPath, ['-e', PIPE_SCRIPT, args[6]], { stdio: 'pipe' });
++			spawned.push(child);
++			return { child, stdout: child.stdout, stderr: child.stderr };
++		}
++	};
++}
++
++test('the pipe script relays bytes both ways', async () => {
++	const server = net.createServer(socket => socket.pipe(socket));
++	const address = await listen(server);
++
++	const child = spawn(process.execPath, ['-e', PIPE_SCRIPT, String(address.port)], { stdio: 'pipe' });
++	try {
++		await once(child.stdout, 'data');
++		child.stdin.write('ping');
++		const [echoed] = await once(child.stdout, 'data');
++		assert.equal(String(echoed), 'ping');
++	} finally {
++		child.kill();
++		await closed(server);
++	}
++});
++
++test('a connection is relayed to the echo server through the child', async () => {
++	const echo = net.createServer(socket => socket.pipe(socket));
++	const address = await listen(echo);
++	const runner = fakeRunner();
++	const tunnel = await createStdioTunnel({
++		runner,
++		distro: 'Ubuntu',
++		serverPort: address.port,
++		nodePath: '/payloads/server-1.0.0/node',
++		log: silentLog
++	});
++
++	const client = net.connect(tunnel.localPort, '127.0.0.1');
++	try {
++		await once(client, 'connect');
++		client.write('hello');
++		const [chunk] = await once(client, 'data');
++		assert.equal(String(chunk), 'hello');
++	} finally {
++		client.destroy();
++		await tunnel.dispose();
++		await closed(echo);
++	}
++});
++
++test('a binary payload survives the round trip', async () => {
++	const echo = net.createServer(socket => socket.pipe(socket));
++	const address = await listen(echo);
++	const tunnel = await createStdioTunnel({
++		runner: fakeRunner(),
++		distro: 'Ubuntu',
++		serverPort: address.port,
++		nodePath: '/payloads/server-1.0.0/node',
++		log: silentLog
++	});
++
++	const client = net.connect(tunnel.localPort, '127.0.0.1');
++	const payload = Buffer.from([0x00, 0xff, 0x41, 0x0a, 0xc3, 0x28]);
++	try {
++		await once(client, 'connect');
++		client.write(payload);
++		const [chunk] = await once(client, 'data');
++		assert.deepStrictEqual(Buffer.from(chunk).subarray(0, payload.length), payload);
++	} finally {
++		client.destroy();
++		await tunnel.dispose();
++		await closed(echo);
++	}
++});
++
++test('dispose closes the listener and leaves no child alive', async () => {
++	const echo = net.createServer(socket => socket.pipe(socket));
++	const address = await listen(echo);
++	const runner = fakeRunner();
++	const tunnel = await createStdioTunnel({
++		runner,
++		distro: 'Ubuntu',
++		serverPort: address.port,
++		nodePath: '/payloads/server-1.0.0/node',
++		log: silentLog
++	});
++	const port = tunnel.localPort;
++
++	await tunnel.dispose();
++	await closed(echo);
++
++	assert.ok(runner.spawned.length > 0, 'the bootstrap should have spawned a child');
++	for (const child of runner.spawned) {
++		assert.ok(child.exitCode !== null || child.signalCode !== null, 'every child must be dead after dispose');
++	}
++
++	const client = net.connect(port, '127.0.0.1');
++	const [error] = await once(client, 'error');
++	assert.equal(error.code, 'ECONNREFUSED');
++	client.destroy();
++});
++
++test('a silent child fails the bootstrap with a preamble timeout', async () => {
++	const echo = net.createServer(socket => socket.pipe(socket));
++	const address = await listen(echo);
++	const runner = fakeRunner({
++		spawn: () => spawn(process.execPath, ['-e', 'setInterval(() => { }, 1000)'], { stdio: 'pipe' })
++	});
++
++	try {
++		await assert.rejects(
++			() => createStdioTunnel({
++				runner,
++				distro: 'Ubuntu',
++				serverPort: address.port,
++				nodePath: '/payloads/server-1.0.0/node',
++				log: silentLog,
++				preambleTimeoutMs: 200
++			}),
++			/tunnel preamble timeout/
++		);
++	} finally {
++		for (const child of runner.spawned) {
++			child.kill();
++		}
++		await closed(echo);
++	}
++});
++
++test('a child that exits before the preamble reports why', async () => {
++	const echo = net.createServer(socket => socket.pipe(socket));
++	const address = await listen(echo);
++	const runner = fakeRunner({
++		spawn: () => spawn(process.execPath, ['-e', 'process.stderr.write("node: not found\\n"); process.exit(3)'], { stdio: 'pipe' })
++	});
++
++	try {
++		await assert.rejects(
++			() => createStdioTunnel({
++				runner,
++				distro: 'Ubuntu',
++				serverPort: address.port,
++				nodePath: '/payloads/server-1.0.0/node',
++				log: silentLog,
++				preambleTimeoutMs: 5000
++			}),
++			/exited with code 3.*node: not found/s
++		);
++	} finally {
++		await closed(echo);
++	}
 +});

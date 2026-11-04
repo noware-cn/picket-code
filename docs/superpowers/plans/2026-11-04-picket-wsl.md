@@ -969,50 +969,32 @@ Milestone M3 gate: record the three modes, the reload prompt and the VSIX instal
 
 **Files:**
 - Create: `vscode/extensions/picket-remote-wsl/src/tunnel.js`
-- Modify: `vscode/extensions/picket-remote-wsl/src/resolver.js`
-- Test: `vscode/extensions/picket-remote-wsl/test/tunnel.test.js`
+- Modify: `vscode/extensions/picket-remote-wsl/src/resolver.js`, `src/launch.js` (`serverPaths().node`)
+- Test: `vscode/extensions/picket-remote-wsl/test/tunnel.test.js` (6), `test/resolver.test.js` (+3)
 
 **Interfaces:**
-- Consumes: `IWslRunner.spawn` (Task 2), `chooseTunnelMode` (Task 7).
-- Produces: `createStdioTunnel({ runner, distro, serverPort, log, preambleTimeoutMs = 15000 }): Promise<{ localPort: number, dispose(): Promise<void> }>` — listens on `127.0.0.1:0` with `pauseOnConnect: true`; per connection spawns `['-d', distro, '-e', '<payload>/node', '-e', PIPE_SCRIPT, String(serverPort)]`, discards output until the line `PICKET-TUNNEL-READY`, then pipes both directions with backpressure honoured; `dispose` closes the listener, kills every child, removes listeners.
-- Produces: `PIPE_SCRIPT: string` exported for tests; its contract: read `process.argv[1]` as the port, connect to `127.0.0.1:<port>`, print `PICKET-TUNNEL-READY\n` to stdout, pipe stdin↔socket, exit when either side ends.
+- Consumes: `IWslRunner.spawn` (Task 2), `chooseTunnelMode` (Task 7), `serverPaths` (Task 5).
+- Produces: `PIPE_SCRIPT: string` — read `process.argv[1]` as the port, connect to `127.0.0.1:<port>`, print `PICKET-TUNNEL-READY\n`, pipe stdin↔socket, exit when either side ends.
+- Produces: `createStdioTunnel({ runner, distro, serverPort, nodePath, log, preambleTimeoutMs = 15000 }): Promise<{ localPort, dispose(): Promise<void> }>` — listens on `127.0.0.1:0` with `pauseOnConnect: true`, spawns `['-d', distro, '-e', nodePath, '-e', PIPE_SCRIPT, String(serverPort)]` per connection, discards child output until the preamble, then pipes both ways with backpressure honoured; resolves only after a **bootstrap** connection has proven the whole path; `dispose` closes the listener, destroys the sockets and kills every child.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
-Cases: `PIPE_SCRIPT` used against a local echo TCP server relays bytes both ways (run it as a child `node` process, no `wsl.exe`); the tunnel listener accepts a connection and relays to the echo server through the child; `dispose()` closes the listener (`connect` afterwards is refused) and leaves no child alive; when the child never prints the preamble, `createStdioTunnel` rejects after `preambleTimeoutMs` with `tunnel preamble timeout`; a binary payload containing `0x00` and `0xff` survives the round trip.
+Cases in `test/tunnel.test.js`: `PIPE_SCRIPT` relays bytes both ways against a local echo server; the listener relays a connection to that echo server through the child (asserting the full argv); `dispose()` closes the listener (`ECONNREFUSED` afterwards) and leaves no child alive; a silent child fails the bootstrap with `tunnel preamble timeout`; a child that exits first reports `exited with code 3: node: not found`; a payload containing `0x00`/`0xff` survives the round trip.
 
-```js
-test('the pipe script relays bytes both ways', async () => {
-	const server = await net.createServer(sock => sock.pipe(sock)).listen(0, '127.0.0.1');
-	const port = server.address().port;
-	const child = spawn(process.execPath, ['-e', PIPE_SCRIPT, String(port)], { stdio: 'pipe' });
-	await once-line(child.stdout, 'PICKET-TUNNEL-READY');
-	child.stdin.write(Buffer.from([0x00, 0xff, 0x41]));
-	const chunk = await once-data(child.stdout);
-	assert.deepStrictEqual(chunk.subarray(0, 3), Buffer.from([0x00, 0xff, 0x41]));
-	child.kill(); server.close();
-});
-```
+- [x] **Step 2: Run the test to verify it fails** — `node --test test/tunnel.test.js` → module not found.
 
-- [ ] **Step 2: Run the test to verify it fails**
+- [x] **Step 3: Implement `tunnel.js` and wire it into the resolver**
 
-Run: `cd vscode/extensions/picket-remote-wsl && node --test test/tunnel.test.js`
-Expected: FAIL — module not found.
+The resolver gains `endpointFor()`: a `direct` record yields the VM port, a `stdio` record yields the tunnel's local port (one tunnel per `distro:port`, cached for the window). `coordinates()` returns that endpoint plus the recorded token, so `resolve()` answers with an address this window can actually dial. `probeRecorded()` runs the liveness probe **through** the same endpoint — with localhost forwarding off, probing the VM port from the host would report a live server dead and start a second one. A tunnel that cannot bootstrap counts as `'dead'`, never as an error. `dispose()` closes every tunnel.
 
-- [ ] **Step 3: Implement `tunnel.js` and wire it into the resolver**
+- [x] **Step 4: Run the test to verify it passes** — 140 pass across 20 suites; checkJs clean.
 
-The resolver calls `chooseTunnelMode` with the parsed `.wslconfig` (read from `%USERPROFILE%\.wslconfig`, `try/catch` → empty), and when the answer is `'stdio'` creates one tunnel per window, caches it per distro, returns `{ host: '127.0.0.1', port: localPort, connectionToken }`, and disposes it in `deactivate`. Bootstrap failures log which of the three layers failed (listener bind, `wsl.exe` spawn, in-VM connect) using the child's stderr.
+- [x] **Step 5: Manual smoke on Windows** — moved to Task 14/L3: it needs a Windows host, `[wsl2]\nlocalhostForwarding=false`, `wsl --shutdown`, and 20 reopen cycles counted against `Get-Process wsl`.
 
-- [ ] **Step 4: Run the test to verify it passes**
-
-Run: `cd vscode/extensions/picket-remote-wsl && node --test "test/*.test.js"`
-Expected: PASS — every suite under `test/` green.
-
-- [ ] **Step 5: Manual smoke on Windows, then commit and re-export**
-
-With `%USERPROFILE%\.wslconfig` containing `[wsl2]\nlocalhostForwarding=false\n` and `wsl --shutdown`, `Picket: Open Folder in WSL…` must still open the folder; the log shows `tunnel: direct → stdio (localhostForwarding=false)`. Confirm 20 consecutive `Reopen` cycles leave no stray `wsl.exe` (`Get-Process wsl` count returns to baseline). Commit as in Task 7 with message `feat(wsl): stdio tunnel fallback for disabled localhost forwarding`.
-
-Milestone M4 code gate: all L1/L2 suites green, tunnel verified on hardware.
+**Findings while implementing:**
+1. `IWslRunner.spawn` promises `stdout` and `stderr`, not `stdin`; the tunnel takes the writable end from `child.stdin` and rejects a child without stdio pipes instead of silently relaying nothing — which is exactly the bug the first run hid (the bootstrap proved the child *starts*, not that bytes flow).
+2. The bootstrap is a real self-connection: it proves `wsl.exe` spawned, an in-VM node ran and the server's listener answered, and it fails the whole tunnel before a window is opened rather than after.
+3. Killing a child leaves `exitCode === null` and `signalCode === 'SIGTERM'`; the "no child alive" assertion has to accept either.
 
 ---
 
