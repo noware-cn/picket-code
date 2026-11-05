@@ -1156,7 +1156,7 @@ index 00000000..e462e441
 +module.exports = { createCommands, registerCommands, downloadFromSettings, COMMANDS, LAST_DISTRO };
 diff --git a/extensions/picket-remote-wsl/src/components.js b/extensions/picket-remote-wsl/src/components.js
 new file mode 100644
-index 00000000..46361209
+index 00000000..6a6d596c
 --- /dev/null
 +++ b/extensions/picket-remote-wsl/src/components.js
 @@ -0,0 +1,254 @@
@@ -1164,7 +1164,7 @@ index 00000000..46361209
 +
 +const { readFile, writeFile } = require('node:fs/promises');
 +const { chooseSource, installPayload } = require('./payload.js');
-+const { compareVersions, selectComponent, describeSelectionError } = require('./version.js');
++const { compareVersions, normalizeWant, selectComponent, describeSelectionError } = require('./version.js');
 +
 +/** @typedef {{ sha256: string, version: string, commit: string, source: string, installedAt: string }} IPayloadMarker */
 +/** @typedef {'absent' | 'installed' | 'outdated' | 'incompatible' | 'broken'} IPayloadState */
@@ -1228,7 +1228,7 @@ index 00000000..46361209
 +
 +	/** What this build is allowed to talk to. */
 +	function want() {
-+		return { commit: options.product?.commit ?? '', minVersion: options.product?.picketServerMinVersion ?? '' };
++		return normalizeWant({ commit: options.product?.commit, minVersion: options.product?.picketServerMinVersion });
 +	}
 +
 +	/** @param {string} version */
@@ -1283,7 +1283,7 @@ index 00000000..46361209
 +			const declared = (catalog?.components ?? []).find((/** @type {any} */ c) => c.version === entry.version);
 +			return !declared || declared.sha256.toLowerCase() === entry.sha256.toLowerCase();
 +		};
-+		const ours = marked.filter(entry => entry.commit === want().commit);
++		const ours = marked.filter(entry => want().anyCommit || entry.commit === want().commit);
 +		const usable = ours.filter(entry => intact(entry) && atLeastMinimum(entry.version));
 +		if (usable.length > 0) {
 +			const best = usable.reduce((top, entry) => (compareVersions(entry.version, top.version) > 0 ? entry : top));
@@ -1369,7 +1369,7 @@ index 00000000..46361209
 +		const live = new Set();
 +		for (const dir of dirs) {
 +			const marker = await readMarker(dir);
-+			if (marker && marker.commit === want().commit && atLeastMinimum(marker.version)) {
++			if (marker && (want().anyCommit || marker.commit === want().commit) && atLeastMinimum(marker.version)) {
 +				live.add(dir);
 +			}
 +		}
@@ -3638,14 +3638,14 @@ index 00000000..f736d42b
 +module.exports = { AUTHORITY_PREFIX, parseAuthority, remoteUriFor, parseUncPath, toPosixPath, toWindowsPath };
 diff --git a/extensions/picket-remote-wsl/src/resolver.js b/extensions/picket-remote-wsl/src/resolver.js
 new file mode 100644
-index 00000000..8246cea1
+index 00000000..06759da5
 --- /dev/null
 +++ b/extensions/picket-remote-wsl/src/resolver.js
-@@ -0,0 +1,355 @@
+@@ -0,0 +1,356 @@
 +'use strict';
 +
 +const { listDistros, defaultDistro, visibleDistros, distroHome } = require('./distro.js');
-+const { compareVersions } = require('./version.js');
++const { compareVersions, normalizeWant } = require('./version.js');
 +const { serverPaths, versionFromPayloadDir, runtimeFileFor, buildServerArgs, newConnectionToken, lockAndRead, readRuntime, lockAgeMs, isStartLocked, acquireLock, releaseLock, writeRuntime, clearRuntime, startServer, stopServer } = require('./launch.js');
 +const { probeServer } = require('./probe.js');
 +const { parseAuthority } = require('./remoteUri.js');
@@ -3706,7 +3706,7 @@ index 00000000..8246cea1
 +
 +	/** What the product stamp says this client may talk to. */
 +	function want() {
-+		return { commit: options.product?.commit ?? '', minVersion: options.product?.picketServerMinVersion ?? '' };
++		return normalizeWant({ commit: options.product?.commit, minVersion: options.product?.picketServerMinVersion });
 +	}
 +
 +	/**
@@ -3716,7 +3716,8 @@ index 00000000..8246cea1
 +	 */
 +	function reusable(info) {
 +		try {
-+			return info?.commit === want().commit && compareVersions(String(info.version), want().minVersion) >= 0;
++			const { commit, minVersion, anyCommit } = want();
++			return (anyCommit || info?.commit === commit) && compareVersions(String(info.version), minVersion) >= 0;
 +		} catch {
 +			// An unparsable record is a record from before this scheme existed.
 +			return false;
@@ -4412,10 +4413,10 @@ index 00000000..07f34d81
 +module.exports = { PIPE_SCRIPT, createStdioTunnel };
 diff --git a/extensions/picket-remote-wsl/src/version.js b/extensions/picket-remote-wsl/src/version.js
 new file mode 100644
-index 00000000..44f0fc84
+index 00000000..2d8b619d
 --- /dev/null
 +++ b/extensions/picket-remote-wsl/src/version.js
-@@ -0,0 +1,75 @@
+@@ -0,0 +1,92 @@
 +'use strict';
 +
 +/**
@@ -4466,12 +4467,28 @@ index 00000000..44f0fc84
 +}
 +
 +/**
++ * A build that never went through `assemble.mjs` — a developer tree, the
++ * acceptance harness — carries no stamp, and such a client can only work with
++ * whatever the catalog offers. `build/wsl/check.mjs` refuses to package an
++ * unstamped app, so this tolerance cannot reach a release.
++ * @param {{ commit?: string, minVersion?: string } | undefined} want
++ * @returns {{ commit: string, minVersion: string, anyCommit: boolean }}
++ */
++function normalizeWant(want) {
++	return {
++		commit: want?.commit ?? '',
++		minVersion: want?.minVersion || '0.0.0',
++		anyCommit: !want?.commit
++	};
++}
++
++/**
 + * Compatibility is expressed by the handshake commit, so a component is a
 + * candidate only when it was built from this client's commit. Among candidates
 + * the newest wins, and a catalog that cannot satisfy the minimum is an error
 + * rather than a silent downgrade.
 + * @param {{ commit?: string | null, components?: any[] } | undefined} catalog
-+ * @param {{ commit: string, minVersion: string }} want
++ * @param {{ commit?: string, minVersion?: string }} want
 + * @returns {{ component: any } | { error: 'none' | 'no-commit' | 'below-min', offered?: string }}
 + */
 +function selectComponent(catalog, want) {
@@ -4479,18 +4496,19 @@ index 00000000..44f0fc84
 +	if (components.length === 0) {
 +		return { error: 'none' };
 +	}
-+	const candidates = components.filter(component => component?.kind === 'server' && component.commit === want.commit);
++	const { commit, minVersion, anyCommit } = normalizeWant(want);
++	const candidates = components.filter(component => component?.kind === 'server' && (anyCommit || component.commit === commit));
 +	if (candidates.length === 0) {
 +		return { error: 'no-commit' };
 +	}
 +	const highest = candidates.reduce((best, component) => (compareVersions(component.version, best.version) > 0 ? component : best));
-+	if (compareVersions(highest.version, want.minVersion) < 0) {
++	if (compareVersions(highest.version, minVersion) < 0) {
 +		return { error: 'below-min', offered: highest.version };
 +	}
 +	return { component: highest };
 +}
 +
-+module.exports = { parseVersion, compareVersions, selectComponent, describeSelectionError };
++module.exports = { parseVersion, compareVersions, normalizeWant, selectComponent, describeSelectionError };
 diff --git a/extensions/picket-remote-wsl/test/catalog.test.js b/extensions/picket-remote-wsl/test/catalog.test.js
 new file mode 100644
 index 00000000..b6dc5b39
@@ -6703,10 +6721,10 @@ index 00000000..1ae6d0d9
 +});
 diff --git a/extensions/picket-remote-wsl/test/offline.test.js b/extensions/picket-remote-wsl/test/offline.test.js
 new file mode 100644
-index 00000000..55696e9f
+index 00000000..988d5738
 --- /dev/null
 +++ b/extensions/picket-remote-wsl/test/offline.test.js
-@@ -0,0 +1,103 @@
+@@ -0,0 +1,107 @@
 +'use strict';
 +
 +const test = require('node:test');
@@ -6721,7 +6739,9 @@ index 00000000..55696e9f
 +
 +const { unpackOfflineBundle, removeBundle } = require('../src/offline.js');
 +
-+const NAME = 'picket-code-server-v1.0.0-linux-x64.tar.gz';
++const VERSION = '1.0.0';
++const COMMIT = 'a'.repeat(40);
++const NAME = `picket-code-server-${VERSION}-linux-x64.tar.gz`;
 +const PAYLOAD = Buffer.from([0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03]);
 +const SHA = createHash('sha256').update(PAYLOAD).digest('hex');
 +
@@ -6732,13 +6752,14 @@ index 00000000..55696e9f
 +	await writeFile(join(inner, NAME), PAYLOAD);
 +	await writeFile(join(inner, 'SHA256SUMS'), `${SHA}  ${NAME}\n`);
 +	await writeFile(join(inner, 'catalog.json'), JSON.stringify({
-+		version: 1,
-+		tag: 'v1.0.0',
++		schema: 2,
++		minVersion: VERSION,
 +		flavor: 'ondemand',
 +		components: [{
 +			id: 'wsl-server',
 +			kind: 'server',
-+			version: 'v1.0.0',
++			version: VERSION,
++			commit: COMMIT,
 +			file: NAME,
 +			size: 10,
 +			sha256: SHA,
@@ -6756,10 +6777,11 @@ index 00000000..55696e9f
 +		const zip = await buildBundle(work);
 +		const unpacked = await unpackOfflineBundle({ bundlePath: zip });
 +
-+		assert.equal(unpacked.catalog.tag, 'v1.0.0');
++		assert.equal(unpacked.catalog.schema, 2);
++		assert.equal(unpacked.catalog.components[0].commit, COMMIT);
 +		assert.equal(unpacked.sums.get(NAME), SHA);
 +		assert.equal(unpacked.payloadSha256, SHA, 'the payload digest is checked before anything is installed');
-+		assert.match(unpacked.payloadPath, /picket-code-server-v1\.0\.0-linux-x64\.tar\.gz$/);
++		assert.match(unpacked.payloadPath, /picket-code-server-1\.0\.0-linux-x64\.tar\.gz$/);
 +
 +		const bytes = await readFile(unpacked.payloadPath);
 +		assert.equal(bytes.length, 10);
@@ -7141,10 +7163,10 @@ index 00000000..69414920
 +});
 diff --git a/extensions/picket-remote-wsl/test/resolver.test.js b/extensions/picket-remote-wsl/test/resolver.test.js
 new file mode 100644
-index 00000000..f53f35be
+index 00000000..7888f317
 --- /dev/null
 +++ b/extensions/picket-remote-wsl/test/resolver.test.js
-@@ -0,0 +1,567 @@
+@@ -0,0 +1,582 @@
 +// RED first: this file must fail until src/resolver.js exists.
 +const test = require('node:test');
 +const assert = require('node:assert');
@@ -7368,6 +7390,21 @@ index 00000000..f53f35be
 +	assert.strictEqual(args[1], 'Ubuntu');
 +	assert.strictEqual(starts[0].runtimeFile, `/home/u/.picket-code-server/runtime/Ubuntu.json`);
 +	assert.strictEqual(starts[0].extra.commit, COMMIT);
++});
++
++test('an unstamped developer window adopts a recorded server it did not build', async () => {
++	// `scripts/code.sh` and the acceptance harness run an unpackaged tree, so there
++	// is no commit to match; a stamped build is the case the guard exists for.
++	const runner = makeRunner({ runtime: recorded({ commit: 'f'.repeat(40) }) });
++	const { starts, startServer } = startsRecording();
++	const resolver = createResolver({
++		runner, components: () => { throw new Error('must not install when the stored server is alive'); },
++		settings: {}, log: silentLog(), startServer,
++		probe: async () => 'alive'
++	});
++
++	assert.strictEqual((await resolver.resolve('picket-wsl+Ubuntu')).port, 41234);
++	assert.strictEqual(starts.length, 0);
 +});
 +
 +test('a dead probe restarts the server and clears the stale runtime file', async () => {
@@ -8140,14 +8177,14 @@ index 00000000..bfcd4e81
 +});
 diff --git a/extensions/picket-remote-wsl/test/version.test.js b/extensions/picket-remote-wsl/test/version.test.js
 new file mode 100644
-index 00000000..5bc3dedb
+index 00000000..c5533c26
 --- /dev/null
 +++ b/extensions/picket-remote-wsl/test/version.test.js
-@@ -0,0 +1,52 @@
+@@ -0,0 +1,64 @@
 +// RED first: this file must fail until src/version.js exists.
 +const test = require('node:test');
 +const assert = require('node:assert');
-+const { compareVersions, parseVersion, selectComponent } = require('../src/version.js');
++const { compareVersions, normalizeWant, parseVersion, selectComponent } = require('../src/version.js');
 +
 +/** @param {string[]} versions @param {string} [commit] */
 +function catalogOf(versions, commit = 'abc') {
@@ -8195,6 +8232,18 @@ index 00000000..5bc3dedb
 +test('an empty catalog is not an error the caller can paper over', () => {
 +	assert.deepEqual(selectComponent({ schema: 2, flavor: 'ondemand', minVersion: '1.0.0', components: [] },
 +		{ commit: 'abc', minVersion: '1.0.0' }), { error: 'none' });
++});
++
++test('a build with no stamp (a developer tree) takes the highest component whatever its commit', () => {
++	// Acceptance and every `scripts/code.sh` run use an unpackaged tree, which has
++	// no commit and no minimum. check.mjs keeps such a build out of a release.
++	const result = selectComponent(catalogOf(['1.0.0', '1.4.0'], 'someone-elses-commit'), {});
++	assert.equal(result.component.version, '1.4.0');
++	assert.deepEqual(normalizeWant(undefined), { commit: '', minVersion: '0.0.0', anyCommit: true });
++});
++
++test('a stamped build is never treated as stampless', () => {
++	assert.deepEqual(normalizeWant({ commit: 'abc', minVersion: '1.2.0' }), { commit: 'abc', minVersion: '1.2.0', anyCommit: false });
 +});
 diff --git a/test/automation/src/code.ts b/test/automation/src/code.ts
 index 4c0d9bda..8ff230a3 100644

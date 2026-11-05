@@ -2,7 +2,7 @@
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, mkdir, writeFile, readdir, rm } from 'node:fs/promises';
+import { mkdtemp, mkdir, writeFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createHash } from 'node:crypto';
@@ -11,8 +11,10 @@ import { promisify } from 'node:util';
 import { fileURLToPath } from 'node:url';
 
 const run = promisify(execFile);
-const TAG = 'v1.143.1-picket.1-rc.4';
-const NAME = `picket-code-server-${TAG}-linux-x64.tar.gz`;
+const MIN = '1.0.0';
+const VERSION = '1.4.0';
+const COMMIT = 'a'.repeat(40);
+const NAME = `picket-code-server-${VERSION}-linux-x64.tar.gz`;
 const SCRIPT = fileURLToPath(new URL('../check.mjs', import.meta.url));
 
 const PAYLOAD = Buffer.from('fake-payload-bytes');
@@ -21,28 +23,60 @@ const SHA = createHash('sha256').update(PAYLOAD).digest('hex');
 /**
  * A fake built app: product.json + the extension with a payload and catalog
  * shaped exactly like assemble.mjs writes them.
- * @param {{ flavor?: 'embedded' | 'ondemand', proposals?: boolean, tag?: string, catalogTag?: string, payloadBytes?: Buffer, sumsSha?: string, size?: number }} [options]
+ * @param {{
+ *   flavor?: 'embedded' | 'ondemand',
+ *   proposals?: boolean,
+ *   minVersion?: string,
+ *   catalogMinVersion?: string,
+ *   version?: string,
+ *   commit?: string,
+ *   componentCommit?: string,
+ *   schema?: number,
+ *   productMinVersion?: string | undefined,
+ *   payloadBytes?: Buffer,
+ *   sumsSha?: string,
+ *   size?: number
+ * }} [options]
  */
 async function fixtureApp(options = {}) {
 	const app = await mkdtemp(join(tmpdir(), 'picket-check-'));
 	const ext = join(app, 'extensions', 'picket-remote-wsl');
 	await mkdir(join(ext, 'payloads'), { recursive: true });
 	const proposals = options.proposals === false ? {} : { 'noware.picket-remote-wsl': ['resolvers', 'contribViewsRemote'] };
-	await writeFile(join(app, 'product.json'), JSON.stringify({ extensionEnabledApiProposals: proposals, picketTag: options.tag ?? TAG }));
+	/** @type {Record<string, unknown>} */
+	const product = {
+		extensionEnabledApiProposals: proposals,
+		commit: options.commit ?? COMMIT
+	};
+	const min = 'productMinVersion' in options ? options.productMinVersion : (options.minVersion ?? MIN);
+	if (min !== undefined) {
+		product.picketServerMinVersion = min;
+	}
+	await writeFile(join(app, 'product.json'), JSON.stringify(product));
+
 	const flavor = options.flavor ?? 'embedded';
-	const catalogTag = options.catalogTag ?? TAG;
+	const bytes = options.payloadBytes ?? PAYLOAD;
+	const fileName = `picket-code-server-${options.version ?? VERSION}-linux-x64.tar.gz`;
+	/** @type {Record<string, unknown>} */
 	const component = {
-		id: 'wsl-server', kind: 'server', version: catalogTag, file: NAME,
-		size: options.size ?? (options.payloadBytes ?? PAYLOAD).length,
-		sha256: options.sumsSha ?? SHA, embedded: flavor === 'embedded'
+		id: 'wsl-server', kind: 'server',
+		version: options.version ?? VERSION,
+		commit: options.componentCommit ?? COMMIT,
+		file: fileName,
+		size: options.size ?? bytes.length,
+		sha256: options.sumsSha ?? SHA,
+		embedded: flavor === 'embedded'
 	};
 	if (flavor === 'embedded') {
 		await mkdir(join(ext, 'resources', 'wsl-payloads'), { recursive: true });
-		await writeFile(join(ext, 'resources', 'wsl-payloads', NAME), options.payloadBytes ?? PAYLOAD);
-		component.embeddedPath = `resources/wsl-payloads/${NAME}`;
+		await writeFile(join(ext, 'resources', 'wsl-payloads', fileName), bytes);
+		component.embeddedPath = `resources/wsl-payloads/${fileName}`;
 	}
 	await writeFile(join(ext, 'payloads', 'catalog.json'), JSON.stringify({
-		version: 1, tag: catalogTag, flavor, components: [component]
+		schema: options.schema ?? 2,
+		minVersion: options.catalogMinVersion ?? options.minVersion ?? MIN,
+		flavor,
+		components: [component]
 	}, null, '\t'));
 	return app;
 }
@@ -79,11 +113,61 @@ test('an ondemand build containing a payload fails', async () => {
 	}
 });
 
-test('a catalog tag that disagrees with picketTag fails', async () => {
-	const app = await fixtureApp({ catalogTag: 'v0.0.1', tag: TAG });
+test('a catalog whose highest version is below the minimum fails the build', async () => {
+	const app = await fixtureApp({ version: '0.9.0' });
 	try {
 		const result = await check('--app', app, '--flavor', 'embedded');
-		assert.match(result.stderr, /catalog version v0\.0\.1 does not match picketTag/);
+		assert.match(result.stderr, /catalog offers 0\.9\.0, requires >= 1\.0\.0/);
+	} finally {
+		await rm(app, { recursive: true, force: true });
+	}
+});
+
+test('a catalog for another commit fails the build', async () => {
+	const app = await fixtureApp({ componentCommit: 'b'.repeat(40) });
+	try {
+		const result = await check('--app', app, '--flavor', 'embedded');
+		assert.match(result.stderr, new RegExp(`no server component for commit ${COMMIT}`));
+	} finally {
+		await rm(app, { recursive: true, force: true });
+	}
+});
+
+test('a catalog minVersion that disagrees with the product stamp fails', async () => {
+	const app = await fixtureApp({ catalogMinVersion: '1.2.0' });
+	try {
+		const result = await check('--app', app, '--flavor', 'embedded');
+		assert.match(result.stderr, /catalog minVersion 1\.2\.0 does not match picketServerMinVersion 1\.0\.0/);
+	} finally {
+		await rm(app, { recursive: true, force: true });
+	}
+});
+
+test('a schema 1 catalog is refused instead of being read as current', async () => {
+	const app = await fixtureApp({ schema: 1 });
+	try {
+		const result = await check('--app', app, '--flavor', 'embedded');
+		assert.match(result.stderr, /catalog schema 1 is not 2/);
+	} finally {
+		await rm(app, { recursive: true, force: true });
+	}
+});
+
+test('a product without a minimum version stamp cannot be checked', async () => {
+	const app = await fixtureApp({ productMinVersion: undefined });
+	try {
+		const result = await check('--app', app, '--flavor', 'embedded');
+		assert.match(result.stderr, /picketServerMinVersion is missing/);
+	} finally {
+		await rm(app, { recursive: true, force: true });
+	}
+});
+
+test('a component version that is not semver is refused', async () => {
+	const app = await fixtureApp({ version: 'v1.143.1-picket.1-rc.4', minVersion: MIN });
+	try {
+		const result = await check('--app', app, '--flavor', 'embedded');
+		assert.match(result.stderr, /is not a semver version/);
 	} finally {
 		await rm(app, { recursive: true, force: true });
 	}

@@ -4,25 +4,53 @@
 // component catalog and, for embedded builds, copies the payload into the
 // extension. Run after the platform build, before packaging.
 //
-//   node assemble.mjs --app <VSCode-win32-x64> --tag <release-tag> --flavor embedded --payload <tar.gz> [--sums <SHA256SUMS>]
-//   node assemble.mjs --app <app> --tag <tag> --flavor ondemand --sums <SHA256SUMS> --size <bytes>
+//   node assemble.mjs --app <app> --min-version <x.y.z> [--version <x.y.z>] [--commit <40hex>] \
+//        --flavor embedded --payload <tar.gz> [--sums <SHA256SUMS>]
+//   node assemble.mjs --app <app> --min-version <x.y.z> [--version <x.y.z>] [--commit <40hex>] \
+//        --flavor ondemand --sums <SHA256SUMS> --size <bytes>
+//
+// --version defaults to the minimum, so a release that only ever cut one server
+// version does not have to set both. --commit defaults to the one the upstream
+// build wrote into product.json (gulpfile.vscode.ts:178): that is the value the
+// client sends in the handshake, so the catalog must carry the same one.
 
 import { copyFile, mkdir, readdir, readFile, stat, writeFile } from 'node:fs/promises';
 import { basename, join } from 'node:path';
-import { parseArgs, payloadName, readSha256Sums, requireArg, runCli, sha256File } from './lib/common.mjs';
+import { compareVersions, parseArgs, payloadName, readSha256Sums, requireArg, requireSemver, runCli, sha256File } from './lib/common.mjs';
 
 const EXTENSION = 'extensions/picket-remote-wsl';
+
+/**
+ * @param {string} explicit
+ * @param {string} app
+ */
+async function resolveCommit(explicit, app) {
+	const fromProduct = explicit ? '' : JSON.parse(await readFile(join(app, 'product.json'), 'utf8')).commit;
+	const commit = explicit || fromProduct;
+	if (!commit) {
+		throw new Error('--commit or product.json commit is required: a catalog component is matched to a client by commit');
+	}
+	if (!/^[0-9a-f]{40}$/.test(commit)) {
+		throw new Error(`commit "${commit}" is not a 40-character hex sha`);
+	}
+	return commit;
+}
 
 async function main() {
 	const args = parseArgs(process.argv.slice(2));
 	const app = requireArg(args, 'app');
-	const tag = requireArg(args, 'tag');
 	const flavor = requireArg(args, 'flavor');
 	if (flavor !== 'embedded' && flavor !== 'ondemand') {
 		throw new Error(`unknown flavor "${flavor}": use embedded or ondemand`);
 	}
+	const minVersion = requireSemver(requireArg(args, 'min-version'), '--min-version');
+	const version = args.version ? requireSemver(args.version, '--version') : minVersion;
+	if (compareVersions(version, minVersion) < 0) {
+		throw new Error(`version ${version} is below the minimum ${minVersion}: this build would refuse its own payload`);
+	}
+	const commit = await resolveCommit(args.commit, app);
 
-	const name = payloadName(tag);
+	const name = payloadName(version);
 	const extensionDir = join(app, EXTENSION);
 	const payloadsDir = join(extensionDir, 'payloads');
 	await mkdir(payloadsDir, { recursive: true });
@@ -31,11 +59,11 @@ async function main() {
 	let component;
 	if (flavor === 'embedded') {
 		if (!args.payload) {
-			throw new Error('embedded builds need --payload <picket-code-server-<tag>-linux-x64.tar.gz>');
+			throw new Error('embedded builds need --payload <picket-code-server-<version>-linux-x64.tar.gz>');
 		}
 		const file = basename(args.payload);
-		if (!file.includes(tag)) {
-			throw new Error(`payload file name does not contain tag "${tag}": ${file}`);
+		if (!file.includes(version)) {
+			throw new Error(`payload file name does not contain version "${version}": ${file}`);
 		}
 		const sha256 = await sha256File(args.payload);
 		const size = (await stat(args.payload)).size;
@@ -49,7 +77,7 @@ async function main() {
 		await mkdir(embeddedDir, { recursive: true });
 		await copyFile(args.payload, join(embeddedDir, file));
 		component = {
-			id: 'wsl-server', kind: 'server', version: tag, file, size, sha256,
+			id: 'wsl-server', kind: 'server', version, commit, file, size, sha256,
 			embedded: true, embeddedPath: `resources/wsl-payloads/${file}`
 		};
 	} else {
@@ -64,17 +92,20 @@ async function main() {
 			throw new Error(`SHA256SUMS has no entry for ${name}`);
 		}
 		component = {
-			id: 'wsl-server', kind: 'server', version: tag, file: name,
+			id: 'wsl-server', kind: 'server', version, commit, file: name,
 			size: Number(args.size), sha256, embedded: false
 		};
 	}
 
-	const catalog = { version: 1, tag, flavor, components: [component] };
+	const catalog = { schema: 2, minVersion, flavor, components: [component] };
 	await writeFile(join(payloadsDir, 'catalog.json'), `${JSON.stringify(catalog, null, '\t')}\n`);
 
 	const productPath = join(app, 'product.json');
 	const product = JSON.parse(await readFile(productPath, 'utf8'));
-	product.picketTag = tag;
+	product.picketServerMinVersion = minVersion;
+	// The old stamp tied the client tag to the server tag; leaving it behind
+	// would let two different stamps disagree about which server is right.
+	delete product.picketTag;
 	await writeFile(productPath, `${JSON.stringify(product, null, '\t')}\n`);
 
 	if (flavor === 'ondemand') {
@@ -84,7 +115,7 @@ async function main() {
 			throw new Error(`ondemand build contains a payload: ${leaked.join(', ')}`);
 		}
 	}
-	console.log(`assembled ${flavor} WSL component ${component.file} (${component.size} bytes) for ${tag}`);
+	console.log(`assembled ${flavor} WSL component ${component.file} (${component.size} bytes): server ${version} for commit ${commit}, minimum ${minVersion}`);
 }
 
 runCli(main);

@@ -5,14 +5,38 @@
 import { createHash } from 'node:crypto';
 import { createReadStream } from 'node:fs';
 import { readFile } from 'node:fs/promises';
+// The gate compares versions with the same code the client selects with, so a
+// payload that passes packaging cannot be refused at runtime by a tie-break.
+import { compareVersions, parseVersion } from '../../../vscode/extensions/picket-remote-wsl/src/version.js';
 
 /**
- * The canonical name of the server payload for a release tag.
- * @param {string} tag
+ * The canonical name of the server payload for a server version.
+ * @param {string} version
  */
-export function payloadName(tag) {
-	return `picket-code-server-${tag}-linux-x64.tar.gz`;
+export function payloadName(version) {
+	return `picket-code-server-${version}-linux-x64.tar.gz`;
 }
+
+/**
+ * @param {string} text
+ * @returns {boolean}
+ */
+export function isSemver(text) {
+	return parseVersion(text) !== undefined;
+}
+
+/**
+ * @param {string} text @param {string} label how the value reached the script
+ * @returns {string}
+ */
+export function requireSemver(text, label) {
+	if (!isSemver(text)) {
+		throw new Error(`${label} must be a semver x.y.z (got "${text}")`);
+	}
+	return text;
+}
+
+export { compareVersions };
 
 /**
  * Parse an SHA256SUMS file into a Map of file name -> digest. Tolerates the

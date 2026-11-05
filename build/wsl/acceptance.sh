@@ -46,7 +46,7 @@ payload() {
 server_pids() {
 	# bin/picket-code-server is a sh wrapper that runs node as a child, so the
 	# server itself is the server-main.js process (matching both would double count).
-	pgrep -f "out/server-main.js .*user-data-dir=$SCRATCH/home/.picket-code-server/data" || true
+	pgrep -f "out/server-main.js .*user-data-dir=$SCRATCH/home/.vscode-server/data" || true
 }
 
 launch_window() { # $1 = log file
@@ -123,10 +123,10 @@ export_accept_env() {
 
 stage_window() { # $1 payload path, $2 configured icodePath, $3 tunnelMode
 	local payload="$1" icode="${2:-}" tunnel="${3:-auto}"
-	pkill -KILL -f "user-data-dir=$SCRATCH/home/.picket-code-server/data" 2>/dev/null || true
+	pkill -KILL -f "user-data-dir=$SCRATCH/home/.vscode-server/data" 2>/dev/null || true
 	pkill -KILL -f "user-data-dir=$USER_DATA" 2>/dev/null || true
 	rm -rf "$SCRATCH/home" "$SCRATCH/user-data" "$SCRATCH/ext"
-	mkdir -p "$SCRATCH/home/.picket-code-server" "$SCRATCH/user-data/User" "$SCRATCH/logs" "$FOLDER" "$STAGING"
+	mkdir -p "$SCRATCH/home/.picket-code-server" "$SCRATCH/home/.vscode-server" "$SCRATCH/user-data/User" "$SCRATCH/logs" "$FOLDER" "$STAGING"
 	echo '# acceptance profile marker (proves the server runs under the login shell)' > "$SCRATCH/home/.profile"
 	echo 'export PICKET_ACCEPT_PROFILE_MARKER=from-login-shell' >> "$SCRATCH/home/.profile"
 	if ! cp -r "$ROOT/vscode/extensions/picket-remote-wsl/." "$STAGING"; then
@@ -149,8 +149,8 @@ stage_window() { # $1 payload path, $2 configured icodePath, $3 tunnelMode
 	' "$STAGING/package.json" || { ko stage "could not rewrite the staged manifest"; return 1; }
 	# The harness asserts from inside the remote extension host, so it has to be
 	# installed into the distro-side extensions dir the server scans.
-	mkdir -p "$SCRATCH/home/.picket-code-server/extensions"
-	if ! cp -r "$HARNESS" "$SCRATCH/home/.picket-code-server/extensions/picket.picket-wsl-harness-0.0.0"; then
+	mkdir -p "$SCRATCH/home/.vscode-server/extensions"
+	if ! cp -r "$HARNESS" "$SCRATCH/home/.vscode-server/extensions/picket.picket-wsl-harness-0.0.0"; then
 		ko stage "could not install the harness extension"
 		return 1
 	fi
@@ -330,7 +330,7 @@ main() {
 
 	# A window left behind by an interrupt would hold the display and the
 	# scratch directory the next stage wipes.
-	trap 'pkill -KILL -f "user-data-dir=$USER_DATA" 2>/dev/null; pkill -KILL -f "out/server-main.js .*user-data-dir=$SCRATCH/home/.picket-code-server/data" 2>/dev/null; true' EXIT
+	trap 'pkill -KILL -f "user-data-dir=$USER_DATA" 2>/dev/null; pkill -KILL -f "out/server-main.js .*user-data-dir=$SCRATCH/home/.vscode-server/data" 2>/dev/null; true' EXIT
 
 	[ $l2 -eq 1 ] && run_l2
 	[ $remote -eq 1 ] && run_remote

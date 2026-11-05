@@ -40,8 +40,8 @@ on:
         description: "Upstream VS Code tag to test (e.g. 1.143.1). Defaults to the newest picket-code release tag."
         required: false
         type: string
-      server_tag:
-        description: "noware-cn/picket-code-server tag whose payload the WSL job installs. Defaults to the repository variable PICKET_SERVER_TAG."
+      server_version:
+        description: "noware-cn/picket-code-server version whose payload the WSL job installs. Defaults to the repository variable PICKET_SERVER_VERSION."
         required: false
         type: string
   schedule:
@@ -54,8 +54,8 @@ on:
         description: "Upstream VS Code tag to test (e.g. 1.143.1). Defaults to the newest picket-code release tag."
         required: false
         type: string
-      server_tag:
-        description: "noware-cn/picket-code-server tag whose payload the WSL job installs. Defaults to the repository variable PICKET_SERVER_TAG."
+      server_version:
+        description: "noware-cn/picket-code-server version whose payload the WSL job installs. Defaults to the repository variable PICKET_SERVER_VERSION."
         required: false
         type: string
     # Optional: noware-cn/picket-code-server is public, so the payload comes down over
@@ -365,10 +365,12 @@ jobs:
       # The driver's own default, named here so the artifact paths below cannot drift
       # from the directory the script actually used.
       PICKET_WSL_ACCEPT_HOME: /tmp/picket-wsl-accept
-      # Release of noware-cn/picket-code-server whose payload is installed into the
-      # scratch distro. Repository variable — release.yml pins the shipped build with
-      # the same one; the dispatch input overrides it for an unreleased payload.
-      PICKET_SERVER_TAG: ${{ inputs.server_tag || vars.PICKET_SERVER_TAG }}
+      # Version of noware-cn/picket-code-server whose payload is installed into the
+      # scratch distro. Repository variable — release.yml states its floor with the
+      # same one; the dispatch input overrides it for an unreleased payload.
+      # The acceptance window is an unpackaged tree with no product stamp, so it
+      # accepts any commit; fetch-payload.sh reads the real one out of the payload.
+      PICKET_SERVER_VERSION: ${{ inputs.server_version || vars.PICKET_SERVER_VERSION }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -385,12 +387,12 @@ jobs:
         run: |
           set -euo pipefail
           missing=0
-          if [ -z "${PICKET_SERVER_TAG:-}" ]; then
-            echo "FAIL: PICKET_SERVER_TAG is empty."
-            echo "      Set the repository variable PICKET_SERVER_TAG (Settings -> Secrets and"
+          if [ -z "${PICKET_SERVER_VERSION:-}" ]; then
+            echo "FAIL: PICKET_SERVER_VERSION is empty."
+            echo "      Set the repository variable PICKET_SERVER_VERSION (Settings -> Secrets and"
             echo "      variables -> Actions -> Variables) to the noware-cn/picket-code-server"
-            echo "      release tag whose payload this branch installs, or dispatch this"
-            echo "      workflow with the 'server_tag' input."
+            echo "      version whose payload this branch installs, or dispatch this"
+            echo "      workflow with the 'server_version' input."
             missing=1
           fi
           if [ -n "${SERVER_TOKEN:-}" ] && ! command -v gh >/dev/null 2>&1; then
@@ -401,7 +403,7 @@ jobs:
           if [ "$missing" -ne 0 ]; then
             exit 1
           fi
-          echo "ok: payload tag $PICKET_SERVER_TAG (anonymous download)"
+          echo "ok: payload version $PICKET_SERVER_VERSION (anonymous download)"
 
       - name: Resolve tag (input → release tag → newest release tag → upstream latest)
         id: resolve
@@ -600,7 +602,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: build/wsl/download
-          key: wsl-payload-${{ env.PICKET_SERVER_TAG }}
+          key: wsl-payload-${{ env.PICKET_SERVER_VERSION }}
 
       # fetch-payload.sh downloads the release over plain HTTPS (the payload repository is
       # public), verifies the tarball against SHA256SUMS and writes catalog.json from the
@@ -613,8 +615,8 @@ jobs:
         run: |
           set -euo pipefail
           token="${PICKET_SERVER_TOKEN:+with token}"
-          echo "==> bash build/wsl/fetch-payload.sh $PICKET_SERVER_TAG ${token:-anonymously}"
-          bash build/wsl/fetch-payload.sh "$PICKET_SERVER_TAG"
+          echo "==> bash build/wsl/fetch-payload.sh $PICKET_SERVER_VERSION ${token:-anonymously}"
+          bash build/wsl/fetch-payload.sh "$PICKET_SERVER_VERSION"
 
       # Existence alone is not enough: a cache restored from an interrupted download
       # would hand the driver a truncated tarball, and `tar` failures deep inside the
@@ -631,7 +633,7 @@ jobs:
               exit 1
             fi
           done
-          tarball="$dir/picket-code-server-$PICKET_SERVER_TAG-linux-x64.tar.gz"
+          tarball="$dir/picket-code-server-$PICKET_SERVER_VERSION-linux-x64.tar.gz"
           if [ ! -f "$tarball" ]; then
             echo "FAIL: $tarball is missing after fetch-payload.sh ran."
             ls -l "$dir"

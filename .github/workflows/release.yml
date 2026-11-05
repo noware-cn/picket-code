@@ -23,14 +23,18 @@ permissions:
 # catalog and downloads the payload on first use. Embedded builds (payload
 # inside the app, zero first-use download) are cut by the internal
 # distribution from a checkout that overrides PICKET_WSL_PAYLOAD=embedded.
-# PICKET_SERVER_TAG pins the noware-cn/picket-code-server release whose
-# payload ships; set it in the repo variables. That repository is public, so
-# the payload is fetched over plain HTTPS and no token is involved. (Setting
-# PICKET_SERVER_TOKEN still switches fetch-payload.sh to `gh`, for a private
-# mirror via PICKET_SERVER_REPO.)
+# The server is versioned separately from the client, so a build states a floor
+# and a version rather than an exact tag: PICKET_SERVER_MIN_VERSION is the oldest
+# picket-code-server this client accepts, PICKET_SERVER_VERSION is the payload it
+# ships (defaults to the floor). Both live in repo variables; an unset variable
+# fails the build in the first step instead of producing an app nobody can connect
+# to. That repository is public, so the payload is fetched over plain HTTPS and
+# no token is involved. (Setting PICKET_SERVER_TOKEN still switches
+# fetch-payload.sh to `gh`, for a private mirror via PICKET_SERVER_REPO.)
 env:
   PICKET_WSL_PAYLOAD: ondemand
-  PICKET_SERVER_TAG: ${{ vars.PICKET_SERVER_TAG }}
+  PICKET_SERVER_MIN_VERSION: ${{ vars.PICKET_SERVER_MIN_VERSION }}
+  PICKET_SERVER_VERSION: ${{ vars.PICKET_SERVER_VERSION }}
 
 # Gate order (docs/testing.md §3.1): the automated test layers run before anything is
 # compiled, packaged or published, so a red layer means no artifacts and no release.
@@ -104,7 +108,7 @@ jobs:
       # The WSL job installs the noware-cn/picket-code-server payload, which is
       # public and needs no credential. A reusable workflow still only sees the
       # secrets the caller names, so the optional token is forwarded for the
-      # private-mirror case; the tag travels through PICKET_SERVER_TAG.
+      # private-mirror case; the version travels through the repository variables.
       PICKET_SERVER_TOKEN: ${{ secrets.PICKET_SERVER_TOKEN }}
 
   # Compile stage: clone + patch + npm ci + upstream min build, then ship the
@@ -206,13 +210,22 @@ jobs:
       # The offline component bundle is platform-independent (a Linux server
       # payload plus metadata), so it is built once, in the win32 job only —
       # WSL is a Windows-host scenario and duplicate artifact names collide.
+      # The payload's commit is read from the packaged app: that is the value the
+      # client stamps, so the bundle's catalog must carry the same one.
       - name: Offline WSL component bundle
         if: matrix.platform == 'win32'
         shell: bash
         run: |
-          bash build/wsl/fetch-payload.sh "$PICKET_SERVER_TAG"
+          APP="picket-code-win32-${{ matrix.arch }}/resources/app"
+          export PICKET_SERVER_COMMIT="$(node -e 'process.stdout.write(JSON.parse(require("fs").readFileSync(process.argv[1], "utf8")).commit ?? "")' "$APP/product.json")"
+          if [ -z "$PICKET_SERVER_COMMIT" ]; then
+            echo "the packaged product.json carries no commit" >&2
+            exit 1
+          fi
+          bash build/wsl/fetch-payload.sh "$PICKET_SERVER_VERSION"
           node build/wsl/offline-bundle.mjs \
-            --dir build/wsl/download --tag "$PICKET_SERVER_TAG" \
+            --dir build/wsl/download --version "$PICKET_SERVER_VERSION" \
+            --min-version "$PICKET_SERVER_MIN_VERSION" \
             --out "picket-code-${{ github.ref_name }}-offline-wsl.zip"
 
       # The archives leave package.sh under a version-less name so the checks below
