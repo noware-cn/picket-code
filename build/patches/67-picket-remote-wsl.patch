@@ -326,10 +326,10 @@ index 00000000..8d23bae8
 +module.exports = { activate, deactivate };
 diff --git a/extensions/picket-remote-wsl/package.json b/extensions/picket-remote-wsl/package.json
 new file mode 100644
-index 00000000..b46de115
+index 00000000..184524f4
 --- /dev/null
 +++ b/extensions/picket-remote-wsl/package.json
-@@ -0,0 +1,362 @@
+@@ -0,0 +1,363 @@
 +{
 +	"name": "picket-remote-wsl",
 +	"displayName": "Picket Remote - WSL",
@@ -350,7 +350,8 @@ index 00000000..b46de115
 +	],
 +	"activationEvents": [
 +		"onStartupFinished",
-+		"onResolveRemoteAuthority:picket-wsl"
++		"onResolveRemoteAuthority:picket-wsl",
++		"onResolveRemoteAuthority:wsl"
 +	],
 +	"categories": [
 +		"Other"
@@ -828,10 +829,10 @@ index 00000000..2ac6fe0f
 +module.exports = { loadCatalog };
 diff --git a/extensions/picket-remote-wsl/src/commands.js b/extensions/picket-remote-wsl/src/commands.js
 new file mode 100644
-index 00000000..1dcd6563
+index 00000000..5b2879fe
 --- /dev/null
 +++ b/extensions/picket-remote-wsl/src/commands.js
-@@ -0,0 +1,548 @@
+@@ -0,0 +1,552 @@
 +'use strict';
 +
 +const { listDistros, distroHome, visibleDistros } = require('./distro.js');
@@ -1278,7 +1279,10 @@ index 00000000..1dcd6563
 +		}
 +		const result = await installShim({ runner, distro, home, version, clientPath });
 +		if (result.status === 'installed') {
-+			await host.showInformationMessage(`picket-code 命令行已就绪：${result.linkPath}`);
++			// The alias is a convenience, not part of the contract: say which of the
++			// two happened instead of implying both paths exist.
++			const extra = result.codeAlias === 'created' ? '（以及 code 别名）' : '（code 已被其他程序占用，未改动）';
++			await host.showInformationMessage(`picket-code 命令行已就绪：${result.linkPath}${extra}`);
 +		} else if (result.status === 'foreign-link') {
 +			await host.showErrorMessage(`${result.linkPath} 已存在且不是 Picket Code 的（${result.message}），未做改动。`);
 +		} else {
@@ -1358,9 +1362,10 @@ index 00000000..1dcd6563
 +
 +/**
 + * A resident command answers whether or not the surface is mounted, because it
-+ * is how a user finds out *why* nothing else works.
++ * is how a user finds out *why* nothing else works — including the two that get
++ * them out of the blocked state.
 + */
-+const RESIDENT_COMMANDS = ['picket.wsl.diagnose'];
++const RESIDENT_COMMANDS = ['picket.wsl.diagnose', 'picket.wsl.uninstallOfficial', 'picket.wsl.uninstallGuide'];
 +
 +/**
 + * `register` is `vscode.commands.registerCommand`, injected so this file never
@@ -2584,10 +2589,10 @@ index 00000000..cf40b908
 +module.exports = { detectIcode };
 diff --git a/extensions/picket-remote-wsl/src/launch.js b/extensions/picket-remote-wsl/src/launch.js
 new file mode 100644
-index 00000000..a2ffb26d
+index 00000000..e1bcf09f
 --- /dev/null
 +++ b/extensions/picket-remote-wsl/src/launch.js
-@@ -0,0 +1,417 @@
+@@ -0,0 +1,418 @@
 +'use strict';
 +
 +const { randomBytes } = require('node:crypto');
@@ -2627,6 +2632,7 @@ index 00000000..a2ffb26d
 +		node: `${payloadDir}/node`,
 +		remoteCli: `${payloadDir}/bin/remote-cli/picket-code`,
 +		cliLink: `${home}/.local/bin/picket-code`,
++		cliAlias: `${home}/.local/bin/code`,
 +		dataDir: `${root}/data`,
 +		extensionsDir: `${root}/extensions`,
 +		logDir: `${stateDir}/logs`,
@@ -4618,10 +4624,10 @@ index 00000000..c8ba4972
 +module.exports = { resolveSettings, describeOfficialSettings };
 diff --git a/extensions/picket-remote-wsl/src/shim.js b/extensions/picket-remote-wsl/src/shim.js
 new file mode 100644
-index 00000000..f13a2ded
+index 00000000..035c35d7
 --- /dev/null
 +++ b/extensions/picket-remote-wsl/src/shim.js
-@@ -0,0 +1,123 @@
+@@ -0,0 +1,149 @@
 +'use strict';
 +
 +// The in-distro `picket-code` shim: a small shell script that points the
@@ -4666,6 +4672,10 @@ index 00000000..f13a2ded
 +const VERIFY_SCRIPT = 'if [ ! -x "$2" ]; then printf not-executable; elif [ "$(readlink -f "$1")" != "$(readlink -f "$2")" ]; then printf wrong-target; else printf ok; fi';
 +const PROBE_SCRIPT = '"$1" --version >/dev/null 2>&1';
 +const REMOVE_SCRIPT = 'rm -rf "$1" "$2"';
++// The `code` alias is only ours when we created it, so removal has to check
++// where it points instead of listing the path.
++const INSPECT_LINK_SCRIPT = 'if [ -L "$1" ]; then readlink -f "$1"; elif [ -e "$1" ]; then printf file; else printf none; fi';
++const REMOVE_OWNED_LINK_SCRIPT = 'case "$(readlink -f "$2" 2>/dev/null)" in "$1"/*) rm -f "$2" ;; esac';
 +
 +/**
 + * Installs `<home>/.vscode-server/bin/picket-<version>/bin/picket-code` and links it
@@ -4674,11 +4684,15 @@ index 00000000..f13a2ded
 + * step probes that the Windows client is startable from inside the distro at
 + * all — with `[interop] enabled=false` in /etc/wsl.conf it never is, and no
 + * amount of reinstalling fixes that.
++ *
++ * `~/.local/bin/code` is the convenience alias people type out of habit. It
++ * belongs to whoever owns it today, so it is created only when nothing is
++ * there — a `code` installed by the official extension, or by hand, stays.
 + * @param {{
 + *   runner: { exec(args: string[], opts?: { input?: string | Buffer }): Promise<IWslResult> },
 + *   distro: string, home: string, version: string, clientPath: string
 + * }} options
-+ * @returns {Promise<{ status: 'installed' | 'foreign-link' | 'failed', scriptPath: string, linkPath: string, message?: string }>}
++ * @returns {Promise<{ status: 'installed' | 'foreign-link' | 'failed', scriptPath: string, linkPath: string, codeAlias: 'created' | 'kept', message?: string }>}
 + */
 +async function installShim({ runner, distro, home, version, clientPath }) {
 +	const paths = serverPaths(home, version);
@@ -4690,10 +4704,10 @@ index 00000000..f13a2ded
 +		['-d', distro, '-e', 'sh', '-c', INSPECT_SCRIPT, 'sh', `${paths.payloadDir}/bin`, `${home}/.local/bin`, linkPath]);
 +	const current = String(inspect.stdout).trim();
 +	if (current === 'file') {
-+		return { status: 'foreign-link', scriptPath, linkPath, message: `${linkPath} 已存在且不是符号链接` };
++		return { status: 'foreign-link', scriptPath, linkPath, codeAlias: 'kept', message: `${linkPath} 已存在且不是符号链接` };
 +	}
 +	if (current !== 'none' && !current.startsWith(`${shimRoot}/picket-`)) {
-+		return { status: 'foreign-link', scriptPath, linkPath, message: current || `${linkPath} 状态未知` };
++		return { status: 'foreign-link', scriptPath, linkPath, codeAlias: 'kept', message: current || `${linkPath} 状态未知` };
 +	}
 +
 +	const script = shimScript({
@@ -4703,11 +4717,11 @@ index 00000000..f13a2ded
 +	});
 +	const wrote = await runner.exec(['-d', distro, '-e', 'sh', '-c', WRITE_SCRIPT, 'sh', scriptPath], { input: script });
 +	if (wrote.code !== 0) {
-+		return { status: 'failed', scriptPath, linkPath, message: `无法写入 ${scriptPath}（exit ${wrote.code}）：${String(wrote.stderr ?? '').trim()}` };
++		return { status: 'failed', scriptPath, linkPath, codeAlias: 'kept', message: `无法写入 ${scriptPath}（exit ${wrote.code}）：${String(wrote.stderr ?? '').trim()}` };
 +	}
 +	const linked = await runner.exec(['-d', distro, '-e', 'sh', '-c', LINK_SCRIPT, 'sh', linkPath, scriptPath]);
 +	if (linked.code !== 0) {
-+		return { status: 'failed', scriptPath, linkPath, message: `无法创建 ${linkPath}（exit ${linked.code}）：${String(linked.stderr ?? '').trim()}` };
++		return { status: 'failed', scriptPath, linkPath, codeAlias: 'kept', message: `无法创建 ${linkPath}（exit ${linked.code}）：${String(linked.stderr ?? '').trim()}` };
 +	}
 +	// A write that "succeeded" is not an install: the script has to be executable
 +	// and the link has to point at it, or `picket-code .` silently runs something
@@ -4715,7 +4729,20 @@ index 00000000..f13a2ded
 +	const verified = await runner.exec(['-d', distro, '-e', 'sh', '-c', VERIFY_SCRIPT, 'sh', linkPath, scriptPath]);
 +	const verdict = String(verified.stdout).trim();
 +	if (verdict !== 'ok') {
-+		return { status: 'failed', scriptPath, linkPath, message: `${linkPath} 校验失败：${verdict || `exit ${verified.code}`}` };
++		return { status: 'failed', scriptPath, linkPath, codeAlias: 'kept', message: `${linkPath} 校验失败：${verdict || `exit ${verified.code}`}` };
++	}
++
++	// An unreadable `code` reads as `none` here, which is the wrong answer, so the
++	// failure of the inspect itself has to keep us from creating the alias.
++	const aliasInspect = await runner.exec(['-d', distro, '-e', 'sh', '-c', INSPECT_LINK_SCRIPT, 'sh', paths.cliAlias]);
++	const aliasState = aliasInspect.code === 0 ? String(aliasInspect.stdout).trim() : 'file';
++	/** @type {'created' | 'kept'} */
++	let codeAlias = 'kept';
++	if (aliasState === 'none' || aliasState.startsWith(`${shimRoot}/picket-`)) {
++		const aliasLinked = await runner.exec(['-d', distro, '-e', 'sh', '-c', LINK_SCRIPT, 'sh', paths.cliAlias, scriptPath]);
++		if (aliasLinked.code === 0) {
++			codeAlias = 'created';
++		}
 +	}
 +
 +	const probe = await runner.exec(['-d', distro, '-e', 'sh', '-c', PROBE_SCRIPT, 'sh', clientPath]);
@@ -4724,15 +4751,19 @@ index 00000000..f13a2ded
 +			status: 'failed',
 +			scriptPath,
 +			linkPath,
++			codeAlias,
 +			message: `无法从 ${distro} 内启动 Windows 程序（exit ${probe.code}）。检查 /etc/wsl.conf 是否设置了 [interop] enabled=false。`
 +		};
 +	}
-+	return { status: 'installed', scriptPath, linkPath };
++	return { status: 'installed', scriptPath, linkPath, codeAlias };
 +}
 +
 +/**
 + * Removes the link and every shim script we ever wrote (all tags). The shim
 + * root is ours alone — payloads, runtime and data live in sibling directories.
++ * The `code` alias is removed only when it still resolves into that root: after
++ * a takeover it may be someone else's link, and deleting those would break the
++ * user's other tooling.
 + * @param {{
 + *   runner: { exec(args: string[], opts?: { input?: string | Buffer }): Promise<IWslResult> },
 + *   distro: string, home: string
@@ -4740,8 +4771,9 @@ index 00000000..f13a2ded
 + * @returns {Promise<void>}
 + */
 +async function removeShim({ runner, distro, home }) {
-+	const root = serverPaths(home, '').root;
-+	await runner.exec(['-d', distro, '-e', 'sh', '-c', REMOVE_SCRIPT, 'sh', `${root}/bin`, `${home}/.local/bin/picket-code`]);
++	const paths = serverPaths(home, '');
++	await runner.exec(['-d', distro, '-e', 'sh', '-c', REMOVE_SCRIPT, 'sh', `${paths.root}/bin`, paths.cliLink]);
++	await runner.exec(['-d', distro, '-e', 'sh', '-c', REMOVE_OWNED_LINK_SCRIPT, 'sh', `${paths.root}/bin`, paths.cliAlias]);
 +}
 +
 +module.exports = { shQuote, shimScript, installShim, removeShim };
@@ -7247,10 +7279,10 @@ index 00000000..118dde5d
 +});
 diff --git a/extensions/picket-remote-wsl/test/manifest.test.js b/extensions/picket-remote-wsl/test/manifest.test.js
 new file mode 100644
-index 00000000..5a6b3dd8
+index 00000000..c63a470b
 --- /dev/null
 +++ b/extensions/picket-remote-wsl/test/manifest.test.js
-@@ -0,0 +1,118 @@
+@@ -0,0 +1,130 @@
 +// RED first: the manifest and the code must agree about which commands exist.
 +const test = require('node:test');
 +const assert = require('node:assert');
@@ -7328,6 +7360,15 @@ index 00000000..5a6b3dd8
 +	assert.ok(authorities.includes('wsl+*'), 'a workspace carried over from the official extension must look like ours');
 +});
 +
++test('a window opened on either authority activates the extension', () => {
++	// Both prefixes are registered, so both have to be activation events: without
++	// the legacy one the resolver is asked for `wsl` before the extension has
++	// registered it, and the window fails with "No remote extension installed".
++	for (const prefix of ['picket-wsl', 'wsl']) {
++		assert.ok(manifest.activationEvents.includes(`onResolveRemoteAuthority:${prefix}`), `missing onResolveRemoteAuthority:${prefix}`);
++	}
++});
++
 +test('the surface is mounted only while the gate is open', () => {
 +	// The branch is the guarantee: resolver, tree commands and the nudge live in
 +	// `mountWsl`, and nothing but this call reaches it.
@@ -7367,6 +7408,9 @@ index 00000000..5a6b3dd8
 +		const entry = manifest.contributes.menus.commandPalette.find(e => e.command === id);
 +		assert.ok(entry, `${id} is contributed but not in the palette`);
 +		assert.doesNotMatch(entry.when, /picketWsl\.blocked/, `${id} must not be gated`);
++		// A menu entry is only half of it: the command also has to be registered
++		// while the surface is unmounted, which is what RESIDENT_COMMANDS decides.
++		assert.ok(RESIDENT_COMMANDS.includes(id), `${id} must be registered before the surface is mounted`);
 +	}
 +});
 diff --git a/extensions/picket-remote-wsl/test/marketplace.test.js b/extensions/picket-remote-wsl/test/marketplace.test.js
@@ -8879,10 +8923,10 @@ index 00000000..b38aabc8
 +});
 diff --git a/extensions/picket-remote-wsl/test/shim.test.js b/extensions/picket-remote-wsl/test/shim.test.js
 new file mode 100644
-index 00000000..b73665c7
+index 00000000..88c99249
 --- /dev/null
 +++ b/extensions/picket-remote-wsl/test/shim.test.js
-@@ -0,0 +1,141 @@
+@@ -0,0 +1,164 @@
 +'use strict';
 +
 +// RED first: this file must fail until src/shim.js exists.
@@ -8929,15 +8973,16 @@ index 00000000..b73665c7
 +});
 +
 +test('installShim writes the script, links it and verifies interop', async () => {
-+	const r = recordingRunner([{ code: 0, stdout: 'none\n' }, { code: 0 }, { code: 0 }, { code: 0, stdout: 'ok\n' }]);
++	const r = recordingRunner([{ code: 0, stdout: 'none\n' }, { code: 0 }, { code: 0 }, { code: 0, stdout: 'ok\n' }, { code: 0, stdout: 'none\n' }, { code: 0 }, { code: 0 }]);
 +	const result = await installShim({ runner: r, ...BASE });
 +	assert.strictEqual(result.status, 'installed');
 +	assert.strictEqual(result.scriptPath, `${HOME}/.vscode-server/bin/picket-${VERSION}/bin/picket-code`);
 +	assert.strictEqual(result.linkPath, `${HOME}/.local/bin/picket-code`);
-+	assert.strictEqual(r.calls.length, 5);
++	assert.strictEqual(result.codeAlias, 'created');
++	assert.strictEqual(r.calls.length, 7);
 +
-+	const [inspect, write, link, verify, probe] = r.calls;
-+	for (const call of [inspect, write, link, verify, probe]) {
++	const [inspect, write, link, verify, aliasInspect, aliasLink, probe] = r.calls;
++	for (const call of [inspect, write, link, verify, aliasInspect, aliasLink, probe]) {
 +		assert.deepStrictEqual(call.args.slice(0, 4), ['-d', 'Ubuntu', '-e', 'sh']);
 +	}
 +	// inspect: one round trip that creates the directories and reads the link
@@ -8954,9 +8999,25 @@ index 00000000..b73665c7
 +	// verify: the link must resolve to the script and the script must be executable
 +	assert.ok(verify.args.includes(result.linkPath) && verify.args.includes(result.scriptPath), 'verify reads both paths');
 +	assert.match(verify.args[5], /-x/);
++	// alias: only read, then linked to the same script when the slot is free
++	assert.ok(aliasInspect.args.includes(`${HOME}/.local/bin/code`));
++	assert.ok(aliasLink.args.includes(`${HOME}/.local/bin/code`) && aliasLink.args.includes(result.scriptPath));
 +	// probe: the Windows client must be startable from inside the distro
 +	assert.ok(probe.args.includes('/mnt/c/Programs/Picket Code.exe'));
 +	assert.match(probe.args[5], /--version/);
++});
++
++test('the code alias is only created when nothing occupies it', async () => {
++	const taken = recordingRunner([{ code: 0, stdout: 'none\n' }, { code: 0 }, { code: 0 }, { code: 0, stdout: 'ok\n' }, { code: 0, stdout: '/usr/bin/code\n' }, { code: 0 }]);
++	const keptResult = await installShim({ runner: taken, ...BASE });
++	assert.strictEqual(keptResult.status, 'installed');
++	assert.strictEqual(keptResult.codeAlias, 'kept');
++	assert.strictEqual(taken.calls.length, 6, 'no link may be written over an existing code');
++	assert.ok(!taken.calls[5].args.includes(`${HOME}/.local/bin/code`));
++
++	const own = recordingRunner([{ code: 0, stdout: 'none\n' }, { code: 0 }, { code: 0 }, { code: 0, stdout: 'ok\n' }, { code: 0, stdout: `${HOME}/.vscode-server/bin/picket-0.9.0/bin/picket-code\n` }, { code: 0 }, { code: 0 }]);
++	const upgraded = await installShim({ runner: own, ...BASE });
++	assert.strictEqual(upgraded.codeAlias, 'created', 'our own alias from an older payload is repointed');
 +});
 +
 +test('a symlink that points somewhere else is reported and left alone', async () => {
@@ -8975,10 +9036,10 @@ index 00000000..b73665c7
 +});
 +
 +test('a link into our own shim root is upgraded in place', async () => {
-+	const r = recordingRunner([{ code: 0, stdout: `${HOME}/.vscode-server/bin/picket-0.9.0/bin/picket-code\n` }, { code: 0 }, { code: 0 }, { code: 0, stdout: 'ok\n' }]);
++	const r = recordingRunner([{ code: 0, stdout: `${HOME}/.vscode-server/bin/picket-0.9.0/bin/picket-code\n` }, { code: 0 }, { code: 0 }, { code: 0, stdout: 'ok\n' }, { code: 0, stdout: 'none\n' }, { code: 0 }, { code: 0 }]);
 +	const result = await installShim({ runner: r, ...BASE });
 +	assert.strictEqual(result.status, 'installed');
-+	assert.strictEqual(r.calls.length, 5);
++	assert.strictEqual(r.calls.length, 7);
 +});
 +
 +test('a 126 from the interop probe reports failed with the wsl.conf hint', async () => {
@@ -8987,6 +9048,8 @@ index 00000000..b73665c7
 +		{ code: 0 },
 +		{ code: 0 },
 +		{ code: 0, stdout: 'ok\n' },
++		{ code: 0, stdout: 'none\n' },
++		{ code: 0 },
 +		{ code: 126 }
 +	]);
 +	const result = await installShim({ runner: r, ...BASE });
@@ -9017,12 +9080,16 @@ index 00000000..b73665c7
 +	assert.match(result.message ?? '', /wrong-target/);
 +});
 +
-+test('removeShim removes the shim root and the link', async () => {
++test('removeShim removes the shim root and the link, and only our own code alias', async () => {
 +	const r = recordingRunner([]);
 +	await removeShim({ runner: r, distro: 'Ubuntu', home: HOME });
-+	assert.strictEqual(r.calls.length, 1);
++	assert.strictEqual(r.calls.length, 2);
 +	assert.ok(r.calls[0].args.includes(`${HOME}/.vscode-server/bin`));
 +	assert.ok(r.calls[0].args.includes(`${HOME}/.local/bin/picket-code`));
++	// The alias has to be checked, not listed: a `code` that is not ours stays.
++	assert.ok(r.calls[1].args.includes(`${HOME}/.vscode-server/bin`));
++	assert.ok(r.calls[1].args.includes(`${HOME}/.local/bin/code`));
++	assert.match(r.calls[1].args[5], /readlink/);
 +});
 diff --git a/extensions/picket-remote-wsl/test/tree.test.js b/extensions/picket-remote-wsl/test/tree.test.js
 new file mode 100644
@@ -9689,6 +9756,135 @@ index 02bee7c0..fb0c381a 100644
  	if (!opts.web && !opts.remote) { setupBrowserViewTests(logger); }
  	// Native policy fixtures modify OS state outside the test profile; opt in only on disposable runners so you don't break your own machine.
  	if (!opts.web && !opts.remote && process.env.VSCODE_SMOKE_TEST_POLICY === '1') { setupPolicyTests(logger); }
+diff --git a/test/wsl-harness/conflict/extension.js b/test/wsl-harness/conflict/extension.js
+new file mode 100644
+index 00000000..794a14a6
+--- /dev/null
++++ b/test/wsl-harness/conflict/extension.js
+@@ -0,0 +1,91 @@
++'use strict';
++
++// Acceptance harness for the conflict stage (plan Task 10). Loads in the *local*
++// window — the one WSL surface is mounted in — with a fake extension installed
++// under the official id, and asserts that the gate closed the surface:
++//
++//   active          — the Picket extension is running (the gate is a live state,
++//                     not "the extension refused to start")
++//   commands        — every business command is gone, the two uninstall paths and
++//                     the diagnostics remain
++//
++// Results go to `$PICKET_WSL_CONFLICT_RESULTS` (acceptance.sh polls for the file).
++
++const { mkdir, rename, writeFile } = require('node:fs/promises');
++const { dirname } = require('node:path');
++const vscode = require('vscode');
++
++const RESULTS = process.env.PICKET_WSL_CONFLICT_RESULTS;
++
++// Activation order between extensions is not defined, and `onStartupFinished`
++// can fire before the manifest scan settles; a short wait beats a flaky assert.
++const SETTLE_MS = 4000;
++
++/** Commands that must be gone while the gate is closed. */
++const GATED = [
++	'picket.wsl.openFolder',
++	'picket.wsl.reopenInWsl',
++	'picket.wsl.stopServer',
++	'picket.wsl.components',
++	'picket.wsl.refreshTargets'
++];
++
++/** Commands that must survive the gate: diagnostics and the way out. */
++const RESIDENT = [
++	'picket.wsl.diagnose',
++	'picket.wsl.uninstallOfficial',
++	'picket.wsl.uninstallGuide'
++];
++
++async function main() {
++	if (!RESULTS) {
++		return;
++	}
++	await new Promise(resolve => setTimeout(resolve, SETTLE_MS));
++
++	const commands = await vscode.commands.getCommands(true);
++	const state = {
++		active: Boolean(vscode.extensions.getExtension('noware.picket-remote-wsl')?.isActive),
++		officialInstalled: Boolean(vscode.extensions.getExtension('ms-vscode-remote.remote-wsl')),
++		gated: Object.fromEntries(GATED.map(id => [id, commands.includes(id)])),
++		resident: Object.fromEntries(RESIDENT.map(id => [id, commands.includes(id)])),
++		// Which extensions the host actually knows about. A failed lookup alone
++		// cannot tell "never scanned" from "scanned and rejected", and the answer
++		// decides whether the fix is in the harness or in the product.
++		installed: vscode.extensions.all.map(extension => extension.id).sort()
++	};
++
++	/** @type {string[]} */
++	const failures = [];
++	if (!state.active) {
++		failures.push('the Picket extension never activated');
++	}
++	if (!state.officialInstalled) {
++		failures.push('the stand-in official extension is not installed');
++	}
++	for (const [id, present] of Object.entries(state.gated)) {
++		if (present) {
++			failures.push(`${id} is registered while the official extension is installed`);
++		}
++	}
++	for (const [id, present] of Object.entries(state.resident)) {
++		if (!present) {
++			failures.push(`${id} is missing while the official extension is installed`);
++		}
++	}
++
++	for (const line of failures) {
++		console.log(`WSL-CONFLICT fail ${line}`);
++	}
++	if (failures.length === 0) {
++		console.log('WSL-CONFLICT ok blocked surface');
++	}
++
++	await mkdir(dirname(RESULTS), { recursive: true });
++	const pending = `${RESULTS}.${process.pid}.tmp`;
++	await writeFile(pending, JSON.stringify({ failures, state }, null, 2));
++	await rename(pending, RESULTS);
++}
++
++exports.activate = main;
++exports.deactivate = undefined;
+diff --git a/test/wsl-harness/conflict/package.json b/test/wsl-harness/conflict/package.json
+new file mode 100644
+index 00000000..f4a70fdc
+--- /dev/null
++++ b/test/wsl-harness/conflict/package.json
+@@ -0,0 +1,26 @@
++{
++	"name": "picket-wsl-conflict-harness",
++	"displayName": "Picket WSL Conflict Harness",
++	"description": "Asserts from inside the local window what the remote-authority product cannot: which commands exist while the official extension is installed. Never shipped.",
++	"version": "0.0.0",
++	"publisher": "picket",
++	"private": true,
++	"engines": {
++		"vscode": "^1.143.0"
++	},
++	"categories": [
++		"Other"
++	],
++	"main": "./extension.js",
++	"extensionKind": [
++		"ui"
++	],
++	"activationEvents": [
++		"onStartupFinished"
++	],
++	"capabilities": {
++		"untrustedWorkspaces": {
++			"supported": true
++		}
++	}
++}
 diff --git a/test/wsl-harness/fake-wsl.mjs b/test/wsl-harness/fake-wsl.mjs
 new file mode 100755
 index 00000000..1976546b
@@ -9798,10 +9994,10 @@ index 00000000..1976546b
 +}
 diff --git a/test/wsl-harness/remote/extension.js b/test/wsl-harness/remote/extension.js
 new file mode 100644
-index 00000000..fcd9ed20
+index 00000000..ec74b7ec
 --- /dev/null
 +++ b/test/wsl-harness/remote/extension.js
-@@ -0,0 +1,157 @@
+@@ -0,0 +1,194 @@
 +'use strict';
 +
 +// Acceptance harness for the WSL remote window (plan Task 14). Loads in the
@@ -9924,6 +10120,35 @@ index 00000000..fcd9ed20
 +	return { ok: true, detail: `PICKET_ICODE_BIN=${exported ?? '<unset>'} (bogus path not exported)` };
 +}
 +
++// Takeover: `~/.vscode-server/server-env-setup` is sourced by the launch, so a
++// hook the official server left there must still reach the server process.
++async function checkHook() {
++	if (process.env.WSL_HARNESS_EXPECT_HOOK !== '1') {
++		return undefined;
++	}
++	const hook = process.env.PICKET_OFFICIAL_HOOK;
++	if (hook !== 'kept') {
++		return { ok: false, detail: `server-env-setup hook not applied (PICKET_OFFICIAL_HOOK=${hook ?? '<unset>'})` };
++	}
++	return { ok: true };
++}
++
++// Legacy URI: the window was opened through `wsl+<distro>`, the authority the
++// official extension wrote into workspaces and history. Connecting at all is the
++// contract; the authority it ends up with must be one this product owns.
++async function checkLegacy() {
++	if (process.env.WSL_HARNESS_EXPECT_LEGACY !== '1') {
++		return undefined;
++	}
++	// `env.remoteName` is stable API (the authority *without* its distro suffix);
++	// `env.remoteAuthority` is not, and touching it here makes the whole check
++	// fail with a proposal error instead of an assertion. The canonical authority
++	// rewrites `wsl` to `picket-wsl`, so both names mean the legacy URI resolved.
++	const name = vscode.env.remoteName ?? '';
++	const ok = name === 'wsl' || name === 'picket-wsl';
++	return { ok, detail: `remoteName=${JSON.stringify(name)}` };
++}
++
 +async function main() {
 +	const results = {};
 +	try {
@@ -9940,6 +10165,14 @@ index 00000000..fcd9ed20
 +		const b6 = await checkB6();
 +		if (b6) {
 +			results.icode = b6;
++		}
++		const hook = await checkHook();
++		if (hook) {
++			results.hook = hook;
++		}
++		const legacy = await checkLegacy();
++		if (legacy) {
++			results.legacy = legacy;
 +		}
 +	} catch (error) {
 +		results.harness = { ok: false, detail: error.message };
