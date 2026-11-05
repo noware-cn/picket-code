@@ -9,10 +9,10 @@ index 00000000..96fab092
 +tsconfig.json
 diff --git a/extensions/picket-remote-wsl/extension.js b/extensions/picket-remote-wsl/extension.js
 new file mode 100644
-index 00000000..93d7fecb
+index 00000000..9116d370
 --- /dev/null
 +++ b/extensions/picket-remote-wsl/extension.js
-@@ -0,0 +1,211 @@
+@@ -0,0 +1,226 @@
 +'use strict';
 +
 +const { join } = require('node:path');
@@ -23,7 +23,7 @@ index 00000000..93d7fecb
 +const { createWslRunner, listDistros, visibleDistros } = require('./src/distro.js');
 +const { createComponentManager } = require('./src/components.js');
 +const { createResolver } = require('./src/resolver.js');
-+const { AUTHORITY_PREFIX, parseAuthority } = require('./src/remoteUri.js');
++const { AUTHORITY_PREFIX, LEGACY_AUTHORITY_PREFIX, parseAuthority, canonicalAuthority } = require('./src/remoteUri.js');
 +const { buildDistroNodes } = require('./src/tree.js');
 +const { registerCommands, downloadFromSettings } = require('./src/commands.js');
 +const { resolveSettings } = require('./src/settings.js');
@@ -116,12 +116,27 @@ index 00000000..93d7fecb
 +		components: createComponents
 +	});
 +
-+	context.subscriptions.push(vscode.workspace.registerRemoteAuthorityResolver(AUTHORITY_PREFIX, {
-+		resolve: async (authority) => {
++	// One resolver object for both authorities: `picket-wsl+Ubuntu` is what this
++	// extension writes, `wsl+Ubuntu` is what the official extension left behind
++	// in saved workspaces and history. Canonicalising means each folder opens
++	// under one identity instead of forking its state on the first reload.
++	const authorityResolver = {
++		resolve: async (/** @type {string} */ authority) => {
 +			const result = await resolver.resolve(authority);
 +			return new vscode.ResolvedAuthority(result.host, result.port, result.connectionToken);
++		},
++		getCanonicalURI: (/** @type {vscode.Uri} */ uri) => {
++			const parsed = parseAuthority(uri.authority);
++			if (!parsed) {
++				return undefined;
++			}
++			const authority = canonicalAuthority(AUTHORITY_PREFIX, parsed.distro);
++			return authority === uri.authority ? undefined : uri.with({ authority });
 +		}
-+	}));
++	};
++	for (const prefix of [AUTHORITY_PREFIX, LEGACY_AUTHORITY_PREFIX]) {
++		context.subscriptions.push(vscode.workspace.registerRemoteAuthorityResolver(prefix, authorityResolver));
++	}
 +	context.subscriptions.push({ dispose: () => resolver.dispose() });
 +
 +	const changed = new vscode.EventEmitter();
@@ -137,7 +152,7 @@ index 00000000..93d7fecb
 +			if (element) {
 +				return [];
 +			}
-+			const activeDistro = parseAuthority(vscode.env.remoteAuthority ?? '');
++			const activeDistro = parseAuthority(vscode.env.remoteAuthority ?? '')?.distro ?? '';
 +			try {
 +				return buildDistroNodes(visibleDistros(await listDistros(runner)), { activeDistro });
 +			} catch (error) {
@@ -226,10 +241,10 @@ index 00000000..93d7fecb
 +module.exports = { activate, deactivate };
 diff --git a/extensions/picket-remote-wsl/package.json b/extensions/picket-remote-wsl/package.json
 new file mode 100644
-index 00000000..212049af
+index 00000000..78e0a1b4
 --- /dev/null
 +++ b/extensions/picket-remote-wsl/package.json
-@@ -0,0 +1,329 @@
+@@ -0,0 +1,339 @@
 +{
 +	"name": "picket-remote-wsl",
 +	"displayName": "Picket Remote - WSL",
@@ -482,6 +497,16 @@ index 00000000..212049af
 +					"tildify": true,
 +					"workspaceSuffix": "WSL"
 +				}
++			},
++			{
++				"scheme": "vscode-remote",
++				"authority": "wsl+*",
++				"formatting": {
++					"label": "${path}",
++					"separator": "/",
++					"tildify": true,
++					"workspaceSuffix": "WSL"
++				}
 +			}
 +		],
 +		"configuration": {
@@ -695,7 +720,7 @@ index 00000000..2ac6fe0f
 +module.exports = { loadCatalog };
 diff --git a/extensions/picket-remote-wsl/src/commands.js b/extensions/picket-remote-wsl/src/commands.js
 new file mode 100644
-index 00000000..e462e441
+index 00000000..73439111
 --- /dev/null
 +++ b/extensions/picket-remote-wsl/src/commands.js
 @@ -0,0 +1,486 @@
@@ -958,7 +983,7 @@ index 00000000..e462e441
 +
 +	async function reopenInWindows() {
 +		const folder = (options.currentFolders?.() ?? [])[0];
-+		const distro = parseAuthority(options.currentAuthority?.() ?? '');
++		const distro = parseAuthority(options.currentAuthority?.() ?? '')?.distro ?? '';
 +		if (!folder || !distro) {
 +			await host.showErrorMessage('当前窗口不是 Picket WSL 窗口。');
 +			return;
@@ -1060,7 +1085,7 @@ index 00000000..e462e441
 +
 +	/** The distro a command acts on: the current window's, else a picker. */
 +	async function targetDistro(title) {
-+		return parseAuthority(options.currentAuthority?.() ?? '') || await pickDistro(title);
++		return parseAuthority(options.currentAuthority?.() ?? '')?.distro || await pickDistro(title);
 +	}
 +
 +	/**
@@ -3593,27 +3618,54 @@ index 00000000..1c98de4a
 +module.exports = { readProduct };
 diff --git a/extensions/picket-remote-wsl/src/remoteUri.js b/extensions/picket-remote-wsl/src/remoteUri.js
 new file mode 100644
-index 00000000..f736d42b
+index 00000000..286ab287
 --- /dev/null
 +++ b/extensions/picket-remote-wsl/src/remoteUri.js
-@@ -0,0 +1,81 @@
+@@ -0,0 +1,108 @@
 +'use strict';
 +
 +const { decodeWslOutput } = require('./distro.js');
 +
 +const AUTHORITY_PREFIX = 'picket-wsl';
++/**
++ * The prefix the official `ms-vscode-remote.remote-wsl` wrote into every saved
++ * workspace and history entry. Claiming it is what lets a user who uninstalled
++ * that extension open the folders they already had.
++ */
++const LEGACY_AUTHORITY_PREFIX = 'wsl';
++
++/** @typedef {{ prefix: string, distro: string }} IParsedAuthority */
 +
 +/**
-+ * `picket-wsl+Ubuntu 22.04 LTS` -> `Ubuntu 22.04 LTS`. An empty distro means
-+ * "the default distro"; any other authority is not ours.
++ * `picket-wsl+Ubuntu 22.04 LTS` -> `{ prefix: 'picket-wsl', distro: 'Ubuntu 22.04 LTS' }`.
++ * An empty distro means "the default distro", and the official extension spells
++ * that `default`; both collapse to `''` so no caller has to know. Any other
++ * authority is not ours and returns `undefined`.
 + * @param {string} authority
-+ * @returns {string}
++ * @returns {IParsedAuthority | undefined}
 + */
 +function parseAuthority(authority) {
-+	if (!authority.startsWith(`${AUTHORITY_PREFIX}+`)) {
-+		return '';
++	for (const prefix of [AUTHORITY_PREFIX, LEGACY_AUTHORITY_PREFIX]) {
++		if (authority === prefix) {
++			return { prefix, distro: '' };
++		}
++		if (authority.startsWith(`${prefix}+`)) {
++			const distro = authority.slice(prefix.length + 1);
++			return { prefix, distro: distro === 'default' ? '' : distro };
++		}
 +	}
-+	return authority.slice(AUTHORITY_PREFIX.length + 1);
++	return undefined;
++}
++
++/**
++ * `default` rather than an empty tail: `wsl+default` is what the official
++ * extension writes, so a canonical authority never opens a second identity for
++ * the same folder.
++ * @param {string} prefix
++ * @param {string} distro
++ */
++function canonicalAuthority(prefix, distro) {
++	return `${prefix}+${distro || 'default'}`;
 +}
 +
 +/**
@@ -3677,13 +3729,13 @@ index 00000000..f736d42b
 +	return wslpath('-w', runner, distro, posixPath);
 +}
 +
-+module.exports = { AUTHORITY_PREFIX, parseAuthority, remoteUriFor, parseUncPath, toPosixPath, toWindowsPath };
++module.exports = { AUTHORITY_PREFIX, LEGACY_AUTHORITY_PREFIX, parseAuthority, canonicalAuthority, remoteUriFor, parseUncPath, toPosixPath, toWindowsPath };
 diff --git a/extensions/picket-remote-wsl/src/resolver.js b/extensions/picket-remote-wsl/src/resolver.js
 new file mode 100644
-index 00000000..05487640
+index 00000000..97a53f86
 --- /dev/null
 +++ b/extensions/picket-remote-wsl/src/resolver.js
-@@ -0,0 +1,399 @@
+@@ -0,0 +1,443 @@
 +'use strict';
 +
 +const { listDistros, defaultDistro, visibleDistros, distroHome } = require('./distro.js');
@@ -3699,7 +3751,7 @@ index 00000000..05487640
 +/** @typedef {{ host: string, port: number, connectionToken: string }} IResolverResult */
 +/** @typedef {{ info(...parts: unknown[]): void, error(...parts: unknown[]): void }} ILog */
 +/** @typedef {{ ensure(id: string): Promise<{ payloadDir: string }> }} IComponentManager */
-+/** @typedef {{ startTimeoutSeconds?: number, probeRetrySeconds?: number, probeRetryTimeoutMs?: number, loginShell?: boolean, icodePath?: string, tunnelMode?: string }} ISettings */
++/** @typedef {{ defaultDistro?: string, startTimeoutSeconds?: number, probeRetrySeconds?: number, probeRetryTimeoutMs?: number, loginShell?: boolean, icodePath?: string, tunnelMode?: string }} ISettings */
 +
 +/**
 + * A remote authority names a distro and nothing else; everything a connection
@@ -3767,21 +3819,63 @@ index 00000000..05487640
 +	}
 +
 +	/**
-+	 * @param {string} requested an authority's distro, possibly '' or differently cased
-+	 * @returns {Promise<string>} the name wsl.exe answers to
++	 * @param {import('./distro.js').IDistro[]} list
++	 * @param {string} requested
++	 * @returns {string} the name wsl.exe answers to
 +	 */
-+	async function resolveDistroName(requested) {
-+		const list = await listDistros(runner);
-+		if (!requested) {
-+			return defaultDistro(list);
-+		}
-+		const wanted = requested.trim().toLowerCase();
++	function pickDistro(list, requested) {
++		const wanted = String(requested).trim().toLowerCase();
 +		const match = list.find(d => d.name.toLowerCase() === wanted);
 +		if (match) {
 +			return match.name;
 +		}
 +		const known = visibleDistros(list).map(d => d.name).join(', ') || 'none';
 +		throw new Error(`Distro "${requested}" not found. Installed: ${known}`);
++	}
++
++	/**
++	 * @param {string} requested a distro name, possibly '' for the default
++	 * @returns {Promise<string>} the name wsl.exe answers to
++	 */
++	async function matchDistro(requested) {
++		const list = await listDistros(runner);
++		return requested ? pickDistro(list, requested) : defaultDistro(list);
++	}
++
++	/**
++	 * `wsl+Ubuntu` is what the official extension wrote and `picket-wsl+Ubuntu`
++	 * is ours, so both have to mean the same window. `Ubuntu@<host>` is a window
++	 * the official extension opened from inside another remote; there is no
++	 * equivalent here, and pretending otherwise would resolve to a server the
++	 * inner window already owns.
++	 * @param {string} authority
++	 * @returns {Promise<string>} the name wsl.exe answers to
++	 */
++	async function resolveDistro(authority) {
++		const parsed = parseAuthority(authority);
++		if (!parsed) {
++			throw new Error(`"${authority}" is not a WSL remote authority`);
++		}
++		if (parsed.distro.includes('@')) {
++			throw new Error(`Nested authorities are not supported: "${parsed.distro}". Open the folder from a local window instead.`);
++		}
++		if (parsed.distro) {
++			return matchDistro(parsed.distro);
++		}
++		// An authority with no distro asks for "the default one". The Picket
++		// setting is the user's own answer to that question, so it wins; a stale
++		// entry falls back to WSL's default rather than failing every window.
++		const configured = String(settings.defaultDistro ?? '').trim();
++		const list = await listDistros(runner);
++		if (!configured) {
++			return defaultDistro(list);
++		}
++		try {
++			return pickDistro(list, configured);
++		} catch (error) {
++			log.info(`picket.wsl.defaultDistro "${configured}" is not installed; using the WSL default distro`);
++			return defaultDistro(list);
++		}
 +	}
 +
 +	/** @param {string} distro @param {number} port */
@@ -4024,9 +4118,11 @@ index 00000000..05487640
 +	}
 +
 +	return {
++		/** @param {string} authority @returns {Promise<string>} */
++		resolveDistro,
 +		/** @param {string} authority @returns {Promise<IResolverResult>} */
 +		async resolve(authority) {
-+			const distro = await resolveDistroName(parseAuthority(authority));
++			const distro = await resolveDistro(authority);
 +			const pending = inFlight.get(distro);
 +			if (pending) {
 +				return pending;
@@ -4037,7 +4133,7 @@ index 00000000..05487640
 +		},
 +		/** @param {string} requested @returns {Promise<void>} */
 +		async stop(requested) {
-+			const distro = await resolveDistroName(requested ?? '');
++			const distro = await matchDistro(requested ?? '');
 +			const home = await distroHome(runner, distro);
 +			const runtimeFile = runtimeFileFor(home, distro);
 +
@@ -6668,10 +6764,10 @@ index 00000000..118dde5d
 +});
 diff --git a/extensions/picket-remote-wsl/test/manifest.test.js b/extensions/picket-remote-wsl/test/manifest.test.js
 new file mode 100644
-index 00000000..556fdc3c
+index 00000000..21f7dc0a
 --- /dev/null
 +++ b/extensions/picket-remote-wsl/test/manifest.test.js
-@@ -0,0 +1,68 @@
+@@ -0,0 +1,74 @@
 +// RED first: the manifest and the code must agree about which commands exist.
 +const test = require('node:test');
 +const assert = require('node:assert');
@@ -6724,7 +6820,7 @@ index 00000000..556fdc3c
 +	// log.js is the one vscode-bound helper: it owns an OutputChannel.
 +	const sources = ['catalog.js', 'distro.js', 'components.js', 'payload.js', 'download.js', 'launch.js', 'probe.js',
 +		'remoteUri.js', 'resolver.js', 'icode.js', 'preflight.js', 'tree.js', 'manage.js', 'diagnose.js',
-+		'nudge.js', 'commands.js', 'marketplace.js', 'offline.js', 'shim.js'];
++		'nudge.js', 'commands.js', 'marketplace.js', 'offline.js', 'shim.js', 'settings.js', 'version.js', 'product.js'];
 +	for (const name of sources) {
 +		const text = readFileSync(join(root, 'src', name), 'utf8');
 +		assert.doesNotMatch(text, /require\(['"]vscode['"]\)/, `${name} must stay testable without an extension host`);
@@ -6739,6 +6835,12 @@ index 00000000..556fdc3c
 +	const menu = manifest.contributes.menus['view/item/context'].map(entry => entry.command);
 +	assert.ok(menu.includes('picket.wsl.setDefaultDistro'));
 +	assert.ok(menu.includes('picket.wsl.deleteDistro'));
++});
++
++test('folders opened under either authority render with the WSL label', () => {
++	const authorities = manifest.contributes.resourceLabelFormatters.map((/** @type {any} */ entry) => entry.authority);
++	assert.ok(authorities.includes('picket-wsl+*'));
++	assert.ok(authorities.includes('wsl+*'), 'a workspace carried over from the official extension must look like ours');
 +});
 diff --git a/extensions/picket-remote-wsl/test/marketplace.test.js b/extensions/picket-remote-wsl/test/marketplace.test.js
 new file mode 100644
@@ -7302,21 +7404,36 @@ index 00000000..56079fa9
 +});
 diff --git a/extensions/picket-remote-wsl/test/remoteUri.test.js b/extensions/picket-remote-wsl/test/remoteUri.test.js
 new file mode 100644
-index 00000000..69414920
+index 00000000..1d83cdef
 --- /dev/null
 +++ b/extensions/picket-remote-wsl/test/remoteUri.test.js
-@@ -0,0 +1,56 @@
+@@ -0,0 +1,71 @@
 +// RED first: this file must fail until src/remoteUri.js exists.
 +const test = require('node:test');
 +const assert = require('node:assert');
-+const { parseAuthority, remoteUriFor, parseUncPath, toPosixPath, toWindowsPath } = require('../src/remoteUri.js');
++const { parseAuthority, canonicalAuthority, remoteUriFor, parseUncPath, toPosixPath, toWindowsPath } = require('../src/remoteUri.js');
 +
-+test('parseAuthority strips the prefix and tolerates spaces in a distro name', () => {
-+	assert.strictEqual(parseAuthority('picket-wsl+'), '');
-+	assert.strictEqual(parseAuthority('picket-wsl+Ubuntu'), 'Ubuntu');
-+	assert.strictEqual(parseAuthority('picket-wsl+Ubuntu 22.04 LTS'), 'Ubuntu 22.04 LTS');
-+	assert.strictEqual(parseAuthority('wsl+Ubuntu'), '');
-+	assert.strictEqual(parseAuthority(''), '');
++test('parseAuthority names the prefix and the distro, and treats default as empty', () => {
++	assert.deepStrictEqual(parseAuthority('picket-wsl+Ubuntu 22.04 LTS'), { prefix: 'picket-wsl', distro: 'Ubuntu 22.04 LTS' });
++	assert.deepStrictEqual(parseAuthority('picket-wsl+'), { prefix: 'picket-wsl', distro: '' });
++	assert.deepStrictEqual(parseAuthority('wsl+Ubuntu'), { prefix: 'wsl', distro: 'Ubuntu' });
++});
++
++test('the official spellings of "the default distro" all mean the same window', () => {
++	assert.deepStrictEqual(parseAuthority('wsl+default'), { prefix: 'wsl', distro: '' });
++	assert.deepStrictEqual(parseAuthority('wsl'), { prefix: 'wsl', distro: '' });
++	assert.deepStrictEqual(parseAuthority('picket-wsl+default'), { prefix: 'picket-wsl', distro: '' });
++});
++
++test('another extension authority is not ours', () => {
++	assert.strictEqual(parseAuthority('ssh-remote+host'), undefined);
++	assert.strictEqual(parseAuthority('wslx+Ubuntu'), undefined);
++	assert.strictEqual(parseAuthority(''), undefined);
++});
++
++test('canonicalAuthority spells the default distro the way the official extension does', () => {
++	assert.strictEqual(canonicalAuthority('wsl', 'Ubuntu'), 'wsl+Ubuntu');
++	assert.strictEqual(canonicalAuthority('picket-wsl', ''), 'picket-wsl+default');
 +});
 +
 +test('remoteUriFor builds a vscode-remote uri for the distro', () => {
@@ -7364,10 +7481,10 @@ index 00000000..69414920
 +});
 diff --git a/extensions/picket-remote-wsl/test/resolver.test.js b/extensions/picket-remote-wsl/test/resolver.test.js
 new file mode 100644
-index 00000000..84ca7e37
+index 00000000..eb343ded
 --- /dev/null
 +++ b/extensions/picket-remote-wsl/test/resolver.test.js
-@@ -0,0 +1,664 @@
+@@ -0,0 +1,723 @@
 +// RED first: this file must fail until src/resolver.js exists.
 +const test = require('node:test');
 +const assert = require('node:assert');
@@ -8031,6 +8148,65 @@ index 00000000..84ca7e37
 +
 +	await resolver.resolve('picket-wsl+Ubuntu');
 +	assert.strictEqual(starts[0].args[4], '-c');
++});
++
++test('an authority written by the official extension opens the same distro', async () => {
++	const runner = makeRunner({ runtime: recorded() });
++	const { starts, startServer } = startsRecording();
++	const resolver = createResolver({
++		runner, product: PRODUCT, settings: {}, log: silentLog(), startServer,
++		components: () => { throw new Error('must not install when the recorded server is alive'); },
++		probe: async () => 'alive'
++	});
++
++	assert.strictEqual((await resolver.resolve('wsl+Ubuntu')).port, 41234);
++	assert.strictEqual(starts.length, 0);
++});
++
++test('resolveDistro matches the installed spelling and lists what exists', async () => {
++	const runner = makeRunner();
++	const resolver = createResolver({
++		runner, product: PRODUCT, settings: {}, log: silentLog(), startServer: async () => { throw new Error('unused'); },
++		components: components()
++	});
++
++	assert.strictEqual(await resolver.resolveDistro('wsl+ubuntu'), 'Ubuntu');
++	assert.strictEqual(await resolver.resolveDistro('wsl+default'), 'Ubuntu');
++	await assert.rejects(() => resolver.resolveDistro('wsl+Debian 9'), /Installed: Ubuntu, Debian/);
++});
++
++test('a configured default distro answers an authority with no distro', async () => {
++	const runner = makeRunner({ runtime: recorded({ version: '1.0.0' }) });
++	const resolver = createResolver({
++		runner, product: PRODUCT, settings: { defaultDistro: 'debian' }, log: silentLog(),
++		startServer: async () => { throw new Error('unused'); },
++		components: components()
++	});
++
++	assert.strictEqual(await resolver.resolveDistro('picket-wsl+'), 'Debian');
++});
++
++test('a nested authority is rejected with a readable error', async () => {
++	const runner = makeRunner();
++	const resolver = createResolver({
++		runner, product: PRODUCT, settings: {}, log: silentLog(), startServer: async () => { throw new Error('unused'); },
++		components: components()
++	});
++
++	await assert.rejects(
++		() => resolver.resolveDistro('wsl+Ubuntu@7b22686f73744e616d65223a2278227d'),
++		/nested authorities are not supported/i
++	);
++});
++
++test('an authority that belongs to another extension is refused', async () => {
++	const runner = makeRunner();
++	const resolver = createResolver({
++		runner, product: PRODUCT, settings: {}, log: silentLog(), startServer: async () => { throw new Error('unused'); },
++		components: components()
++	});
++
++	await assert.rejects(() => resolver.resolveDistro('ssh-remote+host'), /not a WSL remote authority/);
 +});
 diff --git a/extensions/picket-remote-wsl/test/settings.test.js b/extensions/picket-remote-wsl/test/settings.test.js
 new file mode 100644
