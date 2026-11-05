@@ -282,12 +282,14 @@ function canonicalAuthority(prefix, distro) // → `${prefix}+${distro}`
 | 构建期漏配 min 版本 | `check.mjs` 双处执行，打包前即失败。 |
 | 回滚 | 全部是补丁可逆的改动；`serverDataFolderName` 改回 `.picket-code-server` 即回到隔离布局，旧数据仍在 `~/.picket-code-server`。 |
 
-## 6. 待你确认的四个决策
+## 6. 决策记录（2026-11-05 已批准）
 
-1. **数据根**：共用 `~/.vscode-server`（推荐）还是保留独立根 + 一次性拷贝？
-2. **版本方案**：独立 semver `1.<n>.<m>` + `commit` 锚点（推荐）还是 `<vscodeVersion>-picket.<n>`？
-3. **`wsl+` 接管**：注册别名（推荐，含 `wsl+default`、大小写归一、`getCanonicalURI`）还是只做引导改写？嵌套 `@host` 我按 v1 不支持处理。
-4. **`code` 命令名**：额外提供（推荐，仅在不存在时）还是只提供 `picket-code`？
+1. **数据根**：**A 共用 `~/.vscode-server`**（`serverDataFolderName` 改为 `.vscode-server`）。
+2. **版本方案**：**A 独立 semver `1.<n>.<m>` + `commit` 锚点**，客户端只要求 `commit` 相等且 `version >= minVersion`。
+3. **`wsl+` 接管**：**A 注册别名**（`wsl` + `picket-wsl`，含 `wsl+default`、`getCanonicalURI` 归一）；嵌套 `wsl+<distro>@<hostAuthority>` 按 v1 不支持处理。
+4. **`code` 命令名**：**A 双命令**——`~/.local/bin/picket-code` 总是装，`~/.local/bin/code` 仅在不存在时创建（外来链接拒绝覆盖）。
+
+批准同时确认：原生 inline 执行、逐 Task 提交并跑门禁、全部完成后派独立子代理整支复核；T5（`picket-code-server` 仓库改动）待另行授权。
 
 ## 7. 交给实现者的自由
 
