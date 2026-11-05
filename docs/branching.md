@@ -24,8 +24,23 @@ main ──●──●──●──●──●──●──●──●─
 1. **不做长期 `develop` 分支**：我们没有并行发布需求，长期分支只会带来 cherry-pick 地狱。需要同时维护两个版本时，才从 tag 拉 `release/x.y`（只接受 hotfix）。
 2. **一个 PR 一个主题**，不夹带格式化/重命名。
 3. **补齐丁必须同 PR 内自带**：改 `vscode/` 源码 → 同 PR 重新导出对应 `build/patches/NN-*.patch` 并更新 `apply-list.txt`（若新增），PR 描述里贴 `git apply -R --check` 输出。
-4. **tag 只由人打**，且只能打在 `main` 的已绿提交上。
+4. **tag 只由人打**，且只能打在 `main` 的已绿提交上。唯一例外是 RC：见 §1.1。
 5. 合入策略：squash merge（保持 `main` 线性，便于 `git bisect` 与回滚）；提交信息遵循 `<type>(<scope>): <summary>`。
+
+### 1.1 RC 的例外（2026-11-04 维护者决定）
+
+`v1.143.1-picket.N-rc.M` 这类**预发行** tag 允许打在 `feat/*` 的已绿提交上，先于合入
+`main`。原因：Windows 侧的人工验收（原生文件夹对话框、真实 `picket-code .`、真实代理与
+自签证书）只能在**可下载的安装包**上做，而这些项目在 Linux CI 上无法验证；等合入
+`main` 再发 RC，等于把未验证的代码放进唯一长期分支。
+
+约束：
+
+- 只打 `-rc.M` 形式的 tag，且 GitHub Release 必须标记为 **pre-release**；
+- 同一个 Picket Code 版本号（`v1.143.1-picket.N`）在 RC 期间不递增 `N`，正式版沿用 RC
+  验证过的那个提交（`N` 只在内容真的不同时 +1）；
+- RC 通过人工验收后，该分支以 PR 合入 `main`，正式 tag 打在 `main` 上的 squash 提交；
+- RC 失败就直接删 tag 与 Release，修完重新打。
 
 ## 2. 保护规则（GitHub 设置，人工配置一次）
 
@@ -52,7 +67,7 @@ AI（含本仓库使用的编码代理）在**分支 + PR** 范围内可自主�
 
 AI **不得**（即使被要求也要先停下并说明）：
 
-1. 创建或推送 tag、触发发布、修改 GitHub Release、操作 R2 镜像；
+1. 创建或推送 tag、触发发布、修改 GitHub Release、操作 R2 镜像（RC 例外见 §1.1：维护者在表单里逐次批准后，代理可代为执行，但推之前必须交代分支与 tag 名，推之后必须交代 run 链接）；
 2. 修改 `.github/workflows/**`（除非该 PR 的主题就是 CI，且需人类 review）；
 3. 修改 `build/product.json`、`build/patches/apply-list.txt` 的启用集合、`apply-patches.sh` 的语义（同属发布契约，需人类 review）；
 4. 处理凭据：读/写 `.env`、`~/.npmrc`、R2/Cloudflare token、模型 API key；
