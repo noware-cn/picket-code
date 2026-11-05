@@ -1,13 +1,18 @@
 #!/usr/bin/env bash
 # fetch-payload.sh — stage the WSL server payload of a picket-code-server release.
 #
-# Usage: fetch-payload.sh <server-version> [--metadata-only]
+# Usage: fetch-payload.sh <server-version> [--metadata-only] [--from-file <path>]
 #
 # Lays down in build/wsl/download/:
 #   picket-code-server-<version>-linux-x64.tar.gz   the payload (skipped by --metadata-only)
 #   SHA256SUMS                                      the release checksums (always)
 #   payload-size.txt                                byte size of the payload (always)
 #   catalog.json                                    ondemand component catalog (always)
+#
+# --from-file <path> stages a payload you already have — a build made in the
+# server repository, or one unpacked from an offline bundle — instead of
+# downloading it: the size and checksum are computed from that file, SHA256SUMS
+# is rewritten to describe it, and nothing goes to the network.
 #
 # The payload lives in its own repository (noware-cn/picket-code-server) and is
 # versioned independently of the client: <server-version> is a bare semver such
@@ -24,8 +29,18 @@
 # PICKET_SERVER_REPO points at a private mirror; that path goes through gh.
 set -euo pipefail
 
-VERSION="${1:?usage: fetch-payload.sh <server-version> [--metadata-only]}"
-MODE="${2:-}"
+VERSION="${1:?usage: fetch-payload.sh <server-version> [--metadata-only] [--from-file <path>]}"
+shift
+MODE=""
+FROM_FILE=""
+while [ $# -gt 0 ]; do
+	case "$1" in
+		--metadata-only) MODE="--metadata-only" ;;
+		--from-file) FROM_FILE="${2:?--from-file needs the path of a payload tarball}"; shift ;;
+		*) echo "unknown argument: $1" >&2; exit 2 ;;
+	esac
+	shift
+done
 MIN_VERSION="${PICKET_SERVER_MIN_VERSION:-$VERSION}"
 COMMIT="${PICKET_SERVER_COMMIT:-}"
 
@@ -66,33 +81,48 @@ fetch_asset() {
 if [ -n "$TOKEN" ]; then
 	command -v gh >/dev/null 2>&1 || { echo "PICKET_SERVER_TOKEN is set but gh CLI is missing" >&2; exit 1; }
 fi
-command -v curl >/dev/null 2>&1 || { echo "curl is required to read $BASE" >&2; exit 1; }
+if [ -z "$FROM_FILE" ]; then
+	command -v curl >/dev/null 2>&1 || { echo "curl is required to read $BASE" >&2; exit 1; }
+fi
 
-echo "==> [picket-code-wsl] fetching $NAME from $REPO@$RELEASE_TAG"
-fetch_asset "$SUMS_NAME" "$DOWNLOAD/SHA256SUMS.tmp"
-mv "$DOWNLOAD/SHA256SUMS.tmp" "$DOWNLOAD/SHA256SUMS"
+if [ -n "$FROM_FILE" ]; then
+	echo "==> [picket-code-wsl] staging $NAME from $FROM_FILE"
+	# Everything the release would have told us is already in the file itself.
+	[ -f "$FROM_FILE" ] || { echo "no payload at $FROM_FILE" >&2; exit 1; }
+	if [ "$FROM_FILE" != "$DOWNLOAD/$NAME" ]; then
+		cp "$FROM_FILE" "$DOWNLOAD/$NAME"
+	fi
+	SIZE="$(wc -c < "$DOWNLOAD/$NAME" | tr -d ' ')"
+	printf '%s  %s\n' "$(sha256sum "$DOWNLOAD/$NAME" | awk '{ print $1 }')" "$NAME" > "$DOWNLOAD/SHA256SUMS"
+else
+	echo "==> [picket-code-wsl] fetching $NAME from $REPO@$RELEASE_TAG"
+	fetch_asset "$SUMS_NAME" "$DOWNLOAD/SHA256SUMS.tmp"
+	mv "$DOWNLOAD/SHA256SUMS.tmp" "$DOWNLOAD/SHA256SUMS"
+fi
 
 # Size comes from the headers, not from the file: --metadata-only must know it
 # without spending the download. GitHub redirects to the CDN that owns the asset,
 # and only the last hop reports the real Content-Length (see asset-size.mjs).
 HEADERS="$DOWNLOAD/.headers"
-if [ -n "$TOKEN" ]; then
-	SIZE="$(gh api "repos/$REPO/releases/tags/$RELEASE_TAG" --jq ".assets[] | select(.name == \"$NAME\") | .size")"
-else
-	# -I: headers only. Without it curl downloads the whole 87 MB body to /dev/null,
-	# which is the download this branch exists to avoid.
-	curl -sSfLI -D "$HEADERS" -o /dev/null --retry 3 --retry-delay 5 --connect-timeout 20 \
-		--retry-all-errors "$BASE/$NAME"
-	SIZE="$(node "$SCRIPT_DIR/lib/asset-size.mjs" "$HEADERS")"
+if [ -z "$FROM_FILE" ]; then
+	if [ -n "$TOKEN" ]; then
+		SIZE="$(gh api "repos/$REPO/releases/tags/$RELEASE_TAG" --jq ".assets[] | select(.name == \"$NAME\") | .size")"
+	else
+		# -I: headers only. Without it curl downloads the whole 87 MB body to /dev/null,
+		# which is the download this branch exists to avoid.
+		curl -sSfLI -D "$HEADERS" -o /dev/null --retry 3 --retry-delay 5 --connect-timeout 20 \
+			--retry-all-errors "$BASE/$NAME"
+		SIZE="$(node "$SCRIPT_DIR/lib/asset-size.mjs" "$HEADERS")"
+	fi
+	rm -f "$HEADERS"
 fi
-rm -f "$HEADERS"
 if [ -z "$SIZE" ]; then
 	echo "release $RELEASE_TAG of $REPO has no asset named $NAME" >&2
 	exit 1
 fi
 printf '%s\n' "$SIZE" > "$DOWNLOAD/payload-size.txt"
 
-if [ "$MODE" != "--metadata-only" ]; then
+if [ -z "$FROM_FILE" ] && [ "$MODE" != "--metadata-only" ]; then
 	fetch_asset "$NAME" "$DOWNLOAD/$NAME"
 	EXPECTED="$(awk -v n="$NAME" '{ sub(/^\*/, "", $2) } $2 == n { print $1 }' "$DOWNLOAD/SHA256SUMS")"
 	ACTUAL="$(sha256sum "$DOWNLOAD/$NAME" | awk '{ print $1 }')"

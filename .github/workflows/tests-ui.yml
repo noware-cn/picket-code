@@ -12,7 +12,7 @@ name: tests (UI)
 #
 # The second job, `wsl-acceptance`, runs the whole picket-remote-wsl matrix
 # (`build/wsl/acceptance.sh --all`: remote window, stdio tunnel, WSL smoke area,
-# lifecycle, icode) on the same kind of Electron-on-Linux runner. It lives here
+# lifecycle, icode, conflict gate, data takeover, legacy wsl+ URI) on the same kind of Electron-on-Linux runner. It lives here
 # rather than in its own workflow because it needs exactly the install path above —
 # clone + patches + transpile + preLaunch + the two smoke-harness packages + Xvfb +
 # the unprivileged-userns sysctl; a separate file would be a near-copy of those
@@ -33,6 +33,8 @@ on:
       - "test/smoke/src/areas/wsl/**"
       - "test/automation/src/**"
       - "docs/wsl-verification.md"
+      - "docs/uninstall-official-remote-wsl.md"
+      - "docs/wsl-server-releases.md"
       - ".github/workflows/tests-ui.yml"
   workflow_dispatch:
     inputs:
@@ -340,6 +342,12 @@ jobs:
   #   --tunnel     the same window over the stdio relay (picket.wsl.tunnelMode: stdio)
   #   --ui         the WSL area of the smoke suite (test/smoke/src/areas/wsl)
   #   --lifecycle  20 open/close cycles reusing exactly one server process
+  #   --conflict   a stand-in official extension closes every WSL command, leaves
+  #                the two uninstall paths and the diagnostics reachable, and starts
+  #                no server
+  #   --takeover   a preset ~/.vscode-server (user settings, extensions.json,
+  #                server-env-setup) is taken over unchanged, and the hook still runs
+  #   --legacy-uri a folder saved as wsl+<distro> opens and resolves
   #   --icode      a bogus picket.wsl.icodePath must not be exported into the distro
   # Only the wsl.exe boundary is faked. The payload, the server process and the window
   # are real, which is why this needs a Linux desktop runner, not a unit-test job.
