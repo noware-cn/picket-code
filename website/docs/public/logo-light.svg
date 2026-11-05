@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 180" role="img" aria-labelledby="title desc">
+  <title id="title">Picket Code</title>
+  <desc id="desc">Geometric engineering emblem and Picket Code wordmark.</desc>
+  <g transform="translate(18 20)">
+    <path d="M0 0h58v40L40 58H0z M82 0h58v58h-40L82 40z M0 82h40l18 18v40H0z M100 82h40v58H82v-40z" fill="#10243A"/>
+    <path d="m70 54 16 16-16 16-16-16z" fill="#19C6D8"/>
+  </g>
+  <text x="190" y="116" font-family="Geist, Inter, Arial, sans-serif" font-size="88" font-weight="650" letter-spacing="-3" fill="#10243A">Picket</text>
+  <text x="470" y="116" font-family="Geist, Inter, Arial, sans-serif" font-size="88" font-weight="650" letter-spacing="-3" fill="#007E8A">Code</text>
+</svg>

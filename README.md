@@ -1,3 +1,7 @@
+<div align="center">
+  <img src="website/docs/public/logo-light.svg" alt="Picket Code" width="520" />
+</div>
+
 # Picket Code
 
 > 面向 AI 编码 agent 的加固版 VS Code 发行版——受控扩展、私有模型网关、按项目沙箱，开箱即用。
