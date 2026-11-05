@@ -25,8 +25,8 @@ Picket Code 是面向 AI 编码 agent 的加固版 Code-OSS 发行版。视觉�
 
 ## 资产
 
-- `logo.svg`：浅色背景横版标志。
-- `logo-dark.svg`：深色背景横版标志。
+- `logo.svg`：深色背景横版标志（网站导航与首页使用）。
+- `logo-light.svg`：浅色背景横版标志（仓库 README 等浅色页面使用）。
 - `favicon.svg`：独立图形标识，适用于网站 favicon 与应用图标源图。
 - SVG 为主要矢量源文件；PNG 应按具体使用场景导出。
 
