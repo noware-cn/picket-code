@@ -70,7 +70,9 @@ HEADERS="$DOWNLOAD/.headers"
 if [ -n "$TOKEN" ]; then
 	SIZE="$(gh api "repos/$REPO/releases/tags/$TAG" --jq ".assets[] | select(.name == \"$NAME\") | .size")"
 else
-	curl -sSfL -D "$HEADERS" -o /dev/null --retry 3 --retry-delay 5 --connect-timeout 20 \
+	# -I: headers only. Without it curl downloads the whole 87 MB body to /dev/null,
+	# which is the download this branch exists to avoid.
+	curl -sSfLI -D "$HEADERS" -o /dev/null --retry 3 --retry-delay 5 --connect-timeout 20 \
 		--retry-all-errors "$BASE/$NAME"
 	SIZE="$(node "$SCRIPT_DIR/lib/asset-size.mjs" "$HEADERS")"
 fi
