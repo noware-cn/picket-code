@@ -1,15 +1,8 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64">
-  <!-- 候选 B：扁平现代——渐变底 + 白色栅栏三条 + 横栏 -->
-  <defs>
-    <linearGradient id="b-g" x1="0" y1="0" x2="1" y2="1">
-      <stop offset="0" stop-color="#10b981"/>
-      <stop offset="1" stop-color="#0284c7"/>
-    </linearGradient>
-  </defs>
-  <rect x="1.5" y="1.5" width="61" height="61" rx="15" fill="url(#b-g)"/>
-  <rect x="1.5" y="1.5" width="61" height="61" rx="15" fill="none" stroke="rgba(255,255,255,0.25)" stroke-width="1.5"/>
-  <path d="M22 13 L22 51" stroke="#ffffff" stroke-width="6" stroke-linecap="round"/>
-  <path d="M32 10 L32 51" stroke="#ffffff" stroke-width="6" stroke-linecap="round"/>
-  <path d="M42 13 L42 51" stroke="#ffffff" stroke-width="6" stroke-linecap="round"/>
-  <rect x="16" y="28" width="32" height="7" rx="3.5" fill="#0b1220" opacity="0.55"/>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 160 160" role="img" aria-labelledby="title">
+  <title id="title">Picket Code</title>
+  <rect width="160" height="160" rx="28" fill="#081A2B"/>
+  <g transform="translate(10 10)">
+    <path d="M0 0h58v40L40 58H0z M82 0h58v58h-40L82 40z M0 82h40l18 18v40H0z M100 82h40v58H82v-40z" fill="#F4F8FC"/>
+    <path d="m70 54 16 16-16 16-16-16z" fill="#19C6D8"/>
+  </g>
 </svg>
