@@ -2,7 +2,7 @@
 
 自动化覆盖见 `build/wsl/acceptance.sh`（`--all` 跑全部；Linux 桌面即跑通全矩阵，
 `wsl.exe` 边界由 `vscode/test/wsl-harness/fake-wsl.mjs` 替身承担，服务器载荷是真的）。
-下面四项是自动化触不到、必须由人在 Windows 真机上看一眼的部分。每项都给出把现场
+下面七项是自动化触不到、必须由人在 Windows 真机上看一眼的部分。每项都给出把现场
 摆好的命令，检查人只需要"看"。
 
 ## 1. 原生文件夹对话框（唯一自动化触不到的交互）
@@ -39,7 +39,47 @@ shim 的写链路有 L2 argv 断言，但只有真实的 Windows 客户端能证
 - 发行版节点的状态徽标（运行中/默认）渲染正常；
 - 空状态（无任何发行版）是引导文案，不是空白面板。
 
-## 4. M4 收尾 15 分钟端到端走查
+## 4. 未卸载官方扩展时功能真的全禁用
+
+自动化（`acceptance.sh --conflict`）断言的是"假官方扩展在位时五个命令消失、树只剩 blocked 节点"，
+真机上还要确认这个禁用对用户是**说得清**的，而不是无理由的消失。
+
+摆现场：Windows 上 `picket-code --install-extension ms-vscode-remote.remote-wsl`，重载窗口。
+
+看什么：
+- `WSL 目标` 视图只有一条「已禁用：检测到官方 Remote-WSL 扩展」，点它给出卸载确认；
+- 命令面板搜 `Picket:` 只剩 `诊断 WSL 支持`、`卸载官方 Remote-WSL 扩展（保留数据）`、
+  `如何卸载官方 Remote-WSL 扩展`，其余 WSL 命令搜不到；
+- 左下角远程指示器菜单里的 WSL 条目同样消失。
+
+## 5. 卸载官方扩展后：数据接管与旧链接
+
+`acceptance.sh --takeover` 与 `--legacy-uri` 用的是夹具数据；这一步证明真实用户的历史数据也在。
+
+摆现场：接第 4 项，在禁用提示上点「卸载（保留数据）」→ 重载窗口 → 打开任意发行版。
+另用一个存着 `vscode-remote://wsl+<发行版>/home/…` 的旧工作区文件（或用
+`vscode-remote://wsl+<发行版>/home/<user>` 手填地址）再开一个窗口。
+
+看什么：
+- 卸载后 `~/.vscode-server/{data,extensions}` 里的东西都在：原来的远程扩展出现在扩展视图里、
+  原来的 `settings.json` 生效（`remote.Settings` 类设置仍在）；
+- `WSL 目标` 视图恢复成发行版列表（不再是禁用提示）；
+- 旧 `wsl+` 地址能直接打开，且 `诊断 WSL 支持` 的 `Extensions` 段逐条给出 `compatible=yes/no`，
+  `no` 的那些写明是 `engines.vscode` 比本产品高。
+
+## 6. 命令行别名
+
+`installShim` 的 argv 有 L2 断言，但"`code` 已存在时不动它"只有真机看得见。
+
+摆现场：在从未装过命令行的发行版里先 `command -v code`（Ubuntu 桌面默认没有），执行
+`Picket: 在 WSL 中安装命令行…`；再换一个 `code` 已存在（例如官方扩展装过）的发行版重复一次。
+
+看什么：
+- 第一次提示「picket-code 命令行已就绪 …（以及 code 别名）」，`code .` 与 `picket-code .` 行为一致；
+- 第二次提示「…（code 已被其他程序占用，未改动）」，`~/.local/bin/code` 仍指向原来的目标；
+- `Picket: 从 WSL 中移除命令行` 后 `picket-code` 消失、被占用的 `code` 仍在。
+
+## 7. M4 收尾 15 分钟端到端走查
 
 自动化只检查它被告知的输入；这 15 分钟回答的是"用起来像不像一个产品"。
 

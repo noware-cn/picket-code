@@ -1,5 +1,12 @@
 # 手工安装 Remote-WSL 与 VS Code Server
 
+> **已退役，不要照着做。** 本文描述的是在本产品内置 WSL 支持之前，用微软官方
+> `ms-vscode-remote.remote-wsl` 侧载跑通 WSL 的历史做法。现在两者**互斥**：官方扩展
+> 装着时本产品的 WSL 功能整体关闭（见 [`docs/wsl.md`](wsl.md) 与
+> [`docs/uninstall-official-remote-wsl.md`](uninstall-official-remote-wsl.md)）。
+> 保留本文只为解释当时的取舍、以及排障时对照旧现场（例如发行版版本号必须是裸 `X.Y.Z`
+> 这条约束对 `.vsix` 依然成立）。
+
 目标是**不依赖任何在线解析**把 `ms-vscode-remote.remote-wsl` 跑起来：`.vsix` 离线安装，服务端产物手工预置。适用于 Picket Code 1.143.1（上游 commit `e646868227c`）＋ Remote-WSL 1.104.7。
 
 两条前置事实决定了流程形状：

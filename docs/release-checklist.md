@@ -20,15 +20,22 @@
 
 ## 0. 发布前置配置（一次性，改了就检查）
 
-`build/build.sh` 从 WSL 组件装配开始就**要求** `PICKET_SERVER_TAG`，缺它就编译失败：
+`build/build.sh` 从 WSL 组件装配开始就**要求** `PICKET_SERVER_MIN_VERSION`，缺它就编译失败：
 
-- 仓库变量 `PICKET_SERVER_TAG`：`noware-cn/picket-code-server` 的载荷 tag，例如
-  `v1.143.1-picket.1-rc.4`。它决定这个构建内部钉的是哪份服务器载荷。
+- 仓库变量 `PICKET_SERVER_MIN_VERSION`（**必填**）：本构建能接受的最旧
+  `noware-cn/picket-code-server` 版本，裸 semver，例如 `1.0.0`。它盖进 `product.json` 与
+  `catalog.json`，客户端据此拒绝更旧的服务端。
+- 仓库变量 `PICKET_SERVER_VERSION`（可选）：这次实际打包下载的载荷版本；留空即等于
+  `PICKET_SERVER_MIN_VERSION`。服务器版本号**独立演进**，改它不需要改动客户端版本。
+- 载荷按 `<version>` 从 `server-v<version>` 这个 tag 的 Release 资产取；另外校验载荷内置
+  `product.json.commit` 与客户端 commit 相同（握手时比对的就是它）。
 - **不需要令牌**：那个仓库已经公开，`build/wsl/fetch-payload.sh` 用普通 HTTPS 取 Release
   资产（`curl`，带重试与停顿检测），不再依赖 `gh`。将来若把载荷挪到私有镜像，设
   `PICKET_SERVER_REPO` 与该仓库的只读 PAT（`PICKET_SERVER_TOKEN`）即可，脚本自动切回 `gh`。
 - `verify-release.yml` 跑完再确认一次：`gh release view <tag> --json assets` 里应有
   `…-offline-wsl.zip`（离线组件包），大小约 87 MB。
+- 服务端仓库的发行流程见 `noware-cn/picket-code-server` 的 README（tag 形如
+  `server-v1.2.0`，资产 `<server 版本>-SHA256SUMS` 与载荷 tar.gz）。
 
 报告链接取法（发布后再补）：`gh release view <tag> --json assets --jq '.assets[].name'`
 —— 附件里是全部 `test-results/*.xml` 与汇总 `summary.md`；同一次发布的 Markdown 汇总
@@ -55,7 +62,7 @@ Linux x64 包上依次执行，任一项失败即停止发布。
 | Linux x64 | L1–L5 全绿 | 第 1 节 6 条 | - [ ] 通过 |
 | Windows x64 | L1/L2 单测 + 打包产物启动冒烟 | `.cmd` 真实启动、审批、diff | - [ ] 通过 |
 | Windows x64（历史欠账） | `.cmd` 转义只到单测（`icodeLaunchConfig`） | 在真机上用 `.cmd` 版 iCode 跑一轮对话 | - [ ] 通过 |
-| Windows x64 + WSL2（远程窗口） | `.github/workflows/tests-ui.yml` 的 `wsl-acceptance` job（`workflow_dispatch` / 每日 `schedule` / `release.yml` 通过 `workflow_call` 调用），在 `xvfb-run` 下跑 `build/wsl/acceptance.sh --all`：remote / tunnel / ui / lifecycle / icode 五阶段 + 扩展单测，Linux 桌面跑，`wsl.exe` 用替身、服务器载荷是真的 + L4 冒烟用例 A5/A6 | `docs/wsl-verification.md` 四项：原生文件夹对话框、真实 `picket-code .`、界面观感、M4 末 15 分钟走查。**Windows Server 与 WSL1 不在范围** | - [ ] 通过 |
+| Windows x64 + WSL2（远程窗口） | `.github/workflows/tests-ui.yml` 的 `wsl-acceptance` job（`workflow_dispatch` / 每日 `schedule` / `release.yml` 通过 `workflow_call` 调用），在 `xvfb-run` 下跑 `build/wsl/acceptance.sh --all`：remote / tunnel / ui / lifecycle / icode / conflict / takeover / legacy-uri 八阶段 + 扩展单测，Linux 桌面跑，`wsl.exe` 用替身、服务器载荷是真的 + L4 冒烟用例 A5/A6 | `docs/wsl-verification.md` 七项：原生文件夹对话框、真实 `picket-code .`、界面观感、未卸载官方扩展时功能全禁用、卸载后数据接管与旧 `wsl+` 链接、命令行别名、M4 末 15 分钟走查。**Windows Server 与 WSL1 不在范围** | - [ ] 通过 |
 | macOS | 未覆盖 | v1 不发布 macOS 则跳过此项 | - [ ] 不适用 / - [ ] 通过 |
 
 ## 3. 未验证项及原因
