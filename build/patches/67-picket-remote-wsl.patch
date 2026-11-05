@@ -9,10 +9,10 @@ index 00000000..96fab092
 +tsconfig.json
 diff --git a/extensions/picket-remote-wsl/extension.js b/extensions/picket-remote-wsl/extension.js
 new file mode 100644
-index 00000000..5b445cc1
+index 00000000..8d23bae8
 --- /dev/null
 +++ b/extensions/picket-remote-wsl/extension.js
-@@ -0,0 +1,310 @@
+@@ -0,0 +1,311 @@
 +'use strict';
 +
 +const { join } = require('node:path');
@@ -231,6 +231,7 @@ index 00000000..5b445cc1
 +		currentFolders: () => vscode.workspace.workspaceFolders ?? [],
 +		currentAuthority: () => vscode.env.remoteAuthority ?? '',
 +		official: () => ({ installed: gate.installed, blocked: gate.blocked }),
++		extensions: { get: (id) => vscode.extensions.getExtension(id) },
 +		// The build's own version is what `engines.vscode` is compared against:
 +		// `env` exposes no version, and the product file is already read above.
 +		productsVersion: product?.version,
@@ -325,10 +326,10 @@ index 00000000..5b445cc1
 +module.exports = { activate, deactivate };
 diff --git a/extensions/picket-remote-wsl/package.json b/extensions/picket-remote-wsl/package.json
 new file mode 100644
-index 00000000..74f4413e
+index 00000000..b46de115
 --- /dev/null
 +++ b/extensions/picket-remote-wsl/package.json
-@@ -0,0 +1,339 @@
+@@ -0,0 +1,362 @@
 +{
 +	"name": "picket-remote-wsl",
 +	"displayName": "Picket Remote - WSL",
@@ -430,6 +431,16 @@ index 00000000..74f4413e
 +				"command": "picket.wsl.refreshTargets",
 +				"title": "刷新 WSL 目标",
 +				"category": "Picket"
++			},
++			{
++				"command": "picket.wsl.uninstallOfficial",
++				"title": "卸载官方 Remote-WSL 扩展（保留数据）",
++				"category": "Picket"
++			},
++			{
++				"command": "picket.wsl.uninstallGuide",
++				"title": "如何卸载官方 Remote-WSL 扩展",
++				"category": "Picket"
 +			}
 +		],
 +		"menus": {
@@ -493,6 +504,14 @@ index 00000000..74f4413e
 +				{
 +					"command": "picket.wsl.refreshTargets",
 +					"when": "isWindows && !isWeb && !picketWsl.blocked"
++				},
++				{
++					"command": "picket.wsl.uninstallOfficial",
++					"when": "isWindows && !isWeb"
++				},
++				{
++					"command": "picket.wsl.uninstallGuide",
++					"when": "isWindows && !isWeb"
 +				}
 +			],
 +			"statusBar/remoteIndicator": [
@@ -524,6 +543,11 @@ index 00000000..74f4413e
 +				{
 +					"command": "picket.wsl.showLog",
 +					"group": "remote_10_picket-wsl_1_open@4"
++				},
++				{
++					"command": "picket.wsl.uninstallGuide",
++					"when": "picketWsl.blocked",
++					"group": "remote_10_picket-wsl_0_local@0"
 +				}
 +			],
 +			"view/title": [
@@ -804,10 +828,10 @@ index 00000000..2ac6fe0f
 +module.exports = { loadCatalog };
 diff --git a/extensions/picket-remote-wsl/src/commands.js b/extensions/picket-remote-wsl/src/commands.js
 new file mode 100644
-index 00000000..6020cbb6
+index 00000000..1dcd6563
 --- /dev/null
 +++ b/extensions/picket-remote-wsl/src/commands.js
-@@ -0,0 +1,502 @@
+@@ -0,0 +1,548 @@
 +'use strict';
 +
 +const { listDistros, distroHome, visibleDistros } = require('./distro.js');
@@ -818,6 +842,7 @@ index 00000000..6020cbb6
 +const { unpackOfflineBundle, removeBundle } = require('./offline.js');
 +const { installShim, removeShim } = require('./shim.js');
 +const { selectComponent, describeSelectionError } = require('./version.js');
++const { uninstallOfficialExtension } = require('./uninstall.js');
 +
 +const LAST_DISTRO = 'picket.wsl.lastDistro';
 +const SERVER_COMPONENT = 'wsl-server';
@@ -868,7 +893,8 @@ index 00000000..6020cbb6
 + *   currentAuthority?: () => string,
 + *   clientPath?: string,
 + *   official?: { installed: boolean, blocked: boolean } | (() => { installed: boolean, blocked: boolean }),
-+ *   productsVersion?: string
++ *   productsVersion?: string,
++ *   extensions?: { get(id: string): { extensionPath?: string } | undefined }
 + * }} options
 + */
 +function createCommands(options) {
@@ -1140,6 +1166,46 @@ index 00000000..6020cbb6
 +		await host.showDocument(report);
 +	}
 +
++	/**
++	 * The one command that has to work *while* everything else is blocked: it is
++	 * the way out of the blocked state, and it must not touch the data the next
++	 * connection depends on.
++	 */
++	async function uninstallOfficial() {
++		const result = await uninstallOfficialExtension({
++			extensions: options.extensions ?? { get: () => undefined },
++			executeCommand: (command, ...args) => host.executeCommand(command, ...args),
++			appRoot: options.appRoot ?? ''
++		});
++		if (result.status === 'uninstalled') {
++			const choice = await host.showInformationMessage(`${result.message} WSL 功能在重新加载窗口后恢复。`, '重新加载窗口');
++			if (choice === '重新加载窗口') {
++				await host.executeCommand('workbench.action.reloadWindow');
++			}
++			return;
++		}
++		if (result.status === 'absent') {
++			await host.showInformationMessage(result.message);
++			return;
++		}
++		await host.showErrorMessage(result.message);
++	}
++
++	/** For a user who would rather do it themselves: the same two paths, in words. */
++	async function uninstallGuide() {
++		const choice = await host.showInformationMessage(
++			'卸载官方 Remote-WSL 扩展（数据全部保留）：在扩展视图搜索 "Remote - WSL" 点卸载；或运行 '
++			+ '"picket-code --uninstall-extension ms-vscode-remote.remote-wsl"。'
++			+ ' ~/.vscode-server 里的服务器、扩展与设置，以及下载缓存都不会被删除。',
++			'立即卸载', '打开扩展视图'
++		);
++		if (choice === '立即卸载') {
++			await uninstallOfficial();
++		} else if (choice === '打开扩展视图') {
++			await host.executeCommand('workbench.view.extensions');
++		}
++	}
++
 +	async function galleryCommand() {
 +		if (!options.gallery) {
 +			await host.showErrorMessage('扩展市场配置不可用。');
@@ -1241,6 +1307,8 @@ index 00000000..6020cbb6
 +		stopServer,
 +		componentsCommand,
 +		diagnose,
++		uninstallOfficial,
++		uninstallGuide,
 +		refreshTargets,
 +		addDistro: () => manage('add'),
 +		setDefaultDistro: (distro) => manage('setDefault', distro),
@@ -1276,6 +1344,8 @@ index 00000000..6020cbb6
 +	'picket.wsl.stopServer': (api) => (node) => api.stopServer(distroOf(node)),
 +	'picket.wsl.components': (api) => () => api.componentsCommand(),
 +	'picket.wsl.diagnose': (api) => () => api.diagnose(),
++	'picket.wsl.uninstallOfficial': (api) => () => api.uninstallOfficial(),
++	'picket.wsl.uninstallGuide': (api) => () => api.uninstallGuide(),
 +	'picket.wsl.refreshTargets': (api) => () => api.refreshTargets(),
 +	'picket.wsl.addDistro': (api) => () => api.addDistro(),
 +	'picket.wsl.setDefaultDistro': (api) => (node) => api.setDefaultDistro(distroOf(node)),
@@ -4978,6 +5048,64 @@ index 00000000..07f34d81
 +}
 +
 +module.exports = { PIPE_SCRIPT, createStdioTunnel };
+diff --git a/extensions/picket-remote-wsl/src/uninstall.js b/extensions/picket-remote-wsl/src/uninstall.js
+new file mode 100644
+index 00000000..46f94964
+--- /dev/null
++++ b/extensions/picket-remote-wsl/src/uninstall.js
+@@ -0,0 +1,52 @@
++'use strict';
++
++const { OFFICIAL_EXTENSION_ID } = require('./official.js');
++
++/**
++ * Windows hands back whatever the user typed for the install path (`C:\Program
++ * Files\...` next to `C:/Program Files/...`), so comparison is on one normalised
++ * form: forward slashes, no trailing separator, lower case.
++ * @param {string} value
++ */
++function normalizePath(value) {
++	return String(value ?? '').replace(/\\/g, '/').replace(/\/+$/, '').toLowerCase();
++}
++
++/**
++ * The workbench command removes the extension from the user's profile and leaves
++ * `~/.vscode-server`, the settings and the download cache alone — which is exactly
++ * what takeover needs. A copy under `resources/app/extensions` is part of the
++ * product instead: it comes back on the next start, so refusing is the honest
++ * answer rather than a command that appears to work and changes nothing.
++ * @param {{
++ *   extensions: { get(id: string): { extensionPath?: string } | undefined },
++ *   executeCommand: (command: string, ...args: any[]) => Promise<any>,
++ *   appRoot: string
++ * }} options
++ * @returns {Promise<{ status: 'uninstalled' | 'absent' | 'builtin' | 'failed', message: string }>}
++ */
++async function uninstallOfficialExtension(options) {
++	const { extensions, executeCommand, appRoot } = options;
++	const found = extensions.get(OFFICIAL_EXTENSION_ID);
++	if (!found) {
++		return { status: 'absent', message: '官方 Remote-WSL 扩展已经不在了。' };
++	}
++
++	const builtinRoot = `${normalizePath(appRoot)}/extensions`;
++	const extensionPath = normalizePath(found.extensionPath ?? '');
++	if (extensionPath === builtinRoot || extensionPath.startsWith(`${builtinRoot}/`)) {
++		return {
++			status: 'builtin',
++			message: '检测到的是 Picket Code 内置的官方 Remote-WSL 扩展，卸载会在下次启动时被还原。请改用不带该扩展的安装包。'
++		};
++	}
++
++	try {
++		await executeCommand('workbench.extensions.uninstallExtension', OFFICIAL_EXTENSION_ID);
++	} catch (error) {
++		return { status: 'failed', message: `卸载失败：${error?.message ?? error}` };
++	}
++	return { status: 'uninstalled', message: '已卸载官方 Remote-WSL 扩展，用户数据全部保留。' };
++}
++
++module.exports = { uninstallOfficialExtension };
 diff --git a/extensions/picket-remote-wsl/src/version.js b/extensions/picket-remote-wsl/src/version.js
 new file mode 100644
 index 00000000..b96ee598
@@ -7119,10 +7247,10 @@ index 00000000..118dde5d
 +});
 diff --git a/extensions/picket-remote-wsl/test/manifest.test.js b/extensions/picket-remote-wsl/test/manifest.test.js
 new file mode 100644
-index 00000000..41473a16
+index 00000000..5a6b3dd8
 --- /dev/null
 +++ b/extensions/picket-remote-wsl/test/manifest.test.js
-@@ -0,0 +1,97 @@
+@@ -0,0 +1,118 @@
 +// RED first: the manifest and the code must agree about which commands exist.
 +const test = require('node:test');
 +const assert = require('node:assert');
@@ -7152,7 +7280,7 @@ index 00000000..41473a16
 +	assert.deepStrictEqual(stray, [], `registered but not in the manifest: ${stray.join(', ')}`);
 +});
 +
-+test('the command layer owns the fourteen commands of this milestone', () => {
++test('the command layer owns the sixteen commands of this milestone', () => {
 +	assert.deepStrictEqual(Object.keys(COMMANDS).sort(), [
 +		'picket.wsl.addDistro',
 +		'picket.wsl.components',
@@ -7167,7 +7295,9 @@ index 00000000..41473a16
 +		'picket.wsl.reopenInWsl',
 +		'picket.wsl.selectGallery',
 +		'picket.wsl.setDefaultDistro',
-+		'picket.wsl.stopServer'
++		'picket.wsl.stopServer',
++		'picket.wsl.uninstallGuide',
++		'picket.wsl.uninstallOfficial'
 +	]);
 +});
 +
@@ -7175,7 +7305,7 @@ index 00000000..41473a16
 +	// log.js is the one vscode-bound helper: it owns an OutputChannel.
 +	const sources = ['catalog.js', 'distro.js', 'components.js', 'payload.js', 'download.js', 'launch.js', 'probe.js',
 +		'remoteUri.js', 'resolver.js', 'icode.js', 'preflight.js', 'tree.js', 'manage.js', 'diagnose.js',
-+		'nudge.js', 'commands.js', 'marketplace.js', 'offline.js', 'shim.js', 'settings.js', 'version.js', 'product.js'];
++		'nudge.js', 'commands.js', 'marketplace.js', 'offline.js', 'shim.js', 'settings.js', 'version.js', 'product.js', 'official.js', 'uninstall.js'];
 +	for (const name of sources) {
 +		const text = readFileSync(join(root, 'src', name), 'utf8');
 +		assert.doesNotMatch(text, /require\(['"]vscode['"]\)/, `${name} must stay testable without an extension host`);
@@ -7208,7 +7338,14 @@ index 00000000..41473a16
 +});
 +
 +test('every clickable command is hidden while the gate is closed', () => {
-+	const resident = new Set([...RESIDENT_COMMANDS, 'picket.wsl.showLog']);
++	// Diagnostics and both uninstall paths answer with the gate closed: one
++	// explains why, the other is the way out.
++	const resident = new Set([
++		...RESIDENT_COMMANDS,
++		'picket.wsl.showLog',
++		'picket.wsl.uninstallOfficial',
++		'picket.wsl.uninstallGuide'
++	]);
 +	for (const entry of manifest.contributes.menus.commandPalette) {
 +		if (resident.has(entry.command)) {
 +			assert.doesNotMatch(entry.when, /blocked/, `${entry.command} must stay reachable while blocked`);
@@ -7218,6 +7355,18 @@ index 00000000..41473a16
 +	}
 +	for (const entry of manifest.contributes.menus['view/title']) {
 +		assert.match(entry.when, /!picketWsl\.blocked/, `${entry.command} stays clickable while blocked`);
++	}
++});
++
++test('the way out of the blocked state is reachable from the blocked state', () => {
++	const blockedHint = manifest.contributes.menus['statusBar/remoteIndicator']
++		.find(entry => entry.command === 'picket.wsl.uninstallGuide');
++	assert.ok(blockedHint, 'the remote indicator must offer the uninstall while blocked');
++	assert.match(blockedHint.when, /picketWsl\.blocked/);
++	for (const id of ['picket.wsl.uninstallOfficial', 'picket.wsl.uninstallGuide']) {
++		const entry = manifest.contributes.menus.commandPalette.find(e => e.command === id);
++		assert.ok(entry, `${id} is contributed but not in the palette`);
++		assert.doesNotMatch(entry.when, /picketWsl\.blocked/, `${id} must not be gated`);
 +	}
 +});
 diff --git a/extensions/picket-remote-wsl/test/marketplace.test.js b/extensions/picket-remote-wsl/test/marketplace.test.js
@@ -9161,6 +9310,75 @@ index 00000000..bfcd4e81
 +		await tunnel.dispose();
 +		await closed(echo);
 +	}
++});
+diff --git a/extensions/picket-remote-wsl/test/uninstall.test.js b/extensions/picket-remote-wsl/test/uninstall.test.js
+new file mode 100644
+index 00000000..173bb582
+--- /dev/null
++++ b/extensions/picket-remote-wsl/test/uninstall.test.js
+@@ -0,0 +1,63 @@
++// RED first: this file must fail until src/uninstall.js exists.
++const test = require('node:test');
++const assert = require('node:assert');
++const { OFFICIAL_EXTENSION_ID } = require('../src/official.js');
++const { uninstallOfficialExtension } = require('../src/uninstall.js');
++
++/**
++ * @param {{ extensionPath?: string } | undefined} found
++ * @param {{ throwOn?: string }} [options]
++ */
++function harness(found, options = {}) {
++	/** @type {any[][]} */
++	const calls = [];
++	return {
++		calls,
++		extensions: { get: (/** @type {string} */ id) => (found && id === OFFICIAL_EXTENSION_ID ? { id, extensionPath: found.extensionPath } : undefined) },
++		executeCommand: async (/** @type {string} */ command, ...args) => {
++			calls.push([command, ...args]);
++			if (options.throwOn === command) {
++				throw new Error('workbench refused');
++			}
++		}
++	};
++}
++
++test('uninstalling passes nothing but the extension id to the workbench', async () => {
++	const { calls, ...api } = harness({ extensionPath: 'C:/Users/u/.picket-code/extensions/ms-vscode-remote.remote-wsl-1.104.7' });
++	const result = await uninstallOfficialExtension({ ...api, appRoot: 'C:/Program Files/Picket Code/resources/app' });
++	assert.deepStrictEqual(calls, [['workbench.extensions.uninstallExtension', OFFICIAL_EXTENSION_ID]]);
++	assert.strictEqual(result.status, 'uninstalled');
++});
++
++test('a built-in copy is refused without calling the workbench', async () => {
++	// A build that ships the official extension cannot be fixed by uninstalling
++	// it: the next start puts it back, so the honest answer is "reinstall".
++	const { calls, ...api } = harness({ extensionPath: 'C:/Program Files/Picket Code/resources/app/extensions/ms-vscode-remote.remote-wsl' });
++	const result = await uninstallOfficialExtension({ ...api, appRoot: 'C:/Program Files/Picket Code/resources/app' });
++	assert.strictEqual(result.status, 'builtin');
++	assert.strictEqual(calls.length, 0);
++	assert.match(result.message, /内置/);
++});
++
++test('the built-in check survives the separator and case differences Windows brings', async () => {
++	const { calls, ...api } = harness({ extensionPath: 'c:\\Program Files\\Picket Code\\resources\\app\\extensions\\ms-vscode-remote.remote-wsl' });
++	const result = await uninstallOfficialExtension({ ...api, appRoot: 'C:/Program Files/Picket Code/resources/app/' });
++	assert.strictEqual(result.status, 'builtin');
++	assert.strictEqual(calls.length, 0);
++});
++
++test('already gone is reported as absent, not as an error', async () => {
++	const { calls, ...api } = harness(undefined);
++	const result = await uninstallOfficialExtension({ ...api, appRoot: '/app' });
++	assert.strictEqual(result.status, 'absent');
++	assert.strictEqual(calls.length, 0);
++});
++
++test('a workbench that refuses the uninstall is a failure with its reason', async () => {
++	const { calls, ...api } = harness({ extensionPath: 'C:/Users/u/.picket-code/extensions/ms-vscode-remote.remote-wsl-1.104.7' }, { throwOn: 'workbench.extensions.uninstallExtension' });
++	const result = await uninstallOfficialExtension({ ...api, appRoot: 'C:/Program Files/Picket Code/resources/app' });
++	assert.strictEqual(result.status, 'failed');
++	assert.match(result.message, /workbench refused/);
++	assert.strictEqual(calls.length, 1);
 +});
 diff --git a/extensions/picket-remote-wsl/test/version.test.js b/extensions/picket-remote-wsl/test/version.test.js
 new file mode 100644
