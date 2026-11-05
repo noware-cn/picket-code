@@ -1101,6 +1101,20 @@ Implemented in vscode commits `55e358a2` (three product defects this task found)
 10. `build/wsl/test/fake-wsl-env.test.mjs` pins the fake's environment contract (`PICKET_WSL_FAKE_HOME`, `PICKET_WSL_DISTRO`, `WSLENV`); its first URL resolved one directory too shallow.
 11. Three product fixes fell out of the green run: the distro probe swallowed EPIPE on a child that exits immediately; the start lock created its parent directory first; the payload installer extracts into a sibling temp directory and strips one wrapping top-level directory.
 
+**Post-review round (2026-11-05).** A fresh-context reviewer read the whole M4 surface. Fixed, each with the failing case as the test:
+
+12. `--ui` could pass **without running a single assertion**: the env the suite needs was exported only by `prepare`, and mocha does not fail on an empty selection. `export_accept_env()` is now called by every stage, `--fail-zero` is passed, and both A5/A6 are confirmed in the runner log.
+13. The stdio tunnel — M4's headline — was never exercised here, while the release matrix implied it was. New `--tunnel` stage writes `picket.wsl.tunnelMode: stdio` and re-runs b2–b5 through the relay; green.
+14. The EXIT trap killed the server but not a window left behind by an interrupt, which then held the display and the scratch directory the next stage wipes.
+15. `prepare` ignored its own `cp` failures, so a missing `catalog.json` surfaced as a 180 s timeout. Both copies are checked and `payload()` requires the tarball *and* the catalog before any stage starts.
+16. `print_results` now requires b2–b5 to be present, and the harness writes its results file atomically — a poller must never read half a file.
+17. Window settings are written through `node -e` instead of here-doc interpolation, so a path containing `"` or `\` cannot corrupt them.
+18. The tunnel really did have the EPIPE hazard the distro probe had: `stdin.on('error')` is attached as soon as the pipe is obtained (a test emits the error and fails without the guard). The reviewer's stronger claim — that `pipe()` forwards destination errors — is **wrong**; a 5-line repro raises an unhandled `'error'`.
+19. A failed re-install no longer removes the working payload: the new tree is built beside the old one and swapped in only when complete, and stale `.tmp-*`/`.old` directories are swept on the next install.
+20. `cleanup()` was implemented but unreachable — `组件…` now offers 「清理旧版本」; `caFile` (declared, read by nothing) is gone from the manifest instead of silently doing nothing.
+21. Palette hygiene: `openFolder`'s title carried a duplicated `Picket: ` prefix on top of its category. `wsl --list --online` gained a row so the add-distro flow has something to pick, the dead `--install` branch in the fake is gone, and the smoke suite pins `--locale=en` because A5 clicks a workbench-NLS label.
+22. Docs corrected against the code: no default mirror, no `caFile`, no "cached" distro listing, `~/.local/bin` (not `~/bin`) plus the `PATH` caveat, English palette labels where the titles are English, and the remote view lives in the activity-bar `Remote Explorer` container. The design doc (§ network access) now records that `http.proxy`/`http.proxyStrictSSL`/`caFile` are **not** honoured and points at the file/offline-bundle escape hatch.
+
 ---
 
 ### Task 15: User documentation and release notes ✅
@@ -1199,7 +1213,7 @@ One entry per milestone, committed with the code so a reviewer can see what was 
 
 ### M4 — stdio tunnel, packaging, CLI shim, acceptance, docs (Tasks 11–15): complete
 
-**State (2026-11-04, final run of this branch):** `node --test "test/*.test.js"` in `extensions/picket-remote-wsl` → **159 pass / 0 fail** (15 suites); `node --test "build/wsl/test/*.test.mjs"` → **16 pass / 0 fail**; `tsc -p extensions/picket-remote-wsl/tsconfig.json` (checkJs, no emit) clean; `npm run transpile-client` rc=0; `bash build/check-contract.sh` → all ok; `bash build/wsl/acceptance.sh --all` → PASS l2 / remote (b2–b6) / ui (A5, A6) / lifecycle (20) / icode, exit 0; `bash build/wsl/gate.sh` → **6 passed, 0 failed**. Patch 66 = 232 lines, patch 67 = 53 files / 6881 lines, both reverse-apply onto `vscode/` at `wsl-baseline`.
+**State (2026-11-04, final run of this branch):** `node --test "test/*.test.js"` in `extensions/picket-remote-wsl` → **161 pass / 0 fail** (15 suites); `node --test "build/wsl/test/*.test.mjs"` → **16 pass / 0 fail**; `tsc -p extensions/picket-remote-wsl/tsconfig.json` (checkJs, no emit) clean; `npm run transpile-client` rc=0; `bash build/check-contract.sh` → all ok; `bash build/wsl/acceptance.sh --all` → PASS l2 / remote (b2–b5) / tunnel (b2–b5 over stdio) / ui (A5, A6) / lifecycle (20) / icode, exit 0; `bash build/wsl/gate.sh` → **6 passed, 0 failed**. Patch 66 = 232 lines, patch 67 = 53 files / 6971 lines, both reverse-apply onto `vscode/` at `wsl-baseline`.
 
 **Commits:** vscode `8156133f` (tunnel) → `b2473741` (packaging) → `581ff108` (shim) → `55e358a2` (fixes found by acceptance) → `f8ebff08` (acceptance harness); main repo `66f0899` → `9b372f5` → `a880571` → `801ca4f` → `324b3c6`.
 
