@@ -9,7 +9,7 @@
 
 `showOpenDialog` 是渲染进程之外的 OS 窗口，返回值没有任何可观测 API。
 
-摆现场：在 Windows 上打开 Picket Code，命令面板执行 `Picket: 打开 WSL 文件夹…`，
+摆现场：在 Windows 上打开 Picket Code，命令面板执行 `Picket: Open Folder in WSL…`，
 选择任意发行版。
 
 看什么：
@@ -32,7 +32,7 @@ shim 的写链路有 L2 argv 断言，但只有真实的 Windows 客户端能证
 
 自动化断言的是 `WSL 目标` 这个字符串和树节点存在，不是它长得对不对。
 
-摆现场：任意本地窗口打开 `WSL 目标` 视图（`工作台顶部的远程指示器 → WSL 目标`）。
+摆现场：任意本地窗口打开 `WSL 目标` 视图（活动栏的 `Remote Explorer` 容器里）。
 
 看什么：
 - 视图图标与 Remote 探索器其他部分一致，标题不截断；

@@ -25,14 +25,19 @@ Remote-WSL 扩展，也不需要手工预置服务端。前提只有一个：目
 |---|---|---|
 | 本地文件 | `picket.wsl.serverPayloadPath` | 指向 tar.gz 或离线组件包解开后的 tar.gz；优先级最高，适合内网/无外网 |
 | 随包内嵌 | — | 正式内网版（`PICKET_WSL_PAYLOAD=embedded`）内置载荷，首次零交互 |
-| 下载 | `picket.wsl.serverPayloadBaseUrl` | 默认公网镜像；需要同目录下有 `catalog.json` 与 `SHA256SUMS` |
+| 下载 | `picket.wsl.serverPayloadBaseUrl` | 留空即不联网；填你自己的镜像根地址，扩展按**随包**的 `catalog.json` 校验下载到的文件的 sha256 与大小 |
 
 公开版是**按需下载**（`ondemand`）：首次打开 WSL 文件夹会提示「自动下载 / 从文件
 安装 / 取消」。SHA256 校验不通过一律拒绝安装——不要绕过它。
 
-内网 HTTPS 自签证书：`picket.wsl.caFile` 指向 PEM 文件。
+下载走 Node 的 `fetch`，**不读** VS Code 的 `http.proxy` 设置。需要代理时：用「从文件
+安装」或离线组件包，或在启动 Picket Code 之前设好 `HTTPS_PROXY` 并带 `NODE_USE_ENV_PROXY=1`。
 
-`Picket: 组件…` 可以查看当前装了哪些版本、换来源、清理旧版本。
+内网镜像用自签证书时，扩展按 Node 的默认信任链校验，校验失败就拒绝安装（这是刻意的）；
+这种情况请改用「从文件安装」或离线组件包。
+
+`Picket: 组件…` 可以查看当前装了哪些版本、重新安装、清理旧版本（换来源改
+`picket.wsl.serverPayloadPath` 设置，或用「从文件安装」）。
 
 ## 发行版管理
 
@@ -43,8 +48,8 @@ Remote-WSL 扩展，也不需要手工预置服务端。前提只有一个：目
   安装/设置/卸载（也可以用 `wsl --install` 之类的原生命令，两边等价）。
 - `picket.wsl.defaultDistro`：命令与文件夹对话框默认用哪个发行版；留空用 WSL
   自己的默认值。
-- `Picket: 刷新 WSL 目标`：`wsl --list --verbose` 的输出缓存到视图里，发行版装/删
-  之后点一下即可。
+- `Picket: 刷新 WSL 目标`：视图每次展开都会重新执行 `wsl --list --verbose`，发行版
+  装/删之后点一下即可。
 
 ## 窗口里的终端与 iCode
 
@@ -61,8 +66,10 @@ shell 脚本），服务器启动前会被 source。
 
 ## 命令行
 
-`Picket: 在 WSL 中安装命令行…` 在发行版里放一个 `picket-code` shim（`~/bin`，并把
-它加进 `PATH`）。之后在发行版终端里：
+`Picket: 在 WSL 中安装命令行…` 在发行版里放一个 `picket-code` shim（脚本在
+`~/.picket-code-server/bin/<tag>/`，链接在 `~/.local/bin/picket-code`）。`~/.local/bin`
+必须在该发行版的 `PATH` 里——绝大多数发行版默认如此，若提示 `command not found` 就往
+`~/.profile` 里加一行。之后在发行版终端里：
 
 ```bash
 cd ~/projects/foo
@@ -84,7 +91,7 @@ Open VSX / 自定义地址 / 关闭。
 
 ## 排障
 
-- `Picket: 显示 WSL 日志`：本扩展的输出（`wsl.exe` 调用、载荷安装、服务器启动行）。
+- `Picket: Show WSL Log`：本扩展的输出（`wsl.exe` 调用、载荷安装、服务器启动行）。
 - `Picket: 诊断 WSL 支持`：逐项检查 `wsl.exe` 是否可用、发行版列表、载荷版本、
   运行时文件与端口、连接方式、iCode 检测结果。
 - 连不上时先看运行时的磁盘状态（见下节）：`runtime/<发行版>.json` 里记着
@@ -109,7 +116,8 @@ Open VSX / 自定义地址 / 关闭。
 └── server-env-setup             可选：服务器启动前的钩子脚本
 ```
 
-旧的载荷版本不会自动删；`Picket: 组件…` 里可以清理，或直接 `rm -rf payloads/server-<旧 tag>`。
+旧的载荷版本不会自动删；`Picket: 组件…` → 「清理旧版本」只保留当前版本，或直接
+`rm -rf payloads/server-<旧 tag>`。
 
 ## 停止与清理
 

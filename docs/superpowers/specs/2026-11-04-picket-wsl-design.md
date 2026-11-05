@@ -146,7 +146,7 @@ WSL2 发行版
 2. 内嵌载荷（仅 `embedded` 形态）。
 3. `picket.wsl.serverPayloadBaseUrl`，默认公网镜像（`ondemand` 形态的主要路径）。
 
-网络访问（仅第 3 条用到）遵守 `http.proxy`、`http.proxyStrictSSL`、`picket.wsl.caFile`；默认直连 + 严格 SSL。
+网络访问（仅第 3 条用到）默认直连 + 严格 SSL。**实现偏差（v5 记录）**：下载走 Node `fetch`，不读 `http.proxy`/`http.proxyStrictSSL`，`picket.wsl.caFile` 未实现并从设置里移除；内网自签证书或代理场景改用本地文件/离线组件包，见 `docs/wsl.md`。
 
 **离线组件包**（管理员分发物）：一个 zip，内含 `*.tar.gz` + `SHA256SUMS` + `catalog.json`。用户在"从文件安装…"里选中它即可，零网络、零额外工具。
 

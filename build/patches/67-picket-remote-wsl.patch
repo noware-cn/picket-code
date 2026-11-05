@@ -190,10 +190,10 @@ index 00000000..9b8b5954
 +module.exports = { activate, deactivate };
 diff --git a/extensions/picket-remote-wsl/package.json b/extensions/picket-remote-wsl/package.json
 new file mode 100644
-index 00000000..193694e7
+index 00000000..aa497ddb
 --- /dev/null
 +++ b/extensions/picket-remote-wsl/package.json
-@@ -0,0 +1,311 @@
+@@ -0,0 +1,306 @@
 +{
 +	"name": "picket-remote-wsl",
 +	"displayName": "Picket Remote - WSL",
@@ -223,7 +223,7 @@ index 00000000..193694e7
 +		"commands": [
 +			{
 +				"command": "picket.wsl.openFolder",
-+				"title": "Picket: Open Folder in WSL…",
++				"title": "Open Folder in WSL…",
 +				"category": "Picket"
 +			},
 +			{
@@ -492,11 +492,6 @@ index 00000000..193694e7
 +					],
 +					"default": "auto",
 +					"description": "连接方式：auto 依据 .wslconfig 决定，direct 直连 127.0.0.1，stdio 走本地管道隧道。"
-+				},
-+				"picket.wsl.caFile": {
-+					"type": "string",
-+					"default": "",
-+					"description": "内网 CA 证书路径（PEM），下载载荷时使用。"
 +				}
 +			}
 +		}
@@ -632,10 +627,10 @@ index 00000000..f612ff0a
 +module.exports = { loadCatalog };
 diff --git a/extensions/picket-remote-wsl/src/commands.js b/extensions/picket-remote-wsl/src/commands.js
 new file mode 100644
-index 00000000..4c58be0e
+index 00000000..9f0c090b
 --- /dev/null
 +++ b/extensions/picket-remote-wsl/src/commands.js
-@@ -0,0 +1,449 @@
+@@ -0,0 +1,455 @@
 +'use strict';
 +
 +const { listDistros, distroHome, visibleDistros } = require('./distro.js');
@@ -897,7 +892,8 @@ index 00000000..4c58be0e
 +			return;
 +		}
 +		const home = await distroHomeOf(runner, distro);
-+		const rows = await createComponents({ distro, home }).list();
++		const manager = createComponents({ distro, home, explicitPath: settings.serverPayloadPath || undefined });
++		const rows = await manager.list();
 +		const picked = await host.showQuickPick(
 +			rows.map((/** @type {any} */ row) => ({
 +				label: row.id,
@@ -910,10 +906,15 @@ index 00000000..4c58be0e
 +			return;
 +		}
 +		const row = typeof picked === 'string' ? { id: picked } : picked.row;
-+		const choice = await host.showInformationMessage(`组件 ${row.id}：${row.state ?? '未知'}`, '重新安装', '取消');
++		const choice = await host.showInformationMessage(`组件 ${row.id}：${row.state ?? '未知'}`, '重新安装', '清理旧版本', '取消');
 +		if (choice === '重新安装') {
-+			await install(createComponents({ distro, home, explicitPath: settings.serverPayloadPath || undefined }));
++			await install(manager);
 +			await host.refreshTargets();
++		} else if (choice === '清理旧版本') {
++			const removed = await manager.cleanup(0);
++			await host.showInformationMessage(removed.length > 0
++				? `已清理 ${removed.length} 个旧版本：${removed.join('、')}`
++				: '没有可清理的旧版本');
 +		}
 +	}
 +
@@ -2565,10 +2566,10 @@ index 00000000..5a909a32
 +module.exports = { unpackOfflineBundle, removeBundle, parseSha256Sums, defaultExpand };
 diff --git a/extensions/picket-remote-wsl/src/payload.js b/extensions/picket-remote-wsl/src/payload.js
 new file mode 100644
-index 00000000..68811aba
+index 00000000..8ed26f1a
 --- /dev/null
 +++ b/extensions/picket-remote-wsl/src/payload.js
-@@ -0,0 +1,163 @@
+@@ -0,0 +1,169 @@
 +'use strict';
 +
 +const { createHash, randomBytes } = require('node:crypto');
@@ -2711,7 +2712,7 @@ index 00000000..68811aba
 +	const finalDir = `${payloadRoot}/server-${component.version}`;
 +	const tmpDir = `${payloadRoot}/.tmp-${randomBytes(4).toString('hex')}`;
 +
-+	const prepare = await runner.exec(['-d', distro, '-e', 'sh', '-c', 'mkdir -p "$1" && rm -rf "$2"', 'sh', payloadRoot, tmpDir]);
++	const prepare = await runner.exec(['-d', distro, '-e', 'sh', '-c', 'mkdir -p "$1" && rm -rf "$1"/.tmp-* "$1"/server-*.old', 'sh', payloadRoot]);
 +	if (prepare.code !== 0) {
 +		throw new Error(`Could not prepare ${payloadRoot} in ${distro}: ${prepare.stderr}`);
 +	}
@@ -2720,8 +2721,14 @@ index 00000000..68811aba
 +			// Release archives wrap everything in one top-level directory (packaged
 +			// from the parent); Task 12 bundles are flat. Unwrap when there is
 +			// exactly one entry and it is a directory.
-+			'rm -rf "$1" "$2" && mkdir -p "$1" && tar -xzf - -C "$1" || exit 1; ' +
-+			'if [ "$(ls -1A "$1" | wc -l)" = 1 ] && [ -d "$1/$(ls -1A "$1")" ]; then mv "$1/$(ls -1A "$1")" "$2"; else mv "$1" "$2"; fi; rm -rf "$1"',
++			// The previously installed directory survives until the new tree is
++			// in place, so a failed re-install leaves the server usable.
++			'rm -rf "$1" && mkdir -p "$1" || exit 1; ' +
++			'tar -xzf - -C "$1" || { rm -rf "$1"; exit 1; }; ' +
++			'src="$1"; if [ "$(ls -1A "$1" | wc -l)" = 1 ] && [ -d "$1/$(ls -1A "$1")" ]; then src="$1/$(ls -1A "$1")"; fi; ' +
++			'mv "$2" "$2.old" 2>/dev/null; ' +
++			'mv "$src" "$2" || { rm -rf "$1"; mv "$2.old" "$2" 2>/dev/null; exit 1; }; ' +
++			'rm -rf "$2.old" "$1"',
 +			'sh', tmpDir, finalDir],
 +		{ input: bytes }
 +	);
@@ -3428,10 +3435,10 @@ index 00000000..83dc02a7
 +module.exports = { buildDistroNodes };
 diff --git a/extensions/picket-remote-wsl/src/tunnel.js b/extensions/picket-remote-wsl/src/tunnel.js
 new file mode 100644
-index 00000000..b6882e48
+index 00000000..07f34d81
 --- /dev/null
 +++ b/extensions/picket-remote-wsl/src/tunnel.js
-@@ -0,0 +1,233 @@
+@@ -0,0 +1,239 @@
 +'use strict';
 +
 +const net = require('node:net');
@@ -3535,6 +3542,12 @@ index 00000000..b6882e48
 +				reject(new Error('tunnel child has no stdio pipes'));
 +				return;
 +			}
++			// A relay that dies mid-transfer makes the next write fail with EPIPE;
++			// without a listener that surfaces as an unhandled 'error' event and
++			// takes the extension host down with it. Attached before the preamble
++			// arrives, so the window between spawn and pipe is covered too; the
++			// child's own 'close'/'error' handlers report the failure.
++			stdin.on('error', () => { /* the child is gone; its close handler says so */ });
 +			let settled = false;
 +			let stderr = '';
 +			let buffered = Buffer.alloc(0);
@@ -5240,10 +5253,10 @@ index 00000000..55696e9f
 +});
 diff --git a/extensions/picket-remote-wsl/test/payload.test.js b/extensions/picket-remote-wsl/test/payload.test.js
 new file mode 100644
-index 00000000..bc92a70e
+index 00000000..b6e98993
 --- /dev/null
 +++ b/extensions/picket-remote-wsl/test/payload.test.js
-@@ -0,0 +1,112 @@
+@@ -0,0 +1,150 @@
 +// RED first: this file must fail until src/payload.js exists.
 +const test = require('node:test');
 +const assert = require('node:assert');
@@ -5355,6 +5368,44 @@ index 00000000..bc92a70e
 +	assert.strictEqual(result.payloadDir, join(payloadRoot, `server-${component.version}`));
 +	assert.ok(existsSync(join(result.payloadDir, 'bin', 'picket-code-server')), 'the wrapper directory is stripped');
 +	assert.deepStrictEqual(readdirSync(result.payloadDir).sort(), ['bin', 'product.json'], 'no nesting inside the final directory');
++});
++
++test('a failed re-install leaves the previous payload in place', { skip: process.platform !== 'linux' }, async () => {
++	// The new tree is built beside the old one and swapped in only once it is
++	// complete; a corrupt archive must not cost the user a working server.
++	const { mkdirSync, statSync, existsSync } = require('node:fs');
++	const { execFileSync, spawn } = require('node:child_process');
++	const { sha256OfFile } = require('../src/payload.js');
++	const { createWslRunner } = require('../src/distro.js');
++
++	const dir = mkdtempSync(join(tmpdir(), 'picket-payload-reinstall-'));
++	const home = mkdtempSync(join(tmpdir(), 'picket-payload-home3-'));
++	const payloadRoot = join(home, '.picket-code-server', 'payloads');
++	const runner = createWslRunner({ wslPath: '/bin/sh', spawn: (wslPath, args) => spawn(wslPath, ['-c', 'exec "$@"', '--', ...args.slice(3)]) });
++
++	const goodDir = join(dir, 'good');
++	mkdirSync(join(goodDir, 'bin'), { recursive: true });
++	writeFileSync(join(goodDir, 'bin', 'picket-code-server'), '#!/bin/sh\nexit 0\n');
++	writeFileSync(join(goodDir, 'product.json'), '{}\n');
++	const good = join(dir, 'good.tar.gz');
++	execFileSync('tar', ['-czf', good, '-C', goodDir, 'bin', 'product.json']);
++	const first = await installPayload({
++		runner, distro: 'X', payloadRoot,
++		component: { ...COMPONENT, file: 'good.tar.gz', size: statSync(good).size, sha256: await sha256OfFile(good) },
++		source: { kind: 'file', path: good }
++	});
++	assert.ok(existsSync(join(first.payloadDir, 'bin', 'picket-code-server')));
++
++	const corrupt = join(dir, 'corrupt.tar.gz');
++	writeFileSync(corrupt, 'not a gzip stream');
++	const corruptSha = await sha256OfFile(corrupt);
++	await assert.rejects(() => installPayload({
++		runner, distro: 'X', payloadRoot,
++		component: { ...COMPONENT, file: 'corrupt.tar.gz', size: statSync(corrupt).size, sha256: corruptSha },
++		source: { kind: 'file', path: corrupt }
++	}), /Could not unpack/);
++	assert.deepStrictEqual(readdirSync(payloadRoot), [`server-${COMPONENT.version}`], 'only the working install remains');
++	assert.ok(existsSync(join(payloadRoot, `server-${COMPONENT.version}`, 'bin', 'picket-code-server')), 'the previous install is intact');
 +});
 diff --git a/extensions/picket-remote-wsl/test/preflight.test.js b/extensions/picket-remote-wsl/test/preflight.test.js
 new file mode 100644
@@ -6165,10 +6216,10 @@ index 00000000..864c9d17
 +});
 diff --git a/extensions/picket-remote-wsl/test/tunnel.test.js b/extensions/picket-remote-wsl/test/tunnel.test.js
 new file mode 100644
-index 00000000..22ff350c
+index 00000000..bfcd4e81
 --- /dev/null
 +++ b/extensions/picket-remote-wsl/test/tunnel.test.js
-@@ -0,0 +1,189 @@
+@@ -0,0 +1,222 @@
 +'use strict';
 +
 +const test = require('node:test');
@@ -6358,6 +6409,39 @@ index 00000000..22ff350c
 +		await closed(echo);
 +	}
 +});
++
++test('a relay stdin that errors does not crash the host', async () => {
++	// Without an 'error' listener on the relay's stdin, a write after the child
++	// died raises an unhandled EPIPE and takes the whole extension host with it
++	// (the same defect the distro probe's exec had).
++	const echo = net.createServer(socket => socket.pipe(socket));
++	const address = await listen(echo);
++	const runner = fakeRunner();
++	const tunnel = await createStdioTunnel({
++		runner,
++		distro: 'Ubuntu',
++		serverPort: address.port,
++		nodePath: '/payloads/server-1.0.0/node',
++		log: silentLog
++	});
++
++	const client = net.connect(tunnel.localPort, '127.0.0.1');
++	client.on('error', () => { /* the relay is gone; that is the point */ });
++	try {
++		await once(client, 'connect');
++		// The accepted connection gets its own relay child; the first one was the
++		// bootstrap, already closed with the socket it proved.
++		for (let i = 0; i < 50 && runner.spawned.length < 2; i++) {
++			await new Promise(resolve => setTimeout(resolve, 20));
++		}
++		runner.spawned[runner.spawned.length - 1].stdin.destroy(new Error('write EPIPE'));
++		await new Promise(resolve => setTimeout(resolve, 100));
++	} finally {
++		client.destroy();
++		await tunnel.dispose();
++		await closed(echo);
++	}
++});
 diff --git a/test/automation/src/code.ts b/test/automation/src/code.ts
 index 4c0d9bda..8ff230a3 100644
 --- a/test/automation/src/code.ts
@@ -6393,10 +6477,10 @@ index dda7cb2f..81de7cac 100644
  			if (!extensionsPath) {
 diff --git a/test/smoke/src/areas/wsl/remote.test.ts b/test/smoke/src/areas/wsl/remote.test.ts
 new file mode 100644
-index 00000000..5124e975
+index 00000000..2be699f1
 --- /dev/null
 +++ b/test/smoke/src/areas/wsl/remote.test.ts
-@@ -0,0 +1,165 @@
+@@ -0,0 +1,168 @@
 +/*---------------------------------------------------------------------------------------------
 + *  Copyright (c) Microsoft Corporation. All rights reserved.
 + *  Licensed under the MIT License. See License.txt in the project root for license information.
@@ -6518,6 +6602,9 @@ index 00000000..5124e975
 +				// Isolated user data dir: the settings seeded below must not leak
 +				// into the shared smoke profile other suites run against.
 +				userDataDir: fs.mkdtempSync(path.join(os.tmpdir(), 'vscode-wsl-smoke-')),
++				// The activity-bar label A5 clicks comes from the workbench NLS, so
++				// pin the language instead of depending on the machine's locale.
++				extraArgs: ['--locale=en'],
 +				extraEnv: {
 +					...(opts.extraEnv ?? {}),
 +					PICKET_WSL_RUNNER: FAKE_WSL,
@@ -6586,10 +6673,10 @@ index 02bee7c0..fb0c381a 100644
  	if (!opts.web && !opts.remote && process.env.VSCODE_SMOKE_TEST_POLICY === '1') { setupPolicyTests(logger); }
 diff --git a/test/wsl-harness/fake-wsl.mjs b/test/wsl-harness/fake-wsl.mjs
 new file mode 100755
-index 00000000..38cf0575
+index 00000000..1976546b
 --- /dev/null
 +++ b/test/wsl-harness/fake-wsl.mjs
-@@ -0,0 +1,99 @@
+@@ -0,0 +1,101 @@
 +#!/usr/bin/env node
 +// Stand-in `wsl.exe` for the Linux acceptance runs (plan Task 14). It executes
 +// the extension's distro-side invocations as plain local commands against a
@@ -6624,10 +6711,12 @@ index 00000000..38cf0575
 +	process.exit(0);
 +}
 +if (args[0] === '--list' && args[1] === '--online') {
-+	process.stdout.write('NAME            DESCRIPTION\n');
++	// One row, so the add-distro flow has something to pick. `--install` is not
++	// handled: manage.js runs it in a user terminal, never through this runner.
++	process.stdout.write('NAME            FRIENDLY NAME\nUbuntu          Ubuntu 24.04 LTS\n');
 +	process.exit(0);
 +}
-+if (args[0] === '--set-default' || args[0] === '--unregister' || args[0] === '--install') {
++if (args[0] === '--set-default' || args[0] === '--unregister') {
 +	process.exit(0);
 +}
 +
@@ -6691,10 +6780,10 @@ index 00000000..38cf0575
 +}
 diff --git a/test/wsl-harness/remote/extension.js b/test/wsl-harness/remote/extension.js
 new file mode 100644
-index 00000000..aea74f52
+index 00000000..fcd9ed20
 --- /dev/null
 +++ b/test/wsl-harness/remote/extension.js
-@@ -0,0 +1,152 @@
+@@ -0,0 +1,157 @@
 +'use strict';
 +
 +// Acceptance harness for the WSL remote window (plan Task 14). Loads in the
@@ -6714,7 +6803,7 @@ index 00000000..aea74f52
 +
 +const { execFile } = require('node:child_process');
 +const { createHash, randomBytes } = require('node:crypto');
-+const { mkdir, writeFile } = require('node:fs/promises');
++const { mkdir, rename, writeFile } = require('node:fs/promises');
 +const { homedir } = require('node:os');
 +const { join } = require('node:path');
 +const { promisify } = require('node:util');
@@ -6842,7 +6931,12 @@ index 00000000..aea74f52
 +		console.log(`WSL-ASSERT ${check.ok ? 'ok' : 'fail'} ${name}${check.detail ? `: ${check.detail}` : ''}`);
 +	}
 +	await mkdir(join(RESULTS_FILE, '..'), { recursive: true });
-+	await writeFile(RESULTS_FILE, JSON.stringify(results, null, 2)).catch(() => { });
++	// The runner polls for this file; a reader must never see half of it, so it
++	// is written beside the target and renamed into place.
++	const pending = `${RESULTS_FILE}.${process.pid}.tmp`;
++	await writeFile(pending, JSON.stringify(results, null, 2))
++		.then(() => rename(pending, RESULTS_FILE))
++		.catch(() => { });
 +}
 +
 +exports.activate = main;
