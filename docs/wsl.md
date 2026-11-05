@@ -30,11 +30,24 @@ Remote-WSL 扩展，也不需要手工预置服务端。前提只有一个：目
 公开版是**按需下载**（`ondemand`）：首次打开 WSL 文件夹会提示「自动下载 / 从文件
 安装 / 取消」。SHA256 校验不通过一律拒绝安装——不要绕过它。
 
-下载走 Node 的 `fetch`，**不读** VS Code 的 `http.proxy` 设置。需要代理时：用「从文件
-安装」或离线组件包，或在启动 Picket Code 之前设好 `HTTPS_PROXY` 并带 `NODE_USE_ENV_PROXY=1`。
+### 代理与自签证书
 
-内网镜像用自签证书时，扩展按 Node 的默认信任链校验，校验失败就拒绝安装（这是刻意的）；
-这种情况请改用「从文件安装」或离线组件包。
+下载走扩展自己的 HTTP 客户端（不是 `fetch`，它没法配代理和 CA），因此可以直接吃
+VS Code 的代理设置：
+
+- `http.proxy`：支持 `http://host:port`、`http://user:pass@host:port`、裸 `host:port`，
+  以及 `off` / `direct` / 留空（直连）。`https://` 代理不支持（会明确报错而不是静默直连）。
+- `http.proxyStrictSSL`：设为 `false` 连同证书校验一起关掉；默认严格校验。
+- `picket.wsl.useProxy`：默认 `true`。设为 `false` 则下载永远直连——当 `http.proxy`
+  是给浏览器/扩展市场用的、而镜像在内网直连可达时用这个。
+- `picket.wsl.caFile`：PEM 文件路径，附加到下载时的信任链，用于内网镜像的自签证书。
+  读不到文件会直接报错并指出路径，而不是抛一个语焉不详的 TLS 握手失败。
+
+仍未支持：`no_proxy` / `NO_PROXY` 的按主机排除、PAC 脚本、`https://` 代理。这些场景请
+用「从文件安装」或离线组件包。
+
+不管走哪条路，SHA256 与大小都会按随包的 `catalog.json` 校验，校验失败一律拒绝安装。
+代理凭证只用于 `Proxy-Authorization`，不进日志、不进状态文件。
 
 `Picket: 组件…` 可以查看当前装了哪些版本、重新安装、清理旧版本（换来源改
 `picket.wsl.serverPayloadPath` 设置，或用「从文件安装」）。
@@ -135,6 +148,7 @@ Open VSX / 自定义地址 / 关闭。
   选择），隧道是每窗口一条，重连频繁时开销高于直连。
 - 没有遥测；没有 WSL1 支持；不支持在 WSL 窗口里再开一层远程。
 - 市场来源切换是**构建级**能力（`product.overrides.json`），不是每个扩展单独开关。
+- 下载只支持 HTTP 代理，不支持 `https://` 代理、PAC 与 `no_proxy` 主机排除。
 
 ## 相关文档
 

@@ -9,10 +9,10 @@ index 00000000..96fab092
 +tsconfig.json
 diff --git a/extensions/picket-remote-wsl/extension.js b/extensions/picket-remote-wsl/extension.js
 new file mode 100644
-index 00000000..9b8b5954
+index 00000000..61b62a59
 --- /dev/null
 +++ b/extensions/picket-remote-wsl/extension.js
-@@ -0,0 +1,175 @@
+@@ -0,0 +1,187 @@
 +'use strict';
 +
 +const { join } = require('node:path');
@@ -24,7 +24,7 @@ index 00000000..9b8b5954
 +const { createResolver } = require('./src/resolver.js');
 +const { AUTHORITY_PREFIX, parseAuthority } = require('./src/remoteUri.js');
 +const { buildDistroNodes } = require('./src/tree.js');
-+const { registerCommands } = require('./src/commands.js');
++const { registerCommands, downloadFromSettings } = require('./src/commands.js');
 +const { maybeNudge } = require('./src/nudge.js');
 +
 +/** @param {vscode.ExtensionContext} context */
@@ -46,9 +46,18 @@ index 00000000..9b8b5954
 +		get defaultDistro() { return config().get('defaultDistro', ''); },
 +		get serverPayloadPath() { return config().get('serverPayloadPath', ''); },
 +		get serverPayloadBaseUrl() { return config().get('serverPayloadBaseUrl', ''); },
++		get caFile() { return config().get('caFile', ''); },
++		get useProxy() { return config().get('useProxy', true); },
 +		get icodePath() { return config().get('icodePath', ''); },
 +		get tunnelMode() { return config().get('tunnelMode', 'auto'); },
 +		get startTimeoutSeconds() { return config().get('startTimeoutSeconds', 90); }
++	};
++
++	// VS Code's own proxy settings, read the same way: a user who already routed
++	// the extension host through a proxy gets identical behaviour for payloads.
++	const httpSettings = {
++		get proxy() { return vscode.workspace.getConfiguration('http').get('proxy'); },
++		get proxyStrictSSL() { return vscode.workspace.getConfiguration('http').get('proxyStrictSSL', true); }
 +	};
 +
 +	// Acceptance runs a stand-in `wsl.exe` (test/wsl-harness/fake-wsl.mjs);
@@ -58,10 +67,11 @@ index 00000000..9b8b5954
 +	/**
 +	 * One factory for both the resolver and the command layer: `explicitPath` is
 +	 * how "install from a file I picked" reaches the component manager without
-+	 * writing a setting.
-+	 * @param {{ distro: string, home: string, explicitPath?: string }} target
++	 * writing a setting. `download` comes from the command layer when it has one;
++	 * the resolver path has no caller to ask, so it reads the same settings here.
++	 * @param {{ distro: string, home: string, explicitPath?: string, download?: { proxy?: string, strictSSL?: boolean, caFile?: string } }} target
 +	 */
-+	const createComponents = ({ distro, home, explicitPath }) => createComponentManager({
++	const createComponents = ({ distro, home, explicitPath, download }) => createComponentManager({
 +		catalog,
 +		runner,
 +		distro,
@@ -70,7 +80,8 @@ index 00000000..9b8b5954
 +			explicitPath: explicitPath ?? (settings.serverPayloadPath || undefined),
 +			embeddedDir: catalog.flavor === 'embedded' ? join(context.extensionPath, 'resources', 'wsl-payloads') : undefined,
 +			baseUrl: settings.serverPayloadBaseUrl || undefined
-+		}
++		},
++		download: download ?? downloadFromSettings({ settings, http: httpSettings })
 +	});
 +
 +	const resolver = createResolver({
@@ -168,6 +179,7 @@ index 00000000..9b8b5954
 +		resolver,
 +		memento: context.globalState,
 +		log,
++		http: httpSettings,
 +		appRoot: vscode.env.appRoot,
 +		gallery,
 +		currentFolders: () => vscode.workspace.workspaceFolders ?? [],
@@ -190,10 +202,10 @@ index 00000000..9b8b5954
 +module.exports = { activate, deactivate };
 diff --git a/extensions/picket-remote-wsl/package.json b/extensions/picket-remote-wsl/package.json
 new file mode 100644
-index 00000000..aa497ddb
+index 00000000..6ca8bb7e
 --- /dev/null
 +++ b/extensions/picket-remote-wsl/package.json
-@@ -0,0 +1,306 @@
+@@ -0,0 +1,316 @@
 +{
 +	"name": "picket-remote-wsl",
 +	"displayName": "Picket Remote - WSL",
@@ -466,6 +478,16 @@ index 00000000..aa497ddb
 +					"default": "",
 +					"description": "服务器载荷的下载基址（需同时提供 SHA256SUMS 与 catalog.json）。"
 +				},
++				"picket.wsl.caFile": {
++					"type": "string",
++					"default": "",
++					"description": "内网 HTTPS CA 证书路径（PEM），下载载荷时使用。"
++				},
++				"picket.wsl.useProxy": {
++					"type": "boolean",
++					"default": true,
++					"description": "使用 VS Code 的 `http.proxy` / `http.proxyStrictSSL` 设置下载载荷。"
++				},
 +				"picket.wsl.icodePath": {
 +					"type": "string",
 +					"default": "",
@@ -627,10 +649,10 @@ index 00000000..f612ff0a
 +module.exports = { loadCatalog };
 diff --git a/extensions/picket-remote-wsl/src/commands.js b/extensions/picket-remote-wsl/src/commands.js
 new file mode 100644
-index 00000000..9f0c090b
+index 00000000..d58b4777
 --- /dev/null
 +++ b/extensions/picket-remote-wsl/src/commands.js
-@@ -0,0 +1,455 @@
+@@ -0,0 +1,482 @@
 +'use strict';
 +
 +const { listDistros, distroHome, visibleDistros } = require('./distro.js');
@@ -645,6 +667,29 @@ index 00000000..9f0c090b
 +const SERVER_COMPONENT = 'wsl-server';
 +
 +/**
++ * The payload download knobs, assembled from the two configuration scopes
++ * that own them: `picket.wsl.*` arrives already unwrapped in `settings`, while
++ * `http.proxy` / `http.proxyStrictSSL` are VS Code's own settings and arrive
++ * through `http` (read in `extension.js`, because nothing in `src/` may touch
++ * `vscode`).
++ *
++ * `''` rather than `undefined` when the user turned the proxy off: an empty
++ * setting is the documented way to say "connect directly".
++ * @param {{ settings: any, http?: { proxy?: string, proxyStrictSSL?: boolean } }} options
++ * @returns {{ proxy: string, strictSSL: boolean, caFile: string }}
++ */
++function downloadFromSettings(options) {
++	const { settings, http } = options;
++	const proxy = http?.proxy;
++	return {
++		proxy: settings.useProxy === false || typeof proxy !== 'string' ? '' : proxy,
++		// Certificate validation is only relaxed when the user said so.
++		strictSSL: http?.proxyStrictSSL !== false,
++		caFile: String(settings.caFile ?? '')
++	};
++}
++
++/**
 + * Every command is a workflow over `host`, the narrow slice of `vscode` this
 + * module is allowed to touch, so the whole command layer runs under `node --test`
 + * with no extension host. `extension.js` supplies the real `vscode` bindings.
@@ -653,10 +698,11 @@ index 00000000..9f0c090b
 + *   runner: any,
 + *   settings: any,
 + *   catalog: any,
-+ *   createComponents: (config: { distro: string, home: string, explicitPath?: string }) => any,
++ *   createComponents: (config: { distro: string, home: string, explicitPath?: string, download?: { proxy?: string, strictSSL?: boolean, caFile?: string } }) => any,
 + *   resolver: { stop(distro?: string): Promise<void> },
 + *   memento?: { get(key: string): any, update(key: string, value: any): any },
 + *   log?: { info(...parts: unknown[]): void, error(...parts: unknown[]): void },
++ *   http?: { proxy?: string, proxyStrictSSL?: boolean },
 + *   listDistros?: typeof listDistros,
 + *   distroHome?: typeof distroHome,
 + *   appRoot?: string,
@@ -670,6 +716,9 @@ index 00000000..9f0c090b
 +	const { host, runner, settings, catalog, createComponents, resolver } = options;
 +	const listDistrosOf = options.listDistros ?? listDistros;
 +	const distroHomeOf = options.distroHome ?? distroHome;
++
++	/** Read on every call: a proxy the user edits applies to the next install. */
++	const downloadOptions = () => downloadFromSettings({ settings, http: options.http });
 +
 +	/** @param {string} title */
 +	async function pickDistro(title) {
@@ -725,7 +774,7 @@ index 00000000..9f0c090b
 +			await host.showErrorMessage('这个构建没有 WSL 服务器组件，无法在 WSL 中打开文件夹。');
 +			return false;
 +		}
-+		const manager = createComponents({ distro: target.distro, home: target.home });
++		const manager = createComponents({ distro: target.distro, home: target.home, download: downloadOptions() });
 +		const current = await manager.inspect(SERVER_COMPONENT);
 +		if (current.state === 'installed') {
 +			return true;
@@ -765,12 +814,12 @@ index 00000000..9f0c090b
 +					return false;
 +				}
 +				try {
-+					return await install(createComponents({ distro: target.distro, home: target.home, explicitPath: bundle.payloadPath }));
++					return await install(createComponents({ distro: target.distro, home: target.home, explicitPath: bundle.payloadPath, download: downloadOptions() }));
 +				} finally {
 +					await removeBundle(bundle.dir);
 +				}
 +			}
-+			return install(createComponents({ distro: target.distro, home: target.home, explicitPath: path }));
++			return install(createComponents({ distro: target.distro, home: target.home, explicitPath: path, download: downloadOptions() }));
 +		}
 +		return false;
 +	}
@@ -892,7 +941,7 @@ index 00000000..9f0c090b
 +			return;
 +		}
 +		const home = await distroHomeOf(runner, distro);
-+		const manager = createComponents({ distro, home, explicitPath: settings.serverPayloadPath || undefined });
++		const manager = createComponents({ distro, home, explicitPath: settings.serverPayloadPath || undefined, download: downloadOptions() });
 +		const rows = await manager.list();
 +		const picked = await host.showQuickPick(
 +			rows.map((/** @type {any} */ row) => ({
@@ -1085,13 +1134,13 @@ index 00000000..9f0c090b
 +	return Object.entries(COMMANDS).map(([id, handler]) => options.register(id, handler(api)));
 +}
 +
-+module.exports = { createCommands, registerCommands, COMMANDS, LAST_DISTRO };
++module.exports = { createCommands, registerCommands, downloadFromSettings, COMMANDS, LAST_DISTRO };
 diff --git a/extensions/picket-remote-wsl/src/components.js b/extensions/picket-remote-wsl/src/components.js
 new file mode 100644
-index 00000000..d587fe9c
+index 00000000..98ec9126
 --- /dev/null
 +++ b/extensions/picket-remote-wsl/src/components.js
-@@ -0,0 +1,198 @@
+@@ -0,0 +1,201 @@
 +'use strict';
 +
 +const { readFile, writeFile } = require('node:fs/promises');
@@ -1120,7 +1169,7 @@ index 00000000..d587fe9c
 + * The disk inside the distro is the only source of truth: the Windows-side
 + * cache can be stale or corrupt, and a marker whose hash disagrees with the
 + * catalog means the payload is not the one this build expects.
-+ * @param {{ catalog: any, runner: any, distro: string, home: string, statePath?: string, env?: any, fetchImpl?: typeof fetch, onProgress?: (progress: { downloaded: number, total: number }) => void }} options
++ * @param {{ catalog: any, runner: any, distro: string, home: string, statePath?: string, env?: any, download?: { proxy?: string, strictSSL?: boolean, caFile?: string }, fetchImpl?: typeof fetch, onProgress?: (progress: { downloaded: number, total: number }) => void }} options
 + */
 +function createComponentManager(options) {
 +	const { catalog, runner, distro, home } = options;
@@ -1207,7 +1256,10 @@ index 00000000..d587fe9c
 +		const installed = await installPayload({
 +			runner, distro, component, source, payloadRoot,
 +			fetchImpl: options.fetchImpl,
-+			onProgress: options.onProgress
++			onProgress: options.onProgress,
++			proxy: options.download?.proxy,
++			strictSSL: options.download?.strictSSL,
++			caFile: options.download?.caFile
 +		});
 +		/** @type {IPayloadMarker} */
 +		const marker = {
@@ -1683,6 +1735,385 @@ index 00000000..4b793ee5
 +	distroStatus,
 +	wslStatus
 +};
+diff --git a/extensions/picket-remote-wsl/src/download.js b/extensions/picket-remote-wsl/src/download.js
+new file mode 100644
+index 00000000..3f9029a1
+--- /dev/null
++++ b/extensions/picket-remote-wsl/src/download.js
+@@ -0,0 +1,373 @@
++'use strict';
++
++const http = require('node:http');
++const https = require('node:https');
++const net = require('node:net');
++const tls = require('node:tls');
++
++const MAX_REDIRECTS = 5;
++const PROGRESS_INTERVAL_MS = 100;
++const DEFAULT_TIMEOUT_MS = 60000;
++const REDIRECT_STATUS = new Set([301, 302, 303, 307, 308]);
++
++/** @typedef {(options: any) => import('node:http').ClientRequest} IRequestFunction */
++/** @typedef {{ kind: 'direct' } | { kind: 'proxy', host: string, port: number, auth?: string, protocol: 'http:' } | { kind: 'invalid', reason: string }} IProxy */
++
++/**
++ * `http.proxy` is a free-form string: a URL, a bare `host:port`, or one of the
++ * words that mean "do not proxy". Credentials stay in the returned value so
++ * the caller can build a header; nothing here ever logs them.
++ *
++ * `no_proxy` / `NO_PROXY` matching is deliberately not implemented in v1:
++ * every payload URL goes through the configured proxy, which is what a user
++ * who set a proxy on an intranet expects, and the narrower rule (per-host
++ * exclusions) can be added without changing this signature — hence the
++ * currently unused `targetUrl` parameter.
++ * @param {string | null | undefined} value
++ * @param {string} [targetUrl]
++ * @returns {IProxy}
++ */
++function parseProxySetting(value, targetUrl) {
++	const text = typeof value === 'string' ? value.trim() : '';
++	if (text === '' || /^(off|direct)$/i.test(text)) {
++		return { kind: 'direct' };
++	}
++	// `new URL` would reject a bare `proxy:3128` as a scheme; VS Code accepts it,
++	// so treat anything without `scheme://` as http.
++	let parsed;
++	try {
++		parsed = new URL(/^[a-z][a-z0-9+.-]*:\/\//i.test(text) ? text : `http://${text}`);
++	} catch {
++		return { kind: 'invalid', reason: `not a proxy URL: ${text}` };
++	}
++	if (parsed.protocol !== 'http:') {
++		return { kind: 'invalid', reason: `unsupported proxy protocol ${parsed.protocol}` };
++	}
++	const host = parsed.hostname.replace(/^\[(.*)\]$/, '$1');
++	const port = Number(parsed.port || 80);
++	if (!host) {
++		return { kind: 'invalid', reason: `no proxy host in: ${text}` };
++	}
++	if (!Number.isInteger(port) || port < 1 || port > 65535) {
++		return { kind: 'invalid', reason: `invalid proxy port in: ${text}` };
++	}
++	/** @type {IProxy} */
++	const proxy = { kind: 'proxy', host, port, protocol: 'http:' };
++	if (parsed.username) {
++		proxy.auth = `${decodeURIComponent(parsed.username)}:${decodeURIComponent(parsed.password)}`;
++	}
++	return proxy;
++}
++
++/**
++ * Downloads `url` to a buffer, honouring an HTTP proxy and a custom CA.
++ *
++ * `fetch` cannot be told about either, which is why this exists: intranet
++ * users reach the payload mirror through the same proxy as everything else,
++ * and a self-signed mirror is trusted through `ca` rather than by switching
++ * certificate validation off.
++ * @param {string} url
++ * @param {{
++ *   proxy?: IProxy,
++ *   ca?: Buffer | string | Array<Buffer | string>,
++ *   rejectUnauthorized?: boolean,
++ *   timeoutMs?: number,
++ *   maxBytes?: number,
++ *   onProgress?: (progress: { downloaded: number, total: number }) => void,
++ *   httpRequest?: IRequestFunction,
++ *   httpsRequest?: IRequestFunction
++ * }} [options]
++ * @returns {Promise<Buffer>}
++ */
++async function downloadFile(url, options = {}) {
++	const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
++	let target = new URL(url);
++	for (let hop = 0; hop <= MAX_REDIRECTS; hop += 1) {
++		if (target.protocol !== 'http:' && target.protocol !== 'https:') {
++			throw new Error(`Unsupported URL scheme for download: ${target.protocol}`);
++		}
++		const response = await openResponse(target, options, timeoutMs);
++		const status = response.statusCode ?? 0;
++		const location = response.headers.location;
++		if (REDIRECT_STATUS.has(status) && location) {
++			discard(response);
++			target = new URL(location, target);
++			continue;
++		}
++		if (status < 200 || status >= 300) {
++			discard(response);
++			throw new Error(`Download failed for ${target.href}: HTTP ${status}`);
++		}
++		return collect(response, options.onProgress, options.maxBytes);
++	}
++	throw new Error(`Download failed for ${url}: more than ${MAX_REDIRECTS} redirects`);
++}
++
++/**
++ * The body of a response we are not going to read is destroyed rather than
++ * drained: a redirect or an error page must not cost the bytes it points at.
++ * @param {import('node:http').IncomingMessage} response
++ */
++function discard(response) {
++	response.on('error', () => { });
++	response.destroy();
++}
++
++/**
++ * A redirect target is an arbitrary URL, so it goes back through the whole
++ * loop: a redirect can switch scheme, and each hop re-decides direct versus
++ * proxied.
++ * @param {URL} target
++ * @param {{ proxy?: IProxy, ca?: any, rejectUnauthorized?: boolean, httpRequest?: IRequestFunction, httpsRequest?: IRequestFunction }} options
++ * @param {number} timeoutMs
++ * @returns {Promise<import('node:http').IncomingMessage>}
++ */
++async function openResponse(target, options, timeoutMs) {
++	const proxy = options.proxy?.kind === 'proxy' ? options.proxy : undefined;
++	if (!proxy) {
++		return requestDirect(target, options, timeoutMs);
++	}
++	if (target.protocol === 'http:') {
++		return requestThroughProxy(target, proxy, options, timeoutMs);
++	}
++	const socket = await openTunnel(target, proxy, timeoutMs);
++	// The tunnel is a plain byte pipe; TLS still has to be negotiated with the
++	// target, and only then is the HTTPS client given a socket it can write to.
++	const secure = tls.connect({ ...tlsOptions(target, options), host: target.hostname, port: portOf(target), socket });
++	try {
++		return await requestOverTunnel(target, secure, options, timeoutMs);
++	} catch (error) {
++		secure.destroy();
++		throw error;
++	}
++}
++
++/**
++ * `agent: false` gives every download its own socket with `Connection: close`:
++ * a payload is fetched once, and a lingering keep-alive socket would only keep
++ * the extension host's event loop busy.
++ * @param {URL} target
++ * @param {{ ca?: any, rejectUnauthorized?: boolean, httpRequest?: IRequestFunction, httpsRequest?: IRequestFunction }} options
++ * @param {number} timeoutMs
++ * @returns {Promise<import('node:http').IncomingMessage>}
++ */
++function requestDirect(target, options, timeoutMs) {
++	const secure = target.protocol === 'https:';
++	const requestFn = secure ? (options.httpsRequest ?? https.request) : (options.httpRequest ?? http.request);
++	/** @type {any} */
++	const requestOptions = {
++		host: target.hostname,
++		port: portOf(target),
++		path: pathOf(target),
++		method: 'GET',
++		agent: false,
++		headers: { Accept: '*/*' }
++	};
++	if (secure) {
++		Object.assign(requestOptions, tlsOptions(target, options));
++	}
++	return sendRequest(requestFn, requestOptions, timeoutMs);
++}
++
++/**
++ * Plain `http:` targets travel to the proxy as an absolute-URI request: the
++ * proxy fetches them itself, and there is nothing to negotiate — the payload
++ * is already readable on the wire.
++ * @param {URL} target
++ * @param {{ host: string, port: number, auth?: string }} proxy
++ * @param {{ httpRequest?: IRequestFunction }} options
++ * @param {number} timeoutMs
++ * @returns {Promise<import('node:http').IncomingMessage>}
++ */
++function requestThroughProxy(target, proxy, options, timeoutMs) {
++	return sendRequest(options.httpRequest ?? http.request, {
++		host: proxy.host,
++		port: proxy.port,
++		path: target.href.replace(/#.*$/, ''),
++		method: 'GET',
++		agent: false,
++		headers: {
++			Host: target.host,
++			Accept: '*/*',
++			...proxyAuthHeader(proxy)
++		}
++	}, timeoutMs);
++}
++
++/**
++ * TLS is negotiated with the *target*, not with the proxy: `CONNECT` only
++ * opens a byte pipe, so a proxy never sees the payload and a self-signed
++ * mirror is validated against `ca` exactly as in a direct download.
++ * @param {URL} target
++ * @param {{ host: string, port: number, auth?: string }} proxy
++ * @param {number} timeoutMs
++ * @returns {Promise<net.Socket>}
++ */
++function openTunnel(target, proxy, timeoutMs) {
++	const authority = `${target.hostname}:${portOf(target)}`;
++	return new Promise((resolve, reject) => {
++		const socket = net.connect({ host: proxy.host, port: proxy.port });
++		/** @param {Error} error */
++		const fail = (error) => {
++			socket.destroy();
++			reject(error);
++		};
++		socket.setTimeout(timeoutMs, () => fail(new Error(`Proxy ${proxy.host}:${proxy.port} did not answer CONNECT within ${timeoutMs} ms`)));
++		socket.once('error', fail);
++		socket.once('connect', () => {
++			const headers = [`CONNECT ${authority} HTTP/1.1`, `Host: ${authority}`, ...authHeaderLines(proxy)];
++			socket.write(`${headers.join('\r\n')}\r\n\r\n`);
++		});
++
++		let buffer = Buffer.alloc(0);
++		/** @param {Buffer} chunk */
++		const onData = (chunk) => {
++			buffer = Buffer.concat([buffer, chunk]);
++			const end = buffer.indexOf('\r\n\r\n');
++			if (end < 0) {
++				return;
++			}
++			socket.pause();
++			socket.removeListener('data', onData);
++			const statusLine = buffer.subarray(0, end).toString('latin1').split('\r\n')[0];
++			const status = Number(/^HTTP\/1\.[01] (\d{3})/.exec(statusLine)?.[1] ?? 0);
++			if (status !== 200) {
++				fail(new Error(`Proxy ${proxy.host}:${proxy.port} refused CONNECT ${authority}: ${statusLine}`));
++				return;
++			}
++			const rest = buffer.subarray(end + 4);
++			if (rest.length > 0) {
++				socket.unshift(rest);
++			}
++			socket.setTimeout(0);
++			socket.removeListener('error', fail);
++			resolve(socket);
++		};
++		socket.on('data', onData);
++	});
++}
++
++/**
++ * @param {URL} target
++ * @param {import('node:tls').TLSSocket} socket
++ * @param {{ httpsRequest?: IRequestFunction }} options
++ * @param {number} timeoutMs
++ * @returns {Promise<import('node:http').IncomingMessage>}
++ */
++function requestOverTunnel(target, socket, options, timeoutMs) {
++	const requestFn = options.httpsRequest ?? https.request;
++	// No agent on purpose: node then uses `createConnection` verbatim instead of
++	// opening (and handshaking) a second socket.
++	return sendRequest(requestFn, {
++		host: target.hostname,
++		port: portOf(target),
++		path: pathOf(target),
++		method: 'GET',
++		headers: { Accept: '*/*' },
++		createConnection: () => socket
++	}, timeoutMs);
++}
++
++/**
++ * @param {URL} target
++ * @param {{ ca?: any, rejectUnauthorized?: boolean }} options
++ * @returns {any}
++ */
++function tlsOptions(target, options) {
++	/** @type {any} */
++	const secure = {
++		// An IP literal in SNI is invalid; node uses the socket host otherwise.
++		servername: net.isIP(target.hostname) ? undefined : target.hostname,
++		// Certificate validation stays on unless the user turned
++		// `http.proxyStrictSSL` off: an untrusted mirror must fail loudly.
++		rejectUnauthorized: options.rejectUnauthorized !== false
++	};
++	if (options.ca) {
++		secure.ca = options.ca;
++	}
++	return secure;
++}
++
++/** @param {{ auth?: string }} proxy @returns {Record<string, string>} */
++function proxyAuthHeader(proxy) {
++	return proxy.auth ? { 'Proxy-Authorization': `Basic ${Buffer.from(proxy.auth).toString('base64')}` } : {};
++}
++
++/** @param {{ auth?: string }} proxy @returns {string[]} */
++function authHeaderLines(proxy) {
++	return Object.entries(proxyAuthHeader(proxy)).map(([name, value]) => `${name}: ${value}`);
++}
++
++/** @param {URL} target @returns {number} */
++function portOf(target) {
++	return Number(target.port || (target.protocol === 'https:' ? 443 : 80));
++}
++
++/** @param {URL} target @returns {string} */
++function pathOf(target) {
++	return `${target.pathname}${target.search}`;
++}
++
++/**
++ * A socket timeout is idle time, not total time: a mirror that stalls halfway
++ * through a large payload fails the download instead of hanging the window.
++ * @param {IRequestFunction} requestFn
++ * @param {any} requestOptions
++ * @param {number} timeoutMs
++ * @returns {Promise<import('node:http').IncomingMessage>}
++ */
++function sendRequest(requestFn, requestOptions, timeoutMs) {
++	return new Promise((resolve, reject) => {
++		const request = requestFn(requestOptions);
++		request.setTimeout(timeoutMs, () => {
++			request.destroy(new Error(`Download timed out after ${timeoutMs} ms of inactivity`));
++		});
++		request.on('error', reject);
++		request.on('response', resolve);
++		request.end();
++	});
++}
++
++/**
++ * Reports at most every 100 ms, plus one final call with the real total: a
++ * `content-length` that disagrees with the bytes received must not leave the
++ * progress bar stuck at 99%.
++ *
++ * `maxBytes` is the size the catalog expects: a mirror that answers with more
++ * than that is refused mid-flight rather than buffered to the end.
++ * @param {import('node:http').IncomingMessage} response
++ * @param {((progress: { downloaded: number, total: number }) => void) | undefined} onProgress
++ * @param {number | undefined} [maxBytes]
++ * @returns {Promise<Buffer>}
++ */
++function collect(response, onProgress, maxBytes) {
++	const total = Number(response.headers['content-length'] ?? 0);
++	/** @type {Buffer[]} */
++	const chunks = [];
++	let downloaded = 0;
++	let lastReport = 0;
++	return new Promise((resolve, reject) => {
++		response.on('data', (/** @type {Buffer} */ chunk) => {
++			const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
++			downloaded += buf.length;
++			if (typeof maxBytes === 'number' && downloaded > maxBytes) {
++				response.destroy();
++				reject(new Error(`Download exceeded the expected size of ${maxBytes} bytes`));
++				return;
++			}
++			chunks.push(buf);
++			const now = Date.now();
++			if (onProgress && now - lastReport >= PROGRESS_INTERVAL_MS) {
++				lastReport = now;
++				onProgress({ downloaded, total });
++			}
++		});
++		response.on('end', () => {
++			onProgress?.({ downloaded, total: total || downloaded });
++			resolve(Buffer.concat(chunks));
++		});
++		response.on('error', reject);
++	});
++}
++
++module.exports = { parseProxySetting, downloadFile };
 diff --git a/extensions/picket-remote-wsl/src/icode.js b/extensions/picket-remote-wsl/src/icode.js
 new file mode 100644
 index 00000000..cf40b908
@@ -2566,14 +2997,15 @@ index 00000000..5a909a32
 +module.exports = { unpackOfflineBundle, removeBundle, parseSha256Sums, defaultExpand };
 diff --git a/extensions/picket-remote-wsl/src/payload.js b/extensions/picket-remote-wsl/src/payload.js
 new file mode 100644
-index 00000000..8ed26f1a
+index 00000000..b09007f1
 --- /dev/null
 +++ b/extensions/picket-remote-wsl/src/payload.js
-@@ -0,0 +1,169 @@
+@@ -0,0 +1,245 @@
 +'use strict';
 +
 +const { createHash, randomBytes } = require('node:crypto');
 +const { readFile, stat } = require('node:fs/promises');
++const { downloadFile, parseProxySetting } = require('./download.js');
 +
 +/**
 + * @typedef {{ kind: 'file', path: string } | { kind: 'embedded', path: string } | { kind: 'url', url: string }} ISource
@@ -2652,13 +3084,62 @@ index 00000000..8ed26f1a
 +
 +/**
 + * Downloads a payload, reporting progress without flooding the caller.
++ *
++ * Two paths, and the precedence is deliberate: an injected `fetchImpl` wins
++ * over everything else so tests can stub the network without a server; the
++ * real path is `downloadFile`, which is the only one that understands
++ * proxies and custom CAs. Production never passes `fetchImpl`.
 + * @param {string} url
-+ * @param {{ fetchImpl?: typeof fetch, onProgress?: (progress: { downloaded: number, total: number }) => void }} options
++ * @param {{
++ *   fetchImpl?: typeof fetch,
++ *   proxy?: string,
++ *   strictSSL?: boolean,
++ *   caFile?: string,
++ *   timeoutMs?: number,
++ *   maxBytes?: number,
++ *   onProgress?: (progress: { downloaded: number, total: number }) => void
++ * }} options
 + * @returns {Promise<Buffer>}
 + */
 +async function download(url, options) {
-+	const fetchImpl = options.fetchImpl ?? globalThis.fetch;
-+	const response = await fetchImpl(url);
++	if (options.fetchImpl) {
++		return downloadViaFetch(url, { fetchImpl: options.fetchImpl, onProgress: options.onProgress });
++	}
++	const proxy = parseProxySetting(options.proxy, url);
++	if (proxy.kind === 'invalid') {
++		throw new Error(`The configured HTTP proxy cannot be used for ${url}: ${proxy.reason}`);
++	}
++	return downloadFile(url, {
++		proxy,
++		ca: options.caFile ? await readCaFile(options.caFile) : undefined,
++		rejectUnauthorized: options.strictSSL !== false,
++		timeoutMs: options.timeoutMs,
++		maxBytes: options.maxBytes,
++		onProgress: options.onProgress
++	});
++}
++
++/**
++ * A mistyped CA path must say so here rather than surface later as an opaque
++ * TLS handshake failure.
++ * @param {string} path
++ * @returns {Promise<Buffer>}
++ */
++async function readCaFile(path) {
++	try {
++		return await readFile(path);
++	} catch (error) {
++		throw new Error(`Could not read the CA file ${path}: ${error.message}`);
++	}
++}
++
++/**
++ * @param {string} url
++ * @param {{ fetchImpl: typeof fetch, onProgress?: (progress: { downloaded: number, total: number }) => void }} options
++ * @returns {Promise<Buffer>}
++ */
++async function downloadViaFetch(url, options) {
++	const response = await options.fetchImpl(url);
 +	if (!response.ok) {
 +		throw new Error(`Download failed for ${url}: HTTP ${response.status}`);
 +	}
@@ -2695,14 +3176,40 @@ index 00000000..8ed26f1a
 + *
 + * The archive must be flat at its root (`bin/`, `out/`, `product.json`), which
 + * Task 12 asserts when it packages the payload.
-+ * @param {{ runner: any, distro: string, component: IComponent, source: ISource, payloadRoot: string, fetchImpl?: typeof fetch, onProgress?: (progress: { downloaded: number, total: number }) => void }} options
++ * @param {{
++ *   runner: any,
++ *   distro: string,
++ *   component: IComponent,
++ *   source: ISource,
++ *   payloadRoot: string,
++ *   fetchImpl?: typeof fetch,
++ *   proxy?: string,
++ *   strictSSL?: boolean,
++ *   caFile?: string,
++ *   timeoutMs?: number,
++ *   onProgress?: (progress: { downloaded: number, total: number }) => void
++ * }} options
 + * @returns {Promise<{ payloadDir: string, source: ISource }>}
 + */
 +async function installPayload(options) {
 +	const { runner, distro, component, source, payloadRoot } = options;
 +	const bytes = source.kind === 'url'
-+		? await download(source.url, { fetchImpl: options.fetchImpl, onProgress: options.onProgress })
++		? await download(source.url, {
++			fetchImpl: options.fetchImpl,
++			proxy: options.proxy,
++			strictSSL: options.strictSSL,
++			caFile: options.caFile,
++			timeoutMs: options.timeoutMs,
++			maxBytes: component.size,
++			onProgress: options.onProgress
++		})
 +		: await readFile(source.path);
++
++	// The size the catalog declares is cheap to check and catches a mirror that
++	// serves a different artifact before the (slower) hash does.
++	if (bytes.length !== component.size) {
++		throw new Error(`Size mismatch for ${component.file}: expected ${component.size} bytes, got ${bytes.length}`);
++	}
 +
 +	const actual = sha256OfBuffer(bytes);
 +	if (actual !== component.sha256.toLowerCase()) {
@@ -2738,7 +3245,7 @@ index 00000000..8ed26f1a
 +	return { payloadDir: finalDir, source };
 +}
 +
-+module.exports = { parseSha256Sums, chooseSource, sha256OfFile, installPayload };
++module.exports = { parseSha256Sums, chooseSource, sha256OfFile, download, installPayload };
 diff --git a/extensions/picket-remote-wsl/src/preflight.js b/extensions/picket-remote-wsl/src/preflight.js
 new file mode 100644
 index 00000000..8450e077
@@ -3754,10 +4261,10 @@ index 00000000..350ec874
 +});
 diff --git a/extensions/picket-remote-wsl/test/commands.test.js b/extensions/picket-remote-wsl/test/commands.test.js
 new file mode 100644
-index 00000000..0a8c071d
+index 00000000..e1a530a3
 --- /dev/null
 +++ b/extensions/picket-remote-wsl/test/commands.test.js
-@@ -0,0 +1,261 @@
+@@ -0,0 +1,293 @@
 +// RED first: this file must fail until src/commands.js exists.
 +const test = require('node:test');
 +const assert = require('node:assert');
@@ -3776,7 +4283,7 @@ index 00000000..0a8c071d
 +
 +/**
 + * Everything the command layer touches, minus VS Code itself.
-+ * @param {{ flavor?: 'embedded' | 'ondemand', state?: 'installed' | 'absent', host?: any, fail?: string }} [options]
++ * @param {{ flavor?: 'embedded' | 'ondemand', state?: 'installed' | 'absent', host?: any, fail?: string, http?: { proxy?: string, proxyStrictSSL?: boolean }, settings?: any }} [options]
 + */
 +function harness(options = {}) {
 +	const host = createFakeHost(options.host);
@@ -3824,9 +4331,12 @@ index 00000000..0a8c071d
 +		defaultDistro: '',
 +		serverPayloadPath: '',
 +		serverPayloadBaseUrl: '',
++		caFile: '',
++		useProxy: true,
 +		tunnelMode: 'auto',
 +		icodePath: '',
-+		startTimeoutSeconds: 90
++		startTimeoutSeconds: 90,
++		...options.settings
 +	};
 +	const store = new Map();
 +	const memento = {
@@ -3843,6 +4353,7 @@ index 00000000..0a8c071d
 +		createComponents,
 +		resolver: { async stop(distro) { stopped.push(distro); } },
 +		log: { info() { }, error() { } },
++		http: options.http,
 +		extensionPath: '/ext'
 +	});
 +
@@ -4018,6 +4529,34 @@ index 00000000..0a8c071d
 +	assert.ok(ctx.host.messages.some(message => /已移除 picket-code 命令行/.test(String(message))), `messages: ${ctx.host.messages.join(' | ')}`);
 +	const removed = ctx.calls.find(args => args.join(' ').includes('rm -rf'));
 +	assert.ok(removed && removed.join(' ').includes('/home/u/.local/bin/picket-code'));
++});
++
++test('the install carries VS Code proxy strictness and the CA path', async () => {
++	const ctx = harness({
++		flavor: 'embedded',
++		http: { proxy: 'http://proxy.corp:8080', proxyStrictSSL: false },
++		settings: { caFile: 'C:\\certs\\corp.pem' },
++		host: { quickPick: 'Ubuntu-24.04', openDialog: [{ path: '/home/u/project' }] }
++	});
++	await ctx.commands.openFolder();
++
++	assert.deepStrictEqual(ctx.ensured[0].config.download, {
++		proxy: 'http://proxy.corp:8080',
++		strictSSL: false,
++		caFile: 'C:\\certs\\corp.pem'
++	});
++});
++
++test('turning useProxy off installs directly even when http.proxy is set', async () => {
++	const ctx = harness({
++		flavor: 'embedded',
++		http: { proxy: 'http://proxy.corp:8080' },
++		settings: { useProxy: false },
++		host: { quickPick: 'Ubuntu-24.04', openDialog: [{ path: '/home/u/project' }] }
++	});
++	await ctx.commands.openFolder();
++
++	assert.deepStrictEqual(ctx.ensured[0].config.download, { proxy: '', strictSSL: true, caFile: '' });
 +});
 diff --git a/extensions/picket-remote-wsl/test/components.test.js b/extensions/picket-remote-wsl/test/components.test.js
 new file mode 100644
@@ -4347,6 +4886,443 @@ index 00000000..7d568b2c
 +	});
 +	assert.strictEqual(result.code, 0);
 +});
+diff --git a/extensions/picket-remote-wsl/test/download.test.js b/extensions/picket-remote-wsl/test/download.test.js
+new file mode 100644
+index 00000000..869cc656
+--- /dev/null
++++ b/extensions/picket-remote-wsl/test/download.test.js
+@@ -0,0 +1,431 @@
++'use strict';
++
++const test = require('node:test');
++const assert = require('node:assert');
++const http = require('node:http');
++const https = require('node:https');
++const net = require('node:net');
++const { EventEmitter } = require('node:events');
++const { readFileSync } = require('node:fs');
++const { join } = require('node:path');
++const { parseProxySetting, downloadFile } = require('../src/download.js');
++const { download, installPayload } = require('../src/payload.js');
++const { createHash } = require('node:crypto');
++
++const KEY = readFileSync(join(__dirname, 'fixtures', 'localhost-key.pem'));
++const CERT = readFileSync(join(__dirname, 'fixtures', 'localhost.pem'));
++
++/**
++ * A server that is listening on an ephemeral port and always goes away again:
++ * a test that leaks a socket also leaks the whole `node --test` run.
++ * @param {import('node:net').Server} server
++ * @param {(port: number) => Promise<any>} run
++ */
++async function withServer(server, run) {
++	/** @type {Set<import('node:net').Socket>} */
++	const sockets = new Set();
++	server.on('connection', (socket) => {
++		sockets.add(socket);
++		socket.on('close', () => sockets.delete(socket));
++	});
++	await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
++	const address = /** @type {import('node:net').AddressInfo} */ (server.address());
++	try {
++		return await run(address.port);
++	} finally {
++		for (const socket of sockets) {
++			socket.destroy();
++		}
++		await new Promise((resolve) => server.close(resolve));
++	}
++}
++
++/**
++ * An http server that records what it was asked, so a test can tell a direct
++ * request from an absolute-URI one.
++ * @param {Array<{ url?: string, headers: import('node:http').IncomingHttpHeaders }>} seen
++ * @param {Buffer} body
++ */
++function recordingServer(seen, body) {
++	return http.createServer((request, response) => {
++		seen.push({ url: request.url, headers: request.headers });
++		response.writeHead(200, { 'content-length': String(body.length) });
++		response.end(body);
++	});
++}
++
++/**
++ * A `CONNECT` proxy: it answers the tunnel request and then becomes a dumb
++ * byte pipe to the target, which is all a payload download ever asks of one.
++ * @param {string[]} seen request lines, in arrival order
++ */
++function connectProxy(seen) {
++	return net.createServer((client) => {
++		let buffer = '';
++		/** @param {Buffer} chunk */
++		const onData = (chunk) => {
++			buffer += chunk.toString('latin1');
++			const end = buffer.indexOf('\r\n\r\n');
++			if (end < 0) {
++				return;
++			}
++			client.removeListener('data', onData);
++			const [requestLine] = buffer.slice(0, end).split('\r\n');
++			seen.push(requestLine);
++			const [method, authority] = requestLine.split(' ');
++			if (method !== 'CONNECT') {
++				client.end('HTTP/1.1 405 Method Not Allowed\r\n\r\n');
++				return;
++			}
++			const [host, port] = authority.split(':');
++			const upstream = net.connect({ host, port: Number(port) }, () => {
++				client.write('HTTP/1.1 200 Connection Established\r\n\r\n');
++				client.pipe(upstream);
++				upstream.pipe(client);
++			});
++			upstream.on('error', () => client.destroy());
++			client.on('error', () => upstream.destroy());
++		};
++		client.on('data', onData);
++	});
++}
++
++/**
++ * Stands in for `https.request` when the point of the test is the options
++ * object rather than the bytes: no socket, no certificate, same interface.
++ * @param {any[]} seen
++ * @param {Buffer} body
++ */
++function fakeHttpsRequest(seen, body) {
++	return (/** @type {any} */ options) => {
++		seen.push(options);
++		const request = new EventEmitter();
++		/** @type {any} */ (request).setTimeout = () => request;
++		/** @type {any} */ (request).destroy = (/** @type {any} */ error) => {
++			if (error) {
++				request.emit('error', error);
++			}
++		};
++		/** @type {any} */ (request).end = () => {
++			const response = new EventEmitter();
++			/** @type {any} */ (response).statusCode = 200;
++			/** @type {any} */ (response).headers = { 'content-length': String(body.length) };
++			process.nextTick(() => {
++				request.emit('response', response);
++				// The body must arrive after the caller has attached its own
++				// listeners, which happens in the microtask after `response`.
++				setImmediate(() => {
++					response.emit('data', body);
++					response.emit('end');
++				});
++			});
++		};
++		return request;
++	};
++}
++
++test('parseProxySetting reads the forms VS Code accepts', () => {
++	for (const value of ['', '   ', null, undefined, 'off', 'OFF', 'direct', 'Direct']) {
++		assert.deepStrictEqual(parseProxySetting(value), { kind: 'direct' }, `expected direct for ${JSON.stringify(value)}`);
++	}
++
++	assert.deepStrictEqual(parseProxySetting('http://proxy.corp:8080'), { kind: 'proxy', host: 'proxy.corp', port: 8080, protocol: 'http:' });
++	assert.deepStrictEqual(parseProxySetting('proxy.corp:3128'), { kind: 'proxy', host: 'proxy.corp', port: 3128, protocol: 'http:' });
++	assert.deepStrictEqual(parseProxySetting('http://proxy.corp'), { kind: 'proxy', host: 'proxy.corp', port: 80, protocol: 'http:' });
++	assert.deepStrictEqual(parseProxySetting('http://user:pa%40ss@proxy.corp:8080'), {
++		kind: 'proxy', host: 'proxy.corp', port: 8080, auth: 'user:pa@ss', protocol: 'http:'
++	});
++	assert.deepStrictEqual(parseProxySetting('[::1]:3128'), { kind: 'proxy', host: '::1', port: 3128, protocol: 'http:' });
++});
++
++test('parseProxySetting rejects what it cannot use', () => {
++	const socks = parseProxySetting('socks5://proxy.corp:1080');
++	assert.strictEqual(socks.kind, 'invalid');
++	assert.match(socks.reason, /unsupported proxy protocol socks5:/);
++
++	const https = parseProxySetting('https://proxy.corp:8080');
++	assert.strictEqual(https.kind, 'invalid', 'an https proxy would need a TLS connection to the proxy itself');
++
++	const port = parseProxySetting('http://proxy.corp:0');
++	assert.strictEqual(port.kind, 'invalid');
++	assert.match(port.reason, /invalid proxy port/);
++
++	const garbage = parseProxySetting('not a url');
++	assert.strictEqual(garbage.kind, 'invalid');
++});
++
++test('a direct http download returns the body', async () => {
++	const body = Buffer.from('payload-bytes');
++	const server = recordingServer([], body);
++	const bytes = await withServer(server, (port) => downloadFile(`http://127.0.0.1:${port}/picket-code-server.tar.gz`));
++	assert.deepStrictEqual(bytes, body);
++});
++
++test('a body larger than the catalog size is refused mid-flight', async () => {
++	const server = http.createServer((request, response) => {
++		response.writeHead(200, { 'content-length': String(4096) });
++		let written = 0;
++		const timer = setInterval(() => {
++			response.write(Buffer.alloc(256, 1));
++			written += 1;
++			if (written === 16) {
++				clearInterval(timer);
++				response.end();
++			}
++		}, 5);
++		// The client hangs up on purpose; writing into the dead socket is expected.
++		response.on('error', () => { });
++		response.on('close', () => clearInterval(timer));
++	});
++	await assert.rejects(
++		() => withServer(server, (port) => downloadFile(`http://127.0.0.1:${port}/big`, { maxBytes: 512 })),
++		/Download exceeded the expected size of 512 bytes/);
++});
++
++test('progress is throttled and ends with the real total', async () => {
++	const chunks = 12;
++	const chunk = Buffer.alloc(1024, 7);
++	const total = chunks * chunk.length;
++	const server = http.createServer((request, response) => {
++		response.writeHead(200, { 'content-length': String(total) });
++		let written = 0;
++		const timer = setInterval(() => {
++			response.write(chunk);
++			written += 1;
++			if (written === chunks) {
++				clearInterval(timer);
++				response.end();
++			}
++		}, 25);
++	});
++	/** @type {Array<{ downloaded: number, total: number, at: number }>} */
++	const reports = [];
++	await withServer(server, (port) => downloadFile(`http://127.0.0.1:${port}/slow`, {
++		onProgress: ({ downloaded, total }) => reports.push({ downloaded, total, at: Date.now() })
++	}));
++
++	assert.ok(reports.length >= 2, `expected several reports, got ${reports.length}`);
++	assert.deepStrictEqual(reports.at(-1), { downloaded: total, total, at: /** @type {any} */ (reports.at(-1)).at });
++	for (let index = 1; index < reports.length - 1; index += 1) {
++		assert.ok(reports[index].at - reports[index - 1].at >= 100, `report ${index} came less than 100 ms after the previous one`);
++	}
++	assert.ok(reports.every(report => report.total === total), 'every report knows the content length');
++});
++
++test('redirects are followed and counted', async () => {
++	const body = Buffer.from('redirected');
++	const server = http.createServer((request, response) => {
++		if (request.url === '/start') {
++			response.writeHead(302, { location: '/middle' });
++			response.end();
++		} else if (request.url === '/middle') {
++			response.writeHead(301, { location: `http://127.0.0.1:${request.socket.localPort}/end` });
++			response.end();
++		} else {
++			response.writeHead(200, { 'content-length': String(body.length) });
++			response.end(body);
++		}
++	});
++	const bytes = await withServer(server, (port) => downloadFile(`http://127.0.0.1:${port}/start`));
++	assert.deepStrictEqual(bytes, body);
++});
++
++test('more than five redirects fail instead of looping', async () => {
++	const server = http.createServer((request, response) => {
++		response.writeHead(302, { location: request.url === '/' ? '/again' : request.url });
++		response.end();
++	});
++	await withServer(server, async (port) => {
++		await assert.rejects(() => downloadFile(`http://127.0.0.1:${port}/`), /more than 5 redirects/);
++	});
++});
++
++test('a non-2xx status fails the download', async () => {
++	const server = http.createServer((request, response) => {
++		response.writeHead(404, { 'content-type': 'text/plain' });
++		response.end('not here');
++	});
++	await withServer(server, async (port) => {
++		await assert.rejects(() => downloadFile(`http://127.0.0.1:${port}/missing`), /HTTP 404/);
++	});
++});
++
++test('an http target travels to the proxy as an absolute-URI request', async () => {
++	const body = Buffer.from('through-the-proxy');
++	/** @type {Array<{ url?: string, headers: import('node:http').IncomingHttpHeaders }>} */
++	const seen = [];
++	const proxy = recordingServer(seen, body);
++	await withServer(proxy, async (port) => {
++		const bytes = await downloadFile('http://mirror.corp/wsl/payload.tar.gz', {
++			proxy: parseProxySetting(`127.0.0.1:${port}`)
++		});
++		assert.deepStrictEqual(bytes, body);
++	});
++	assert.strictEqual(seen.length, 1);
++	assert.strictEqual(seen[0].url, 'http://mirror.corp/wsl/payload.tar.gz');
++	assert.strictEqual(seen[0].headers.host, 'mirror.corp');
++	assert.strictEqual(seen[0].headers['proxy-authorization'], undefined, 'no header without credentials');
++});
++
++test('proxy credentials become a basic Proxy-Authorization header', async () => {
++	const body = Buffer.from('ok');
++	/** @type {Array<{ url?: string, headers: import('node:http').IncomingHttpHeaders }>} */
++	const seen = [];
++	const proxy = recordingServer(seen, body);
++	await withServer(proxy, async (port) => {
++		await downloadFile('http://mirror.corp/wsl/payload.tar.gz', {
++			proxy: parseProxySetting(`http://user:secret@127.0.0.1:${port}`)
++		});
++	});
++	const header = seen[0].headers['proxy-authorization'];
++	assert.strictEqual(header, `Basic ${Buffer.from('user:secret').toString('base64')}`);
++});
++
++test('an https target is tunnelled through CONNECT and the proxy never sees the TLS', async () => {
++	const body = Buffer.from('tls-behind-a-proxy');
++	const target = https.createServer({ key: KEY, cert: CERT }, (request, response) => {
++		response.writeHead(200, { 'content-length': String(body.length) });
++		response.end(body);
++	});
++	/** @type {string[]} */
++	const tunnels = [];
++	await withServer(target, async (targetPort) => {
++		await withServer(connectProxy(tunnels), async (proxyPort) => {
++			const bytes = await downloadFile(`https://localhost:${targetPort}/payload.tar.gz`, {
++				proxy: parseProxySetting(`127.0.0.1:${proxyPort}`),
++				ca: CERT
++			});
++			assert.deepStrictEqual(bytes, body);
++		});
++	});
++	assert.deepStrictEqual(tunnels.length, 1);
++	assert.match(tunnels[0], /^CONNECT localhost:\d+ HTTP\/1\.1$/);
++});
++
++test('a proxy that refuses CONNECT reports the proxy status line', async () => {
++	const refusing = net.createServer((client) => {
++		client.once('data', () => client.write('HTTP/1.1 403 Forbidden\r\n\r\n'));
++	});
++	await withServer(refusing, async (port) => {
++		await assert.rejects(
++			() => downloadFile('https://mirror.corp/payload.tar.gz', { proxy: parseProxySetting(`127.0.0.1:${port}`) }),
++			/refused CONNECT mirror\.corp:443: HTTP\/1\.1 403 Forbidden/
++		);
++	});
++});
++
++test('a custom CA is trusted and an unknown certificate is still rejected', async () => {
++	const body = Buffer.from('self-signed-mirror');
++	const target = https.createServer({ key: KEY, cert: CERT }, (request, response) => {
++		response.writeHead(200, { 'content-length': String(body.length) });
++		response.end(body);
++	});
++	await withServer(target, async (port) => {
++		const bytes = await downloadFile(`https://localhost:${port}/payload.tar.gz`, { ca: CERT });
++		assert.deepStrictEqual(bytes, body);
++
++		const error = await downloadFile(`https://localhost:${port}/payload.tar.gz`).then(() => undefined, (/** @type {any} */ reason) => reason);
++		assert.ok(error, 'validation must not be off by default');
++		assert.match(String(error.code ?? error.message), /CERT|SELF_SIGNED|UNABLE/);
++	});
++});
++
++test('ca and rejectUnauthorized reach the TLS options', async () => {
++	/** @type {any[]} */
++	const seen = [];
++	const ca = Buffer.from('-----BEGIN CERTIFICATE-----\nnot-really\n-----END CERTIFICATE-----\n');
++	await downloadFile('https://mirror.corp/payload.tar.gz', { ca, httpsRequest: fakeHttpsRequest(seen, Buffer.from('x')) });
++	assert.strictEqual(seen.length, 1);
++	assert.strictEqual(seen[0].ca, ca);
++	assert.strictEqual(seen[0].rejectUnauthorized, true);
++	assert.strictEqual(seen[0].host, 'mirror.corp');
++	assert.strictEqual(seen[0].path, '/payload.tar.gz');
++
++	seen.length = 0;
++	await downloadFile('https://mirror.corp/payload.tar.gz', {
++		rejectUnauthorized: false,
++		httpsRequest: fakeHttpsRequest(seen, Buffer.from('x'))
++	});
++	assert.strictEqual(seen[0].rejectUnauthorized, false);
++});
++
++test('a stalled socket times out instead of hanging the window', async () => {
++	const server = http.createServer(() => {
++		// Accept the request and never answer.
++	});
++	await withServer(server, async (port) => {
++		await assert.rejects(() => downloadFile(`http://127.0.0.1:${port}/stall`, { timeoutMs: 100 }), /timed out/);
++	});
++});
++
++test('payload.download prefers an injected fetchImpl over proxy and CA settings', async () => {
++	let asked;
++	const fetchImpl = async (/** @type {string} */ url) => {
++		asked = String(url);
++		return {
++			ok: true,
++			status: 200,
++			headers: { get: () => null },
++			body: null,
++			arrayBuffer: async () => new Uint8Array([120, 121, 122]).buffer
++		};
++	};
++	const bytes = await download('https://mirror.corp/x', {
++		fetchImpl: /** @type {any} */ (fetchImpl),
++		proxy: 'socks5://unusable:1',
++		caFile: '/definitely/not/a/file.pem'
++	});
++	assert.strictEqual(asked, 'https://mirror.corp/x');
++	assert.deepStrictEqual(bytes, Buffer.from('xyz'));
++});
++
++test('payload.download reports an unusable proxy and a missing CA file', async () => {
++	await assert.rejects(() => download('http://mirror.corp/x', { proxy: 'socks5://proxy:1080' }), /cannot be used/);
++	await assert.rejects(() => download('https://mirror.corp/x', { caFile: '/definitely/not/a/ca.pem' }), /Could not read the CA file/);
++});
++
++test('payload.download uses the configured proxy and CA', async () => {
++	const body = Buffer.from('payload-through-the-proxy');
++	/** @type {Array<{ url?: string, headers: import('node:http').IncomingHttpHeaders }>} */
++	const seen = [];
++	const proxy = recordingServer(seen, body);
++	await withServer(proxy, async (port) => {
++		const bytes = await download('http://mirror.corp/payload.tar.gz', {
++			proxy: `127.0.0.1:${port}`,
++			caFile: join(__dirname, 'fixtures', 'localhost.pem')
++		});
++		assert.deepStrictEqual(bytes, body);
++	});
++	assert.strictEqual(seen[0].url, 'http://mirror.corp/payload.tar.gz');
++});
++
++test('installPayload verifies bytes it fetched through the proxy', async () => {
++	const body = Buffer.from('a payload the installer would untar');
++	const sha256 = createHash('sha256').update(body).digest('hex');
++	const component = {
++		id: 'wsl-server', kind: 'server', version: 'v1.0.0',
++		file: 'picket-code-server-v1.0.0-linux-x64.tar.gz', size: body.length, sha256, embedded: false
++	};
++	/** @type {Array<{ url?: string, headers: import('node:http').IncomingHttpHeaders }>} */
++	const seen = [];
++	const proxy = recordingServer(seen, body);
++	/** @type {Array<{ args: any[], input?: Buffer }>} */
++	const calls = [];
++	const runner = {
++		exec: async (/** @type {any[]} */ args, /** @type {any} */ opts) => {
++			calls.push({ args, input: opts?.input });
++			return { code: 0, stdout: '', stderr: '' };
++		}
++	};
++
++	await withServer(proxy, async (port) => {
++		const result = await installPayload({
++			runner, distro: 'D', component, source: { kind: 'url', url: `http://mirror.corp/${component.file}` },
++			payloadRoot: '/home/u/.picket-code-server/payloads', proxy: `127.0.0.1:${port}`
++		});
++		assert.strictEqual(result.payloadDir, `/home/u/.picket-code-server/payloads/server-${component.version}`);
++	});
++	assert.strictEqual(seen[0].url, `http://mirror.corp/${component.file}`);
++	assert.strictEqual(calls.length, 2, 'the archive was verified and then unpacked');
++	assert.deepStrictEqual(calls[1].input, body, 'tar receives exactly the bytes the proxy returned');
++});
 diff --git a/extensions/picket-remote-wsl/test/fixtures/fake-host.js b/extensions/picket-remote-wsl/test/fixtures/fake-host.js
 new file mode 100644
 index 00000000..8de906e0
@@ -4585,6 +5561,65 @@ index 00000000..ac0353a7
 +	process.stderr.write(`fake-wsl: unsupported arguments: ${args.join(' ')}\r\n`);
 +	process.exit(1);
 +}
+diff --git a/extensions/picket-remote-wsl/test/fixtures/localhost-key.pem b/extensions/picket-remote-wsl/test/fixtures/localhost-key.pem
+new file mode 100644
+index 00000000..a7246be2
+--- /dev/null
++++ b/extensions/picket-remote-wsl/test/fixtures/localhost-key.pem
+@@ -0,0 +1,28 @@
++-----BEGIN PRIVATE KEY-----
++MIIEvAIBADANBgkqhkiG9w0BAQEFAASCBKYwggSiAgEAAoIBAQC0a1IPp8I6kYlO
++TpV+0oA4DQ0eedzzlMTYSojKtyUujWeJazeppOnRqBcq5vaoNexLFPisvOjUxt+o
++9k9+j10dSFtvAVM4nu/NKm7sfAzv+1D6r2nTx75WYrHA3TMkQaVYSPsFDnExm9W6
++087x4rv2hie7cDWYFlQzEbZrzJ5iCSmJu0FzwAtAQr6RlLLIa/h/nOdo49FGRBXN
++WvseuKU3RwzJj4Z/aL1NWMtnzmgDndDhfuhf2wLeASI58jc/1DC0R2TlCbZLGZRe
++B3i0uiQ2OL/Ma345avxoLosL5iwDPk7m0eWAxiNi3P3q2VF63udkUFGkKVQB62rz
++SXvM4C89AgMBAAECggEABI4jQ3NIeuG5u97NkGb7+Wm+qLrccWKt8hLJHU8niaNS
++adyOHLCTopcI15F+7W/RGXMy/kZe5rJmmQf34DUxFES6PWeSxHD03DxISS7lV7nx
++bct37wUIpbF/uez5iGe05x8g4VwfqrqE6rExtQT04+MlmAXSt3G0mE+jWrTqeKnK
++sfIjszCGx5wUMIgAddbqrUU+xwIXonqGfTa20kPxBOsan5tGnMeaMHoXGqmNnl7W
++R+r/yRYSk9suZ4Hqh/we6JmgwGz67ImQlJ9bol7uOa/EsIfXuT0Ruhzo5Ar5+AoS
++3lOfb6hfdq4ifOf+4fOBOrJZGg+vtKKXHs7CtkYPMQKBgQDy9hMM898d+R2PTOxT
++0Vbywo2XvC9HKy92P3rMJA4STz6TfArgQeuq3HIYm5kycUWP4clMtVtI/v6X9Klf
++Shuls9i6098rean5zaoifjc3bYVFoCq/yhQCK496O6WK0vGzsq7xhGkakf5g7Lnk
++d7w8yS824g2EJEydeNfklM0l0QKBgQC+GgMWXM0W9odR+R9pqMzE3N7x7HS+FuDo
++81dmoRR/PxK6Z4JIpDIaFN69gtrrIimmn1Apjr/74NORCxRbV8pzbdd9Fkkazw/O
++pqzDoZ+akEmBzpdmJGFapmP/efW2smO6XbeKrUjz5jt8nNgWDidt2DCzb2XOaZnH
++dz8Orf7RrQKBgAJtoS0c9trm1XvMKgSAcB0HAsFEeTh93wCQi9qkdZuLPTXeJIGv
++RvqzL1S9oV9WsHpKqGdi3KGzIrpEELlKFVKnpH/hhDZ8Bc3gV1X26vhb2NwkSKkY
++DPEknE99bx8fEplYLNVvHFnOobs4QnddFv2IiTdENRxf/IAKaCX5sr8xAoGARAVW
++uXe3QtIvlVtIrCvkKUTG2VW8aBATpgb8bRKSHP3am6xR5+AotUBmevUJlD0DHkW/
++Dz+u3leSHEIUpKKDJE5XXsDMo7UXeOAWzWFVlJ6wTqw3bCr0UtVazp07GIY4PQUv
++mYVrpynoeyw7/ZhO73T96BaiHPuYNNEsVPpZRXkCgYBGlForPk+vhIyxEJjauQmB
++JMExdwzyX0h/cmYpD98ACcsaryUGE17mUrZ7yCN3OwCq8oOVfmzg6KgsfXhafx7I
++jjYJ9tErTPJ1ymZAi6l4xry9HuEBLd3bP2viju/0Rf6FMVyQIyCB2LUhCH68aHBi
++lMKnU+NrKNcHMphJ48pNxA==
++-----END PRIVATE KEY-----
+diff --git a/extensions/picket-remote-wsl/test/fixtures/localhost.pem b/extensions/picket-remote-wsl/test/fixtures/localhost.pem
+new file mode 100644
+index 00000000..1808e11d
+--- /dev/null
++++ b/extensions/picket-remote-wsl/test/fixtures/localhost.pem
+@@ -0,0 +1,19 @@
++-----BEGIN CERTIFICATE-----
++MIIDJTCCAg2gAwIBAgIUCVtvzmJpycfGH/k3SZef9Z3nVoAwDQYJKoZIhvcNAQEL
++BQAwFDESMBAGA1UEAwwJbG9jYWxob3N0MB4XDTI2MTEwNTAxNTIzOVoXDTM2MTEw
++MjAxNTIzOVowFDESMBAGA1UEAwwJbG9jYWxob3N0MIIBIjANBgkqhkiG9w0BAQEF
++AAOCAQ8AMIIBCgKCAQEAtGtSD6fCOpGJTk6VftKAOA0NHnnc85TE2EqIyrclLo1n
++iWs3qaTp0agXKub2qDXsSxT4rLzo1MbfqPZPfo9dHUhbbwFTOJ7vzSpu7HwM7/tQ
+++q9p08e+VmKxwN0zJEGlWEj7BQ5xMZvVutPO8eK79oYnu3A1mBZUMxG2a8yeYgkp
++ibtBc8ALQEK+kZSyyGv4f5znaOPRRkQVzVr7HrilN0cMyY+Gf2i9TVjLZ85oA53Q
++4X7oX9sC3gEiOfI3P9QwtEdk5Qm2SxmUXgd4tLokNji/zGt+OWr8aC6LC+YsAz5O
++5tHlgMYjYtz96tlRet7nZFBRpClUAetq80l7zOAvPQIDAQABo28wbTAdBgNVHQ4E
++FgQUEAdnpWGibm3CzTvivCbusRVGHF8wHwYDVR0jBBgwFoAUEAdnpWGibm3CzTvi
++vCbusRVGHF8wGgYDVR0RBBMwEYIJbG9jYWxob3N0hwR/AAABMA8GA1UdEwEB/wQF
++MAMBAf8wDQYJKoZIhvcNAQELBQADggEBAKmXg9+hVR9tOqP5qvPhtmCARRWjc0oH
++ba88rHTd8gZanJ/WQuZQrx+ktyeBJKsHnrjMg6O752FCpx4cpzD4A6CZxEoO1cZE
++X/i75Bfs3fAF4QF4q1iS12qnU0yMiw1CgR9D6uhcHcu5qTNzVnIIuW5z1ktvwUtX
++M37ULCwd3wtS/1Dxqklf7Ma3SQPIZ2f6K46Hlxver8IYy91hplWv4QiTsjoiq986
++KtkavbCr55wwaZYFeU3w3MzNxXpagDGr41582SVK5nn0sKC8RDJHv84FQ3k/yy3i
++w6xrFyYFbZKwhM+hs7bzNifqkTGeH2574Djcojrl38cCH1w2BgUZB0M=
++-----END CERTIFICATE-----
 diff --git a/extensions/picket-remote-wsl/test/icode.test.js b/extensions/picket-remote-wsl/test/icode.test.js
 new file mode 100644
 index 00000000..5e31eaaa
@@ -4890,7 +5925,7 @@ index 00000000..118dde5d
 +});
 diff --git a/extensions/picket-remote-wsl/test/manifest.test.js b/extensions/picket-remote-wsl/test/manifest.test.js
 new file mode 100644
-index 00000000..dfb4be44
+index 00000000..556fdc3c
 --- /dev/null
 +++ b/extensions/picket-remote-wsl/test/manifest.test.js
 @@ -0,0 +1,68 @@
@@ -4944,7 +5979,7 @@ index 00000000..dfb4be44
 +
 +test('the only file that imports vscode is the one that can', () => {
 +	// log.js is the one vscode-bound helper: it owns an OutputChannel.
-+	const sources = ['catalog.js', 'distro.js', 'components.js', 'payload.js', 'launch.js', 'probe.js',
++	const sources = ['catalog.js', 'distro.js', 'components.js', 'payload.js', 'download.js', 'launch.js', 'probe.js',
 +		'remoteUri.js', 'resolver.js', 'icode.js', 'preflight.js', 'tree.js', 'manage.js', 'diagnose.js',
 +		'nudge.js', 'commands.js', 'marketplace.js', 'offline.js', 'shim.js'];
 +	for (const name of sources) {
@@ -5253,10 +6288,10 @@ index 00000000..55696e9f
 +});
 diff --git a/extensions/picket-remote-wsl/test/payload.test.js b/extensions/picket-remote-wsl/test/payload.test.js
 new file mode 100644
-index 00000000..b6e98993
+index 00000000..18915bc4
 --- /dev/null
 +++ b/extensions/picket-remote-wsl/test/payload.test.js
-@@ -0,0 +1,150 @@
+@@ -0,0 +1,163 @@
 +// RED first: this file must fail until src/payload.js exists.
 +const test = require('node:test');
 +const assert = require('node:assert');
@@ -5291,11 +6326,24 @@ index 00000000..b6e98993
 +test('a checksum mismatch aborts and leaves no payload directory', async () => {
 +	const dir = mkdtempSync(join(tmpdir(), 'picket-payload-'));
 +	const file = join(dir, 'bad.tar.gz');
-+	writeFileSync(file, 'nope');
++	writeFileSync(file, 'abc');
 +	const calls = [];
 +	const runner = { exec: async (args) => { calls.push(args.join(' ')); return { code: 0, stdout: '', stderr: '' }; } };
 +	await assert.rejects(() => installPayload({ runner, distro: 'D', component: { ...COMPONENT, sha256: 'c'.repeat(64) },
 +		source: { kind: 'file', path: file }, payloadRoot: '/home/u/.picket-code-server/payloads', onProgress: () => { } }), /checksum mismatch/i);
++	assert.deepStrictEqual(calls, []);
++});
++
++test('a size that disagrees with the catalog aborts before hashing', async () => {
++	const dir = mkdtempSync(join(tmpdir(), 'picket-payload-'));
++	const file = join(dir, 'short.tar.gz');
++	writeFileSync(file, 'abcd');
++	const sha = createHash('sha256').update('abcd').digest('hex');
++	const calls = [];
++	const runner = { exec: async (args) => { calls.push(args.join(' ')); return { code: 0, stdout: '', stderr: '' }; } };
++	await assert.rejects(() => installPayload({ runner, distro: 'D', component: { ...COMPONENT, sha256: sha },
++		source: { kind: 'file', path: file }, payloadRoot: '/home/u/.picket-code-server/payloads' }),
++	/Size mismatch for .*: expected 3 bytes, got 4/);
 +	assert.deepStrictEqual(calls, []);
 +});
 +

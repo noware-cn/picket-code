@@ -146,7 +146,7 @@ WSL2 发行版
 2. 内嵌载荷（仅 `embedded` 形态）。
 3. `picket.wsl.serverPayloadBaseUrl`，默认公网镜像（`ondemand` 形态的主要路径）。
 
-网络访问（仅第 3 条用到）默认直连 + 严格 SSL。**实现偏差（v5 记录）**：下载走 Node `fetch`，不读 `http.proxy`/`http.proxyStrictSSL`，`picket.wsl.caFile` 未实现并从设置里移除；内网自签证书或代理场景改用本地文件/离线组件包，见 `docs/wsl.md`。
+第 3 条的网络访问默认直连 + 严格 SSL。代理与私有 CA 已在 v1 实现（原计划记为「已知限制」，2026-11-04 追加）：`picket.wsl.useProxy`（默认 true）开启时读 VS Code 的 `http.proxy`（支持 `http://host:port`、`http://user:pass@host:port`、裸 `host:port`、`off`/`direct`/空，`https://` 代理明确报错）与 `http.proxyStrictSSL`；`picket.wsl.caFile` 指定 PEM 附加信任链。下载器是扩展自带的 HTTP 客户端（`src/download.js`：直连 / HTTP 代理绝对 URI / HTTPS 经 CONNECT 隧道后自行协商 TLS），因为 `fetch` 无法配代理与 CA。仍未支持：`no_proxy`/`NO_PROXY` 主机排除、PAC、`https://` 代理——这些场景走本地文件或离线组件包。下载**与本地来源一样**按随包 `catalog.json` 校验大小与 sha256，代理凭证只进 `Proxy-Authorization`，不进日志。见 `docs/wsl.md`。
 
 **离线组件包**（管理员分发物）：一个 zip，内含 `*.tar.gz` + `SHA256SUMS` + `catalog.json`。用户在"从文件安装…"里选中它即可，零网络、零额外工具。
 
