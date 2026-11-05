@@ -1137,7 +1137,7 @@ index 00000000..d58b4777
 +module.exports = { createCommands, registerCommands, downloadFromSettings, COMMANDS, LAST_DISTRO };
 diff --git a/extensions/picket-remote-wsl/src/components.js b/extensions/picket-remote-wsl/src/components.js
 new file mode 100644
-index 00000000..98ec9126
+index 00000000..a7cbca34
 --- /dev/null
 +++ b/extensions/picket-remote-wsl/src/components.js
 @@ -0,0 +1,201 @@
@@ -1173,21 +1173,21 @@ index 00000000..98ec9126
 + */
 +function createComponentManager(options) {
 +	const { catalog, runner, distro, home } = options;
-+	const payloadRoot = joinPath(home, '.picket-code-server/payloads');
++	const payloadRoot = joinPath(home, '.vscode-server/bin');
 +
 +	/** @param {string} script @param {...string} params */
 +	function sh(script, ...params) {
 +		return runner.exec(['-d', distro, '-e', 'sh', '-c', script, 'sh', ...params]);
 +	}
 +
-+	/** @returns {Promise<string[]>} absolute server-* paths, newest first */
++	/** @returns {Promise<string[]>} absolute picket-* paths, newest first */
 +	async function listServerDirs() {
 +		const result = await sh('ls -1t "$1" 2>/dev/null || true', payloadRoot);
 +		const base = `${payloadRoot}/`;
 +		return String(result.stdout)
 +			.split(/\r?\n/)
 +			.map(line => line.trim())
-+			.filter(line => line.startsWith('server-') || line.startsWith(base))
++			.filter(line => line.startsWith('picket-') || line.startsWith(base))
 +			.map(line => (line.startsWith('/') ? line : `${payloadRoot}/${line}`));
 +	}
 +
@@ -1219,7 +1219,7 @@ index 00000000..98ec9126
 +	async function inspect(id) {
 +		const component = componentOf(id);
 +		const dirs = await listServerDirs();
-+		const expected = joinPath(payloadRoot, `server-${component.version}`);
++		const expected = joinPath(payloadRoot, `picket-${component.version}`);
 +		if (dirs.includes(expected)) {
 +			const marker = await readMarker(expected);
 +			const matches = marker !== undefined && marker.sha256.toLowerCase() === component.sha256.toLowerCase();
@@ -1233,7 +1233,7 @@ index 00000000..98ec9126
 +		if (other) {
 +			return {
 +				state: /** @type {IPayloadState} */ ('outdated'),
-+				version: other.slice(other.lastIndexOf('server-') + 'server-'.length),
++				version: other.slice(other.lastIndexOf('picket-') + 'picket-'.length),
 +				payloadDir: other
 +			};
 +		}
@@ -1288,7 +1288,7 @@ index 00000000..98ec9126
 +	/** @param {string} id */
 +	async function uninstall(id) {
 +		const component = componentOf(id);
-+		await sh('rm -rf "$1"', joinPath(payloadRoot, `server-${component.version}`));
++		await sh('rm -rf "$1"', joinPath(payloadRoot, `picket-${component.version}`));
 +		await remember(id, undefined);
 +	}
 +
@@ -1299,7 +1299,7 @@ index 00000000..98ec9126
 +	 */
 +	async function cleanup(keep) {
 +		const dirs = await listServerDirs();
-+		const current = joinPath(payloadRoot, `server-${catalog?.tag ?? ''}`);
++		const current = joinPath(payloadRoot, `picket-${catalog?.tag ?? ''}`);
 +		const extras = dirs.filter(dir => dir !== current);
 +		const gone = extras.slice(keep);
 +		for (const dir of gone) {
@@ -1344,10 +1344,10 @@ index 00000000..98ec9126
 +module.exports = { createComponentManager, markerPath };
 diff --git a/extensions/picket-remote-wsl/src/diagnose.js b/extensions/picket-remote-wsl/src/diagnose.js
 new file mode 100644
-index 00000000..8e1ceee8
+index 00000000..7e40e219
 --- /dev/null
 +++ b/extensions/picket-remote-wsl/src/diagnose.js
-@@ -0,0 +1,153 @@
+@@ -0,0 +1,166 @@
 +'use strict';
 +
 +const { readFile } = require('node:fs/promises');
@@ -1461,6 +1461,19 @@ index 00000000..8e1ceee8
 +		const home = await distroHome(runner, primary);
 +		const rows = await components({ distro: primary, home, runner }).list();
 +		return rows.map(row => `${row.id}  ${row.state}${row.version ? `  ${row.version}` : ''}${row.payloadDir ? `  ${row.payloadDir}` : ''}`);
++	});
++
++	// The old private root is not deleted on upgrade: it is the only copy of
++	// what the user had before the switch to the shared root, and the report is
++	// where someone looks before deciding to remove it by hand.
++	await section('Legacy data', async () => {
++		if (!primary) {
++			throw new Error('no WSL distro installed');
++		}
++		const home = await distroHome(runner, primary);
++		const legacy = `${home}/.picket-code-server/payloads`;
++		const result = await runner.exec(['-d', primary, '-e', 'sh', '-c', 'du -sh "$1" 2>/dev/null || true', 'sh', legacy]);
++		return String(result.stdout).trim() || 'none';
 +	});
 +
 +	await section('iCode', async () => {
@@ -2160,10 +2173,10 @@ index 00000000..cf40b908
 +module.exports = { detectIcode };
 diff --git a/extensions/picket-remote-wsl/src/launch.js b/extensions/picket-remote-wsl/src/launch.js
 new file mode 100644
-index 00000000..5002f64d
+index 00000000..5bb1ca01
 --- /dev/null
 +++ b/extensions/picket-remote-wsl/src/launch.js
-@@ -0,0 +1,397 @@
+@@ -0,0 +1,399 @@
 +'use strict';
 +
 +const { randomBytes } = require('node:crypto');
@@ -2193,8 +2206,9 @@ index 00000000..5002f64d
 + * @param {string} tag
 + */
 +function serverPaths(home, tag) {
-+	const root = `${home}/.picket-code-server`;
-+	const payloadDir = `${root}/payloads/server-${tag}`;
++	const root = `${home}/.vscode-server`;
++	const stateDir = `${home}/.picket-code-server`;
++	const payloadDir = `${root}/bin/picket-${tag}`;
 +	return {
 +		root,
 +		payloadDir,
@@ -2204,8 +2218,9 @@ index 00000000..5002f64d
 +		cliLink: `${home}/.local/bin/picket-code`,
 +		dataDir: `${root}/data`,
 +		extensionsDir: `${root}/extensions`,
-+		logDir: `${root}/logs`,
-+		runtimeDir: `${root}/runtime`,
++		logDir: `${stateDir}/logs`,
++		stateDir,
++		runtimeDir: `${stateDir}/runtime`,
 +		envSetupFile: `${root}/server-env-setup`
 +	};
 +}
@@ -2413,7 +2428,7 @@ index 00000000..5002f64d
 +	const log = options.log ?? { info() { }, error() { } };
 +	const persist = options.writeRuntime ?? writeRuntime;
 +	const token = argValue(args, '--connection-token=') ?? '';
-+	const tag = /payloads\/server-([^/]+)\/bin\//.exec(args[6] ?? args.join(' '))?.[1] ?? '';
++	const tag = /bin\/picket-([^/]+)\/bin\//.exec(args[6] ?? args.join(' '))?.[1] ?? '';
 +
 +	return new Promise((resolve, reject) => {
 +		const { child, stdout, stderr } = runner.spawn(args);
@@ -3042,7 +3057,7 @@ index 00000000..5a909a32
 +module.exports = { unpackOfflineBundle, removeBundle, parseSha256Sums, defaultExpand };
 diff --git a/extensions/picket-remote-wsl/src/payload.js b/extensions/picket-remote-wsl/src/payload.js
 new file mode 100644
-index 00000000..b09007f1
+index 00000000..bfc4b865
 --- /dev/null
 +++ b/extensions/picket-remote-wsl/src/payload.js
 @@ -0,0 +1,245 @@
@@ -3261,10 +3276,10 @@ index 00000000..b09007f1
 +		throw new Error(`Checksum mismatch for ${component.file}: expected ${component.sha256.toLowerCase()}, got ${actual}`);
 +	}
 +
-+	const finalDir = `${payloadRoot}/server-${component.version}`;
++	const finalDir = `${payloadRoot}/picket-${component.version}`;
 +	const tmpDir = `${payloadRoot}/.tmp-${randomBytes(4).toString('hex')}`;
 +
-+	const prepare = await runner.exec(['-d', distro, '-e', 'sh', '-c', 'mkdir -p "$1" && rm -rf "$1"/.tmp-* "$1"/server-*.old', 'sh', payloadRoot]);
++	const prepare = await runner.exec(['-d', distro, '-e', 'sh', '-c', 'mkdir -p "$1" && rm -rf "$1"/.tmp-* "$1"/picket-*.old', 'sh', payloadRoot]);
 +	if (prepare.code !== 0) {
 +		throw new Error(`Could not prepare ${payloadRoot} in ${distro}: ${prepare.stderr}`);
 +	}
@@ -3854,7 +3869,7 @@ index 00000000..2413b657
 +module.exports = { createResolver };
 diff --git a/extensions/picket-remote-wsl/src/shim.js b/extensions/picket-remote-wsl/src/shim.js
 new file mode 100644
-index 00000000..4fda4b77
+index 00000000..d99cdfaa
 --- /dev/null
 +++ b/extensions/picket-remote-wsl/src/shim.js
 @@ -0,0 +1,123 @@
@@ -3918,17 +3933,17 @@ index 00000000..4fda4b77
 + */
 +async function installShim({ runner, distro, home, tag, clientPath }) {
 +	const paths = serverPaths(home, tag);
-+	const scriptPath = `${paths.root}/bin/${tag}/bin/picket-code`;
++	const scriptPath = `${paths.payloadDir}/bin/picket-code`;
 +	const linkPath = paths.cliLink;
 +	const shimRoot = `${paths.root}/bin`;
 +
 +	const inspect = await runner.exec(
-+		['-d', distro, '-e', 'sh', '-c', INSPECT_SCRIPT, 'sh', `${shimRoot}/${tag}/bin`, `${home}/.local/bin`, linkPath]);
++		['-d', distro, '-e', 'sh', '-c', INSPECT_SCRIPT, 'sh', `${paths.payloadDir}/bin`, `${home}/.local/bin`, linkPath]);
 +	const current = String(inspect.stdout).trim();
 +	if (current === 'file') {
 +		return { status: 'foreign-link', scriptPath, linkPath, message: `${linkPath} 已存在且不是符号链接` };
 +	}
-+	if (current !== 'none' && !current.startsWith(`${shimRoot}/`)) {
++	if (current !== 'none' && !current.startsWith(`${shimRoot}/picket-`)) {
 +		return { status: 'foreign-link', scriptPath, linkPath, message: current || `${linkPath} 状态未知` };
 +	}
 +
@@ -4645,17 +4660,17 @@ index 00000000..e3b3ee01
 +});
 diff --git a/extensions/picket-remote-wsl/test/components.test.js b/extensions/picket-remote-wsl/test/components.test.js
 new file mode 100644
-index 00000000..6679f571
+index 00000000..c147761c
 --- /dev/null
 +++ b/extensions/picket-remote-wsl/test/components.test.js
-@@ -0,0 +1,93 @@
+@@ -0,0 +1,98 @@
 +// RED first: this file must fail until src/components.js exists.
 +const test = require('node:test');
 +const assert = require('node:assert');
 +const { createComponentManager } = require('../src/components.js');
 +
 +const HOME = '/home/u';
-+const PAYLOADS = `${HOME}/.picket-code-server/payloads`;
++const PAYLOADS = `${HOME}/.vscode-server/bin`;
 +const V = 'v1.143.1-picket.1-rc.4';
 +
 +function managerWith(disk, opts = {}) {
@@ -4670,6 +4685,11 @@ index 00000000..6679f571
 +	return { manager: createComponentManager({ catalog, runner, distro: 'D', home: HOME, statePath: '/tmp/state.json', ...opts }), calls };
 +}
 +
++test('payloads install into the shared bin directory', async () => {
++	const { manager } = managerWith(() => ({ code: 0, stdout: '' }));
++	assert.equal(manager.payloadRoot, '/home/u/.vscode-server/bin');
++});
++
 +test('absent when nothing is installed', async () => {
 +	const { manager } = managerWith(() => ({ code: 0, stdout: '' }));
 +	assert.strictEqual((await manager.inspect('wsl-server')).state, 'absent');
@@ -4678,20 +4698,20 @@ index 00000000..6679f571
 +test('installed when the marker matches the catalog', async () => {
 +	const { manager } = managerWith((s) => s.includes('cat')
 +		? { code: 0, stdout: JSON.stringify({ sha256: 'd'.repeat(64), source: 'file', installedAt: 'now' }) }
-+		: { code: 0, stdout: `${PAYLOADS}/server-${V}\n` });
++		: { code: 0, stdout: `${PAYLOADS}/picket-${V}\n` });
 +	assert.strictEqual((await manager.inspect('wsl-server')).state, 'installed');
 +});
 +
 +test('broken when the marker sha differs', async () => {
 +	const { manager } = managerWith((s) => s.includes('cat')
 +		? { code: 0, stdout: JSON.stringify({ sha256: 'e'.repeat(64), source: 'file', installedAt: 'now' }) }
-+		: { code: 0, stdout: `${PAYLOADS}/server-${V}\n` });
++		: { code: 0, stdout: `${PAYLOADS}/picket-${V}\n` });
 +	assert.strictEqual((await manager.inspect('wsl-server')).state, 'broken');
 +});
 +
 +test('outdated when only another version is present', async () => {
 +	const { manager } = managerWith((s) => s.includes('readlink') || s.includes('ls')
-+		? { code: 0, stdout: `${PAYLOADS}/server-v1.143.1-picket.1-rc.3\n` }
++		? { code: 0, stdout: `${PAYLOADS}/picket-v1.143.1-picket.1-rc.3\n` }
 +		: { code: 0, stdout: '' });
 +	assert.strictEqual((await manager.inspect('wsl-server')).state, 'outdated');
 +});
@@ -4699,13 +4719,13 @@ index 00000000..6679f571
 +test('ensure on an installed component issues no tar', async () => {
 +	const { manager, calls } = managerWith((s) => s.includes('cat')
 +		? { code: 0, stdout: JSON.stringify({ sha256: 'd'.repeat(64), source: 'file', installedAt: 'now' }) }
-+		: { code: 0, stdout: `${PAYLOADS}/server-${V}\n` });
++		: { code: 0, stdout: `${PAYLOADS}/picket-${V}\n` });
 +	await manager.ensure('wsl-server');
 +	assert.ok(!calls.some(c => c.includes('tar')), calls.join('\n'));
 +});
 +
 +test('cleanup keeps the catalog version and the newest extras, drops the rest', async () => {
-+	let listings = [`${PAYLOADS}/server-v1.143.1-picket.1-rc.4`, `${PAYLOADS}/server-v1.143.1-picket.1-rc.3`, `${PAYLOADS}/server-v1.143.1-picket.1-rc.2`];
++	let listings = [`${PAYLOADS}/picket-v1.143.1-picket.1-rc.4`, `${PAYLOADS}/picket-v1.143.1-picket.1-rc.3`, `${PAYLOADS}/picket-v1.143.1-picket.1-rc.2`];
 +	const removed = [];
 +	const runner = { exec: async (args) => {
 +		const script = args.slice(args.indexOf('-e') + 1).join(' ');
@@ -4728,8 +4748,8 @@ index 00000000..6679f571
 +		runner, distro: 'D', home: HOME, statePath: '/tmp/state.json'
 +	});
 +	const gone = await manager.cleanup(0);
-+	assert.deepStrictEqual(gone.sort(), ['server-v1.143.1-picket.1-rc.2', 'server-v1.143.1-picket.1-rc.3']);
-+	assert.ok(!removed.some(r => r.endsWith(`server-${V}`)), 'the catalog version survives');
++	assert.deepStrictEqual(gone.sort(), ['picket-v1.143.1-picket.1-rc.2', 'picket-v1.143.1-picket.1-rc.3']);
++	assert.ok(!removed.some(r => r.endsWith(`picket-${V}`)), 'the catalog version survives');
 +});
 +
 +test('a corrupt state cache never changes the verdict', async () => {
@@ -4744,7 +4764,7 @@ index 00000000..6679f571
 +});
 diff --git a/extensions/picket-remote-wsl/test/diagnose.test.js b/extensions/picket-remote-wsl/test/diagnose.test.js
 new file mode 100644
-index 00000000..7db16f1d
+index 00000000..6ee00887
 --- /dev/null
 +++ b/extensions/picket-remote-wsl/test/diagnose.test.js
 @@ -0,0 +1,119 @@
@@ -4865,7 +4885,7 @@ index 00000000..7db16f1d
 +test('the components section names the installed payload', async () => {
 +	const report = await diagnostics();
 +	assert.match(report, /wsl-server\s+installed/);
-+	assert.match(report, /server-v1\.143\.1-picket\.1-rc\.4/);
++	assert.match(report, /picket-v1\.143\.1-picket\.1-rc\.4/);
 +});
 diff --git a/extensions/picket-remote-wsl/test/distro.test.js b/extensions/picket-remote-wsl/test/distro.test.js
 new file mode 100644
@@ -4973,7 +4993,7 @@ index 00000000..7d568b2c
 +});
 diff --git a/extensions/picket-remote-wsl/test/download.test.js b/extensions/picket-remote-wsl/test/download.test.js
 new file mode 100644
-index 00000000..68049f54
+index 00000000..eab68457
 --- /dev/null
 +++ b/extensions/picket-remote-wsl/test/download.test.js
 @@ -0,0 +1,435 @@
@@ -5404,9 +5424,9 @@ index 00000000..68049f54
 +	await withServer(proxy, async (port) => {
 +		const result = await installPayload({
 +			runner, distro: 'D', component, source: { kind: 'url', url: `http://mirror.corp/${component.file}` },
-+			payloadRoot: '/home/u/.picket-code-server/payloads', proxy: `127.0.0.1:${port}`
++			payloadRoot: '/home/u/.vscode-server/bin', proxy: `127.0.0.1:${port}`
 +		});
-+		assert.strictEqual(result.payloadDir, `/home/u/.picket-code-server/payloads/server-${component.version}`);
++		assert.strictEqual(result.payloadDir, `/home/u/.vscode-server/bin/picket-${component.version}`);
 +	});
 +	assert.strictEqual(seen[0].url, `http://mirror.corp/${component.file}`);
 +	assert.strictEqual(calls.length, 2, 'the archive was verified and then unpacked');
@@ -5414,7 +5434,7 @@ index 00000000..68049f54
 +});
 diff --git a/extensions/picket-remote-wsl/test/fixtures/fake-host.js b/extensions/picket-remote-wsl/test/fixtures/fake-host.js
 new file mode 100644
-index 00000000..8de906e0
+index 00000000..ea052035
 --- /dev/null
 +++ b/extensions/picket-remote-wsl/test/fixtures/fake-host.js
 @@ -0,0 +1,176 @@
@@ -5526,7 +5546,7 @@ index 00000000..8de906e0
 +function createFakeComponents(options = {}) {
 +	const state = { installed: 0, inspected: 0 };
 +	const version = options.version ?? 'v1.143.1-picket.1-rc.4';
-+	const payloadDir = `/home/u/.picket-code-server/payloads/server-${version}`;
++	const payloadDir = `/home/u/.vscode-server/bin/picket-${version}`;
 +	const components = {
 +		state,
 +		async inspect() {
@@ -5776,10 +5796,10 @@ index 00000000..5e31eaaa
 +});
 diff --git a/extensions/picket-remote-wsl/test/launch.test.js b/extensions/picket-remote-wsl/test/launch.test.js
 new file mode 100644
-index 00000000..d49e1c93
+index 00000000..0755a31d
 --- /dev/null
 +++ b/extensions/picket-remote-wsl/test/launch.test.js
-@@ -0,0 +1,253 @@
+@@ -0,0 +1,265 @@
 +// RED first: this file must fail until src/launch.js exists.
 +const test = require('node:test');
 +const assert = require('node:assert');
@@ -5787,11 +5807,23 @@ index 00000000..d49e1c93
 +
 +test('serverPaths composes the documented layout', () => {
 +	const p = serverPaths('/home/u', 'v1.143.1-picket.1-rc.4');
-+	assert.strictEqual(p.binary, '/home/u/.picket-code-server/payloads/server-v1.143.1-picket.1-rc.4/bin/picket-code-server');
-+	assert.strictEqual(p.dataDir, '/home/u/.picket-code-server/data');
-+	assert.strictEqual(p.extensionsDir, '/home/u/.picket-code-server/extensions');
++	assert.strictEqual(p.binary, '/home/u/.vscode-server/bin/picket-v1.143.1-picket.1-rc.4/bin/picket-code-server');
++	assert.strictEqual(p.dataDir, '/home/u/.vscode-server/data');
++	assert.strictEqual(p.extensionsDir, '/home/u/.vscode-server/extensions');
 +	assert.strictEqual(p.runtimeDir, '/home/u/.picket-code-server/runtime');
 +	assert.strictEqual(runtimeFileFor('/home/u', 'Ubuntu 22.04 LTS'), '/home/u/.picket-code-server/runtime/Ubuntu 22.04 LTS.json');
++});
++
++test('server paths live under the shared .vscode-server root', () => {
++	const paths = serverPaths('/home/u', '1.2.0');
++	assert.equal(paths.root, '/home/u/.vscode-server');
++	assert.equal(paths.payloadDir, '/home/u/.vscode-server/bin/picket-1.2.0');
++	assert.equal(paths.binary, '/home/u/.vscode-server/bin/picket-1.2.0/bin/picket-code-server');
++	assert.equal(paths.dataDir, '/home/u/.vscode-server/data');
++	assert.equal(paths.extensionsDir, '/home/u/.vscode-server/extensions');
++	assert.equal(paths.envSetupFile, '/home/u/.vscode-server/server-env-setup');
++	assert.equal(paths.stateDir, '/home/u/.picket-code-server');
++	assert.equal(paths.runtimeDir, '/home/u/.picket-code-server/runtime');
 +});
 +
 +test('buildServerArgs launches through a login shell with argv-passed values', () => {
@@ -6470,7 +6502,7 @@ index 00000000..55696e9f
 +});
 diff --git a/extensions/picket-remote-wsl/test/payload.test.js b/extensions/picket-remote-wsl/test/payload.test.js
 new file mode 100644
-index 00000000..18915bc4
+index 00000000..4cfa80ca
 --- /dev/null
 +++ b/extensions/picket-remote-wsl/test/payload.test.js
 @@ -0,0 +1,163 @@
@@ -6512,7 +6544,7 @@ index 00000000..18915bc4
 +	const calls = [];
 +	const runner = { exec: async (args) => { calls.push(args.join(' ')); return { code: 0, stdout: '', stderr: '' }; } };
 +	await assert.rejects(() => installPayload({ runner, distro: 'D', component: { ...COMPONENT, sha256: 'c'.repeat(64) },
-+		source: { kind: 'file', path: file }, payloadRoot: '/home/u/.picket-code-server/payloads', onProgress: () => { } }), /checksum mismatch/i);
++		source: { kind: 'file', path: file }, payloadRoot: '/home/u/.vscode-server/bin', onProgress: () => { } }), /checksum mismatch/i);
 +	assert.deepStrictEqual(calls, []);
 +});
 +
@@ -6524,7 +6556,7 @@ index 00000000..18915bc4
 +	const calls = [];
 +	const runner = { exec: async (args) => { calls.push(args.join(' ')); return { code: 0, stdout: '', stderr: '' }; } };
 +	await assert.rejects(() => installPayload({ runner, distro: 'D', component: { ...COMPONENT, sha256: sha },
-+		source: { kind: 'file', path: file }, payloadRoot: '/home/u/.picket-code-server/payloads' }),
++		source: { kind: 'file', path: file }, payloadRoot: '/home/u/.vscode-server/bin' }),
 +	/Size mismatch for .*: expected 3 bytes, got 4/);
 +	assert.deepStrictEqual(calls, []);
 +});
@@ -6537,8 +6569,8 @@ index 00000000..18915bc4
 +	const calls = [];
 +	const runner = { exec: async (args, opts) => { calls.push({ args, hasInput: !!(opts && opts.input) }); return { code: 0, stdout: '', stderr: '' }; } };
 +	const result = await installPayload({ runner, distro: 'D', component: { ...COMPONENT, sha256: sha },
-+		source: { kind: 'file', path: file }, payloadRoot: '/home/u/.picket-code-server/payloads', onProgress: () => { } });
-+	assert.strictEqual(result.payloadDir, '/home/u/.picket-code-server/payloads/server-v1.143.1-picket.1-rc.4');
++		source: { kind: 'file', path: file }, payloadRoot: '/home/u/.vscode-server/bin', onProgress: () => { } });
++	assert.strictEqual(result.payloadDir, '/home/u/.vscode-server/bin/picket-v1.143.1-picket.1-rc.4');
 +	assert.strictEqual(calls.length, 2);
 +	assert.match(calls[0].args.join(' '), /mkdir -p/);
 +	assert.ok(calls[1].hasInput, 'tar receives the archive on stdin');
@@ -6568,7 +6600,7 @@ index 00000000..18915bc4
 +	const runner = createWslRunner({ wslPath: '/bin/sh', spawn: (wslPath, args) => spawn(wslPath, ['-c', 'exec "$@"', '--', ...args.slice(3)]) });
 +
 +	const result = await installPayload({ runner, distro: 'X', component, source: { kind: 'file', path: file }, payloadRoot });
-+	assert.strictEqual(result.payloadDir, join(payloadRoot, `server-${component.version}`));
++	assert.strictEqual(result.payloadDir, join(payloadRoot, `picket-${component.version}`));
 +	assert.ok(existsSync(join(result.payloadDir, 'bin', 'picket-code-server')), 'the binary lands in the final directory');
 +	assert.deepStrictEqual(readdirSync(payloadRoot).filter(name => name.startsWith('.tmp-')), [], 'no temp directory survives');
 +});
@@ -6595,7 +6627,7 @@ index 00000000..18915bc4
 +	const runner = createWslRunner({ wslPath: '/bin/sh', spawn: (wslPath, args) => spawn(wslPath, ['-c', 'exec "$@"', '--', ...args.slice(3)]) });
 +
 +	const result = await installPayload({ runner, distro: 'X', component, source: { kind: 'file', path: file }, payloadRoot });
-+	assert.strictEqual(result.payloadDir, join(payloadRoot, `server-${component.version}`));
++	assert.strictEqual(result.payloadDir, join(payloadRoot, `picket-${component.version}`));
 +	assert.ok(existsSync(join(result.payloadDir, 'bin', 'picket-code-server')), 'the wrapper directory is stripped');
 +	assert.deepStrictEqual(readdirSync(result.payloadDir).sort(), ['bin', 'product.json'], 'no nesting inside the final directory');
 +});
@@ -6634,8 +6666,8 @@ index 00000000..18915bc4
 +		component: { ...COMPONENT, file: 'corrupt.tar.gz', size: statSync(corrupt).size, sha256: corruptSha },
 +		source: { kind: 'file', path: corrupt }
 +	}), /Could not unpack/);
-+	assert.deepStrictEqual(readdirSync(payloadRoot), [`server-${COMPONENT.version}`], 'only the working install remains');
-+	assert.ok(existsSync(join(payloadRoot, `server-${COMPONENT.version}`, 'bin', 'picket-code-server')), 'the previous install is intact');
++	assert.deepStrictEqual(readdirSync(payloadRoot), [`picket-${COMPONENT.version}`], 'only the working install remains');
++	assert.ok(existsSync(join(payloadRoot, `picket-${COMPONENT.version}`, 'bin', 'picket-code-server')), 'the previous install is intact');
 +});
 diff --git a/extensions/picket-remote-wsl/test/preflight.test.js b/extensions/picket-remote-wsl/test/preflight.test.js
 new file mode 100644
@@ -6799,7 +6831,7 @@ index 00000000..69414920
 +});
 diff --git a/extensions/picket-remote-wsl/test/resolver.test.js b/extensions/picket-remote-wsl/test/resolver.test.js
 new file mode 100644
-index 00000000..0b93d097
+index 00000000..6b152a02
 --- /dev/null
 +++ b/extensions/picket-remote-wsl/test/resolver.test.js
 @@ -0,0 +1,521 @@
@@ -6965,7 +6997,7 @@ index 00000000..0b93d097
 +	const resolver = createResolver({
 +		runner,
 +		catalog: catalog(),
-+		components: () => ({ ensure: async () => ({ payloadDir: `/home/u/.picket-code-server/payloads/server-${VERSION}` }) }),
++		components: () => ({ ensure: async () => ({ payloadDir: `/home/u/.vscode-server/bin/picket-${VERSION}` }) }),
 +		settings: {},
 +		log: silentLog(),
 +		startServer,
@@ -6978,7 +7010,7 @@ index 00000000..0b93d097
 +	assert.strictEqual(probed, 0, 'a stale tag is enough to restart; the port may already belong to another server');
 +	const args = starts[0].args;
 +	assert.ok(args.some(a => /^--connection-token=.{32,}$/.test(a)), 'a fresh token is minted for the new server');
-+	assert.ok(args.includes(`--user-data-dir=/home/u/.picket-code-server/data`));
++	assert.ok(args.includes(`--user-data-dir=/home/u/.vscode-server/data`));
 +	assert.strictEqual(args[1], 'Ubuntu');
 +	assert.strictEqual(starts[0].runtimeFile, `/home/u/.picket-code-server/runtime/Ubuntu.json`);
 +});
@@ -6989,7 +7021,7 @@ index 00000000..0b93d097
 +	const resolver = createResolver({
 +		runner,
 +		catalog: catalog(),
-+		components: () => ({ ensure: async () => ({ payloadDir: `/home/u/.picket-code-server/payloads/server-${VERSION}` }) }),
++		components: () => ({ ensure: async () => ({ payloadDir: `/home/u/.vscode-server/bin/picket-${VERSION}` }) }),
 +		settings: {},
 +		log: silentLog(),
 +		startServer,
@@ -7050,7 +7082,7 @@ index 00000000..0b93d097
 +	const resolver = createResolver({
 +		runner,
 +		catalog: catalog(),
-+		components: () => ({ ensure: async () => ({ payloadDir: `/home/u/.picket-code-server/payloads/server-${VERSION}` }) }),
++		components: () => ({ ensure: async () => ({ payloadDir: `/home/u/.vscode-server/bin/picket-${VERSION}` }) }),
 +		settings: {},
 +		log: silentLog(),
 +		startServer
@@ -7076,7 +7108,7 @@ index 00000000..0b93d097
 +	assert.strictEqual(stopped[0].distro, 'Ubuntu');
 +	assert.strictEqual(stopped[0].info.port, 41234);
 +	assert.strictEqual(stopped[0].runtimeFile, '/home/u/.picket-code-server/runtime/Ubuntu.json');
-+	assert.strictEqual(stopped[0].dataDir, '/home/u/.picket-code-server/data');
++	assert.strictEqual(stopped[0].dataDir, '/home/u/.vscode-server/data');
 +});
 +
 +test('the detected iCode path and the tunnel mode reach the started server', async () => {
@@ -7084,7 +7116,7 @@ index 00000000..0b93d097
 +	const { starts, startServer } = startsRecording();
 +	const resolver = createResolver({
 +		runner, catalog: catalog(), settings: { tunnelMode: 'stdio' }, log: silentLog(), startServer,
-+		components: () => ({ ensure: async () => ({ payloadDir: `/home/u/.picket-code-server/payloads/server-${VERSION}` }) }),
++		components: () => ({ ensure: async () => ({ payloadDir: `/home/u/.vscode-server/bin/picket-${VERSION}` }) }),
 +		readWslConfig: async () => ({}),
 +		platform: 'win32'
 +	});
@@ -7100,7 +7132,7 @@ index 00000000..0b93d097
 +	const warnings = [];
 +	const resolver = createResolver({
 +		runner, catalog: catalog(), settings: {}, log: silentLog(), startServer,
-+		components: () => ({ ensure: async () => ({ payloadDir: `/home/u/.picket-code-server/payloads/server-${VERSION}` }) }),
++		components: () => ({ ensure: async () => ({ payloadDir: `/home/u/.vscode-server/bin/picket-${VERSION}` }) }),
 +		readWslConfig: async () => ({}),
 +		platform: 'win32',
 +		warn: (message) => warnings.push(message)
@@ -7149,7 +7181,7 @@ index 00000000..0b93d097
 +	const { starts, startServer } = startsRecording();
 +	const resolver = createResolver({
 +		runner, catalog: catalog(), settings: {}, log: silentLog(), startServer,
-+		components: () => ({ ensure: async () => ({ payloadDir: `/home/u/.picket-code-server/payloads/server-${VERSION}` }) }),
++		components: () => ({ ensure: async () => ({ payloadDir: `/home/u/.vscode-server/bin/picket-${VERSION}` }) }),
 +		readWslConfig: async () => ({})
 +	});
 +
@@ -7165,7 +7197,7 @@ index 00000000..0b93d097
 +	const resolver = createResolver({
 +		runner, catalog: catalog(), settings: {}, log: silentLog(),
 +		startServer: async () => { throw new Error('server exited with code 1'); },
-+		components: () => ({ ensure: async () => ({ payloadDir: `/home/u/.picket-code-server/payloads/server-${VERSION}` }) }),
++		components: () => ({ ensure: async () => ({ payloadDir: `/home/u/.vscode-server/bin/picket-${VERSION}` }) }),
 +		readWslConfig: async () => ({})
 +	});
 +
@@ -7179,7 +7211,7 @@ index 00000000..0b93d097
 +	const { starts, startServer } = startsRecording();
 +	const resolver = createResolver({
 +		runner, catalog: catalog(), settings: { startTimeoutSeconds: 90 }, log: silentLog(), startServer,
-+		components: () => ({ ensure: async () => ({ payloadDir: `/home/u/.picket-code-server/payloads/server-${VERSION}` }) }),
++		components: () => ({ ensure: async () => ({ payloadDir: `/home/u/.vscode-server/bin/picket-${VERSION}` }) }),
 +		readWslConfig: async () => ({})
 +	});
 +
@@ -7264,7 +7296,7 @@ index 00000000..0b93d097
 +	assert.deepStrictEqual(probed, [6001], 'the VM port is not dialable from the host, so the probe must use the tunnel');
 +	assert.strictEqual(created.length, 1);
 +	assert.strictEqual(created[0].serverPort, 41234);
-+	assert.strictEqual(created[0].nodePath, `/home/u/.picket-code-server/payloads/server-${VERSION}/node`);
++	assert.strictEqual(created[0].nodePath, `/home/u/.vscode-server/bin/picket-${VERSION}/node`);
 +	assert.strictEqual(starts.length, 0);
 +
 +	await resolver.resolve('picket-wsl+Ubuntu');
@@ -7287,7 +7319,7 @@ index 00000000..0b93d097
 +		runner, catalog: catalog(), settings: {}, log: silentLog(), startServer,
 +		platform: 'win32',
 +		readWslConfig: async () => ({ localhostForwarding: false }),
-+		components: () => ({ ensure: async () => ({ payloadDir: `/home/u/.picket-code-server/payloads/server-${VERSION}` }) }),
++		components: () => ({ ensure: async () => ({ payloadDir: `/home/u/.vscode-server/bin/picket-${VERSION}` }) }),
 +		createTunnel: async (options) => {
 +			created.push(options);
 +			return { localPort: 6200, dispose: async () => { } };
@@ -7310,7 +7342,7 @@ index 00000000..0b93d097
 +	let attempts = 0;
 +	const resolver = createResolver({
 +		runner, catalog: catalog(), settings: {}, log: silentLog(), startServer,
-+		components: () => ({ ensure: async () => ({ payloadDir: `/home/u/.picket-code-server/payloads/server-${VERSION}` }) }),
++		components: () => ({ ensure: async () => ({ payloadDir: `/home/u/.vscode-server/bin/picket-${VERSION}` }) }),
 +		readWslConfig: async () => ({ localhostForwarding: false }),
 +		createTunnel: async () => {
 +			attempts += 1;
@@ -7326,7 +7358,7 @@ index 00000000..0b93d097
 +});
 diff --git a/extensions/picket-remote-wsl/test/shim.test.js b/extensions/picket-remote-wsl/test/shim.test.js
 new file mode 100644
-index 00000000..d984ab32
+index 00000000..de5fb1d5
 --- /dev/null
 +++ b/extensions/picket-remote-wsl/test/shim.test.js
 @@ -0,0 +1,141 @@
@@ -7368,18 +7400,18 @@ index 00000000..d984ab32
 +	const script = shimScript({
 +		clientPath: '/mnt/c/Users/u/AppData/Local/Programs/Picket Code/Picket Code.exe',
 +		authority: 'picket-wsl+Ubuntu 22.04 LTS',
-+		remoteCliPath: '/home/u/.picket-code-server/payloads/server-T/bin/remote-cli/picket-code'
++		remoteCliPath: '/home/u/.vscode-server/bin/picket-T/bin/remote-cli/picket-code'
 +	});
 +	assert.match(script, /VSCODE_CLIENT_COMMAND='\/mnt\/c\/Users\/u\/AppData\/Local\/Programs\/Picket Code\/Picket Code\.exe'/);
 +	assert.match(script, /VSCODE_CLI_AUTHORITY='picket-wsl\+Ubuntu 22\.04 LTS'/);
-+	assert.match(script, /exec '\/home\/u\/\.picket-code-server\/payloads\/server-T\/bin\/remote-cli\/picket-code' "\$@"$/);
++	assert.match(script, /exec '\/home\/u\/\.vscode-server\/bin\/picket-T\/bin\/remote-cli\/picket-code' "\$@"$/);
 +});
 +
 +test('installShim writes the script, links it and verifies interop', async () => {
 +	const r = recordingRunner([{ code: 0, stdout: 'none\n' }, { code: 0 }, { code: 0 }, { code: 0, stdout: 'ok\n' }]);
 +	const result = await installShim({ runner: r, ...BASE });
 +	assert.strictEqual(result.status, 'installed');
-+	assert.strictEqual(result.scriptPath, `${HOME}/.picket-code-server/bin/${TAG}/bin/picket-code`);
++	assert.strictEqual(result.scriptPath, `${HOME}/.vscode-server/bin/picket-${TAG}/bin/picket-code`);
 +	assert.strictEqual(result.linkPath, `${HOME}/.local/bin/picket-code`);
 +	assert.strictEqual(r.calls.length, 5);
 +
@@ -7388,14 +7420,14 @@ index 00000000..d984ab32
 +		assert.deepStrictEqual(call.args.slice(0, 4), ['-d', 'Ubuntu', '-e', 'sh']);
 +	}
 +	// inspect: one round trip that creates the directories and reads the link
-+	assert.ok(inspect.args.includes(`${HOME}/.picket-code-server/bin/${TAG}/bin`), 'inspect must create the script directory');
++	assert.ok(inspect.args.includes(`${HOME}/.vscode-server/bin/picket-${TAG}/bin`), 'inspect must create the script directory');
 +	assert.ok(inspect.args.includes(`${HOME}/.local/bin`), 'inspect must create the link directory too');
 +	assert.ok(inspect.args.includes(result.linkPath), 'inspect reads the current link target');
 +	// write: the shim content travels on stdin, never through a shell word
 +	assert.ok(write.args.includes(result.scriptPath));
 +	assert.match(String(write.input), /VSCODE_CLIENT_COMMAND='\/mnt\/c\/Programs\/Picket Code\.exe'/);
 +	assert.match(String(write.input), /VSCODE_CLI_AUTHORITY='picket-wsl\+Ubuntu'/);
-+	assert.match(String(write.input), new RegExp(`exec '${HOME.replace(/\./g, '\\.')}/\\.picket-code-server/payloads/server-${TAG}/bin/remote-cli/picket-code' "\\$@"`));
++	assert.match(String(write.input), new RegExp(`exec '${HOME.replace(/\./g, '\\.')}/\\.vscode-server/bin/picket-${TAG}/bin/remote-cli/picket-code' "\\$@"`));
 +	// link: both paths as positional args
 +	assert.ok(link.args.includes(result.scriptPath) && link.args.includes(result.linkPath));
 +	// verify: the link must resolve to the script and the script must be executable
@@ -7422,7 +7454,7 @@ index 00000000..d984ab32
 +});
 +
 +test('a link into our own shim root is upgraded in place', async () => {
-+	const r = recordingRunner([{ code: 0, stdout: `${HOME}/.picket-code-server/bin/older-tag/bin/picket-code\n` }, { code: 0 }, { code: 0 }, { code: 0, stdout: 'ok\n' }]);
++	const r = recordingRunner([{ code: 0, stdout: `${HOME}/.vscode-server/bin/picket-older-tag/bin/picket-code\n` }, { code: 0 }, { code: 0 }, { code: 0, stdout: 'ok\n' }]);
 +	const result = await installShim({ runner: r, ...BASE });
 +	assert.strictEqual(result.status, 'installed');
 +	assert.strictEqual(r.calls.length, 5);
@@ -7468,7 +7500,7 @@ index 00000000..d984ab32
 +	const r = recordingRunner([]);
 +	await removeShim({ runner: r, distro: 'Ubuntu', home: HOME });
 +	assert.strictEqual(r.calls.length, 1);
-+	assert.ok(r.calls[0].args.includes(`${HOME}/.picket-code-server/bin`));
++	assert.ok(r.calls[0].args.includes(`${HOME}/.vscode-server/bin`));
 +	assert.ok(r.calls[0].args.includes(`${HOME}/.local/bin/picket-code`));
 +});
 diff --git a/extensions/picket-remote-wsl/test/tree.test.js b/extensions/picket-remote-wsl/test/tree.test.js
