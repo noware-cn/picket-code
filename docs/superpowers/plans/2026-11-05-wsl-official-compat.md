@@ -813,6 +813,8 @@ git commit -m "build(wsl): re-export patch 67 for the official-extension compat 
 
 计划外补做：`code` 别名（设计里的双命令决策 A），vscode `b84b861e`，测试 263 passing。
 
+独立复核后修复（vscode `82d045d5`，主仓 `7480edd`，测试 264 passing）：`removeShim` 不再 `rm -rf` 共享的 `~/.vscode-server/bin`（只删 `picket-*`）；旧 `wsl+` 窗口的远程指示器菜单补齐；catalog 里非 semver 的版本改为丢弃而不是让 `compareVersions` 抛错。两条复核意见经实测为误报（overlay 是整键替换、`print_results` 只在 ok 时打 PASS）。
+
 ## 执行说明
 
 - 任务顺序有依赖：T1 → T2 → T3 →（T4 可与 T3 并行但需 T2 的 schema）→ T6/T7 → T8 → T9 → T10 → T11 → T12。T5 依赖外部仓库，可在 T4 之后任意时刻做。
