@@ -9,16 +9,17 @@ index 00000000..96fab092
 +tsconfig.json
 diff --git a/extensions/picket-remote-wsl/extension.js b/extensions/picket-remote-wsl/extension.js
 new file mode 100644
-index 00000000..61b62a59
+index 00000000..ddd7dae5
 --- /dev/null
 +++ b/extensions/picket-remote-wsl/extension.js
-@@ -0,0 +1,187 @@
+@@ -0,0 +1,194 @@
 +'use strict';
 +
 +const { join } = require('node:path');
 +const vscode = require('vscode');
 +const { createLog } = require('./src/log.js');
 +const { loadCatalog } = require('./src/catalog.js');
++const { readProduct } = require('./src/product.js');
 +const { createWslRunner, listDistros, visibleDistros } = require('./src/distro.js');
 +const { createComponentManager } = require('./src/components.js');
 +const { createResolver } = require('./src/resolver.js');
@@ -33,7 +34,10 @@ index 00000000..61b62a59
 +	context.subscriptions.push(log);
 +
 +	const catalog = await loadCatalog(context.extensionPath);
-+	log.info(`Picket WSL activated (tag=${catalog.tag ?? 'none'}, flavor=${catalog.flavor}, components=${catalog.components.length})`);
++	// The stamp decides which server this client may talk to: `commit` is what
++	// the handshake compares, `picketServerMinVersion` is the catalog floor.
++	const product = await readProduct(vscode.env.appRoot).catch(() => undefined);
++	log.info(`Picket WSL activated (catalog=schema-${catalog.schema}, min=${catalog.minVersion ?? 'none'}, components=${catalog.components.length}, commit=${product?.commit ?? 'none'}, server-min=${product?.picketServerMinVersion ?? 'none'})`);
 +
 +	context.subscriptions.push(vscode.commands.registerCommand('picket.wsl.showLog', () => log.show()));
 +
@@ -73,6 +77,7 @@ index 00000000..61b62a59
 +	 */
 +	const createComponents = ({ distro, home, explicitPath, download }) => createComponentManager({
 +		catalog,
++		product,
 +		runner,
 +		distro,
 +		home,
@@ -87,6 +92,7 @@ index 00000000..61b62a59
 +	const resolver = createResolver({
 +		runner,
 +		catalog,
++		product,
 +		settings,
 +		log,
 +		warn: (message) => void vscode.window.showWarningMessage(message),
@@ -175,6 +181,7 @@ index 00000000..61b62a59
 +		runner,
 +		settings,
 +		catalog,
++		product,
 +		createComponents,
 +		resolver,
 +		memento: context.globalState,
@@ -524,22 +531,22 @@ index 00000000..6ca8bb7e
 +}
 diff --git a/extensions/picket-remote-wsl/payloads/catalog.json b/extensions/picket-remote-wsl/payloads/catalog.json
 new file mode 100644
-index 00000000..c60ef4e0
+index 00000000..133efcc3
 --- /dev/null
 +++ b/extensions/picket-remote-wsl/payloads/catalog.json
 @@ -0,0 +1,6 @@
 +{
-+	"version": 1,
-+	"tag": null,
++	"schema": 2,
++	"minVersion": null,
 +	"flavor": "ondemand",
 +	"components": []
 +}
 diff --git a/extensions/picket-remote-wsl/src/catalog.js b/extensions/picket-remote-wsl/src/catalog.js
 new file mode 100644
-index 00000000..f612ff0a
+index 00000000..2ac6fe0f
 --- /dev/null
 +++ b/extensions/picket-remote-wsl/src/catalog.js
-@@ -0,0 +1,107 @@
+@@ -0,0 +1,116 @@
 +'use strict';
 +
 +const { readFile } = require('node:fs/promises');
@@ -550,12 +557,14 @@ index 00000000..f612ff0a
 + * @returns {ICatalog}
 + */
 +function emptyCatalog() {
-+	return { tag: null, flavor: 'ondemand', components: [] };
++	return { schema: 2, minVersion: null, flavor: 'ondemand', components: [] };
 +}
 +
 +/**
-+ * @typedef {{ id: string, kind: 'server' | 'extensions', version: string, file: string, size: number, sha256: string, embedded: boolean, embeddedPath?: string }} ICatalogComponent
-+ * @typedef {{ tag: string | null, flavor: 'embedded' | 'ondemand', components: ICatalogComponent[] }} ICatalog
++ * A component carries the commit it was built from: that, not the version
++ * string, is what has to match the client's handshake.
++ * @typedef {{ id: string, kind: 'server' | 'extensions', version: string, commit: string, file: string, size: number, sha256: string, embedded: boolean, embeddedPath?: string }} ICatalogComponent
++ * @typedef {{ schema: 2, minVersion: string | null, flavor: 'embedded' | 'ondemand', components: ICatalogComponent[] }} ICatalog
 + */
 +
 +/** @param {unknown} value @returns {value is Record<string, any>} */
@@ -594,6 +603,9 @@ index 00000000..f612ff0a
 +	if (typeof raw.sha256 !== 'string' || !/^[0-9a-f]{64}$/.test(raw.sha256)) {
 +		return undefined;
 +	}
++	if (typeof raw.commit !== 'string' || !/^[0-9a-f]{40}$/.test(raw.commit)) {
++		return undefined;
++	}
 +	const embedded = raw.embedded === true;
 +	const embeddedPath = raw.embeddedPath;
 +	if (embedded) {
@@ -605,6 +617,7 @@ index 00000000..f612ff0a
 +		id: raw.id,
 +		kind: raw.kind,
 +		version: raw.version,
++		commit: raw.commit,
 +		file: raw.file,
 +		size: raw.size,
 +		sha256: raw.sha256,
@@ -633,14 +646,17 @@ index 00000000..f612ff0a
 +	} catch {
 +		return emptyCatalog();
 +	}
-+	if (!isObject(parsed)) {
++	// Schema 1 tied the server version to the client tag and had no commit to
++	// match on; reading it as current would select an unverifiable payload.
++	if (!isObject(parsed) || parsed.schema !== 2) {
 +		return emptyCatalog();
 +	}
 +	const components = Array.isArray(parsed.components)
 +		? parsed.components.map(normalizeComponent).filter(Boolean)
 +		: [];
 +	return {
-+		tag: nonEmpty(parsed.tag) ? parsed.tag : null,
++		schema: 2,
++		minVersion: nonEmpty(parsed.minVersion) ? parsed.minVersion : null,
 +		flavor: parsed.flavor === 'embedded' ? 'embedded' : 'ondemand',
 +		components
 +	};
@@ -649,10 +665,10 @@ index 00000000..f612ff0a
 +module.exports = { loadCatalog };
 diff --git a/extensions/picket-remote-wsl/src/commands.js b/extensions/picket-remote-wsl/src/commands.js
 new file mode 100644
-index 00000000..d58b4777
+index 00000000..8ede422e
 --- /dev/null
 +++ b/extensions/picket-remote-wsl/src/commands.js
-@@ -0,0 +1,482 @@
+@@ -0,0 +1,486 @@
 +'use strict';
 +
 +const { listDistros, distroHome, visibleDistros } = require('./distro.js');
@@ -662,6 +678,7 @@ index 00000000..d58b4777
 +const { selectGallery, installVsix } = require('./marketplace.js');
 +const { unpackOfflineBundle, removeBundle } = require('./offline.js');
 +const { installShim, removeShim } = require('./shim.js');
++const { selectComponent, describeSelectionError } = require('./version.js');
 +
 +const LAST_DISTRO = 'picket.wsl.lastDistro';
 +const SERVER_COMPONENT = 'wsl-server';
@@ -698,6 +715,7 @@ index 00000000..d58b4777
 + *   runner: any,
 + *   settings: any,
 + *   catalog: any,
++ *   product?: { commit: string, version: string, picketServerMinVersion: string },
 + *   createComponents: (config: { distro: string, home: string, explicitPath?: string, download?: { proxy?: string, strictSSL?: boolean, caFile?: string } }) => any,
 + *   resolver: { stop(distro?: string): Promise<void> },
 + *   memento?: { get(key: string): any, update(key: string, value: any): any },
@@ -713,7 +731,7 @@ index 00000000..d58b4777
 + * }} options
 + */
 +function createCommands(options) {
-+	const { host, runner, settings, catalog, createComponents, resolver } = options;
++	const { host, runner, settings, catalog, product, createComponents, resolver } = options;
 +	const listDistrosOf = options.listDistros ?? listDistros;
 +	const distroHomeOf = options.distroHome ?? distroHome;
 +
@@ -1035,11 +1053,13 @@ index 00000000..d58b4777
 +		if (!await ensureComponentInteractive({ distro, home })) {
 +			return;
 +		}
-+		const tag = catalog?.tag;
-+		if (!tag) {
-+			await host.showErrorMessage('这个构建没有 WSL 服务器组件，无法安装命令行。');
++		const want = { commit: product?.commit ?? '', minVersion: product?.picketServerMinVersion ?? '' };
++		const selection = selectComponent(catalog, want);
++		if ('error' in selection) {
++			await host.showErrorMessage(`无法安装命令行：${describeSelectionError(selection, want)}。`);
 +			return;
 +		}
++		const tag = selection.component.version;
 +		let clientPath;
 +		try {
 +			clientPath = await toPosixPath(runner, distro, options.clientPath ?? process.execPath);
@@ -1137,7 +1157,7 @@ index 00000000..d58b4777
 +module.exports = { createCommands, registerCommands, downloadFromSettings, COMMANDS, LAST_DISTRO };
 diff --git a/extensions/picket-remote-wsl/src/components.js b/extensions/picket-remote-wsl/src/components.js
 new file mode 100644
-index 00000000..a7cbca34
+index 00000000..4a15df14
 --- /dev/null
 +++ b/extensions/picket-remote-wsl/src/components.js
 @@ -0,0 +1,201 @@
@@ -1169,7 +1189,7 @@ index 00000000..a7cbca34
 + * The disk inside the distro is the only source of truth: the Windows-side
 + * cache can be stale or corrupt, and a marker whose hash disagrees with the
 + * catalog means the payload is not the one this build expects.
-+ * @param {{ catalog: any, runner: any, distro: string, home: string, statePath?: string, env?: any, download?: { proxy?: string, strictSSL?: boolean, caFile?: string }, fetchImpl?: typeof fetch, onProgress?: (progress: { downloaded: number, total: number }) => void }} options
++ * @param {{ catalog: any, product?: { commit: string, version: string, picketServerMinVersion: string }, runner: any, distro: string, home: string, statePath?: string, env?: any, download?: { proxy?: string, strictSSL?: boolean, caFile?: string }, fetchImpl?: typeof fetch, onProgress?: (progress: { downloaded: number, total: number }) => void }} options
 + */
 +function createComponentManager(options) {
 +	const { catalog, runner, distro, home } = options;
@@ -1344,15 +1364,16 @@ index 00000000..a7cbca34
 +module.exports = { createComponentManager, markerPath };
 diff --git a/extensions/picket-remote-wsl/src/diagnose.js b/extensions/picket-remote-wsl/src/diagnose.js
 new file mode 100644
-index 00000000..7e40e219
+index 00000000..f0164b2e
 --- /dev/null
 +++ b/extensions/picket-remote-wsl/src/diagnose.js
-@@ -0,0 +1,166 @@
+@@ -0,0 +1,168 @@
 +'use strict';
 +
 +const { readFile } = require('node:fs/promises');
 +const { join } = require('node:path');
 +const { listDistros, defaultDistro, distroHome, wslStatus } = require('./distro.js');
++const { readProduct } = require('./product.js');
 +const { detectIcode } = require('./icode.js');
 +const { describeGallery } = require('./marketplace.js');
 +const { chooseTunnelMode, readWslConfigFile, wslConfigPath } = require('./preflight.js');
@@ -1405,7 +1426,8 @@ index 00000000..7e40e219
 +	lines.push('Picket WSL diagnostics');
 +	lines.push('======================');
 +
-+	await section('Product tag', async () => (await product()).picketTag ?? 'none');
++	await section('Server version', async () => (await readProduct(appRoot)).version || 'none');
++	await section('Server minimum', async () => (await readProduct(appRoot)).picketServerMinVersion || 'none');
 +
 +	await section('WSL', async () => {
 +		const status = await wslStatus(runner);
@@ -3432,6 +3454,34 @@ index 00000000..59ade20e
 +}
 +
 +module.exports = { probeServer };
+diff --git a/extensions/picket-remote-wsl/src/product.js b/extensions/picket-remote-wsl/src/product.js
+new file mode 100644
+index 00000000..1c98de4a
+--- /dev/null
++++ b/extensions/picket-remote-wsl/src/product.js
+@@ -0,0 +1,22 @@
++'use strict';
++
++const { readFile } = require('node:fs/promises');
++const { join } = require('node:path');
++
++/**
++ * The product stamp is the only place the client learns which server it may
++ * talk to: `commit` is what the handshake compares, `picketServerMinVersion`
++ * is the floor a catalog has to satisfy.
++ * @param {string} appRoot
++ * @returns {Promise<{ commit: string, version: string, picketServerMinVersion: string }>}
++ */
++async function readProduct(appRoot) {
++	const raw = JSON.parse(await readFile(join(appRoot, 'product.json'), 'utf8'));
++	return {
++		commit: String(raw.commit ?? ''),
++		version: String(raw.version ?? ''),
++		picketServerMinVersion: String(raw.picketServerMinVersion ?? '')
++	};
++}
++
++module.exports = { readProduct };
 diff --git a/extensions/picket-remote-wsl/src/remoteUri.js b/extensions/picket-remote-wsl/src/remoteUri.js
 new file mode 100644
 index 00000000..f736d42b
@@ -3521,10 +3571,10 @@ index 00000000..f736d42b
 +module.exports = { AUTHORITY_PREFIX, parseAuthority, remoteUriFor, parseUncPath, toPosixPath, toWindowsPath };
 diff --git a/extensions/picket-remote-wsl/src/resolver.js b/extensions/picket-remote-wsl/src/resolver.js
 new file mode 100644
-index 00000000..2413b657
+index 00000000..bc3994d4
 --- /dev/null
 +++ b/extensions/picket-remote-wsl/src/resolver.js
-@@ -0,0 +1,342 @@
+@@ -0,0 +1,343 @@
 +'use strict';
 +
 +const { listDistros, defaultDistro, visibleDistros, distroHome } = require('./distro.js');
@@ -3548,6 +3598,7 @@ index 00000000..2413b657
 + * @param {{
 + *   runner: any,
 + *   catalog: any,
++ *   product?: { commit: string, version: string, picketServerMinVersion: string },
 + *   components: (ctx: { distro: string, home: string, runner: any }) => IComponentManager,
 + *   settings: ISettings,
 + *   log: ILog,
@@ -4280,12 +4331,93 @@ index 00000000..07f34d81
 +}
 +
 +module.exports = { PIPE_SCRIPT, createStdioTunnel };
+diff --git a/extensions/picket-remote-wsl/src/version.js b/extensions/picket-remote-wsl/src/version.js
+new file mode 100644
+index 00000000..44f0fc84
+--- /dev/null
++++ b/extensions/picket-remote-wsl/src/version.js
+@@ -0,0 +1,75 @@
++'use strict';
++
++/**
++ * Three numeric segments, nothing else. A prerelease suffix (`-picket.1-rc.5`)
++ * is metadata for humans: ordering only ever compares the numbers.
++ * @param {string} text
++ * @returns {number[] | undefined}
++ */
++function parseVersion(text) {
++	const match = /^(\d+)\.(\d+)\.(\d+)/.exec(String(text ?? ''));
++	return match ? [Number(match[1]), Number(match[2]), Number(match[3])] : undefined;
++}
++
++/**
++ * @param {string} a
++ * @param {string} b
++ * @returns {-1 | 0 | 1}
++ */
++function compareVersions(a, b) {
++	const left = parseVersion(a);
++	const right = parseVersion(b);
++	if (!left || !right) {
++		throw new TypeError(`Cannot compare "${a}" with "${b}": both must be x.y.z`);
++	}
++	for (let index = 0; index < 3; index++) {
++		if (left[index] !== right[index]) {
++			return left[index] < right[index] ? -1 : 1;
++		}
++	}
++	return 0;
++}
++
++/**
++ * Every branch names what to do next, so the caller never has to invent a
++ * message or discover the mismatch from a failed download.
++ * @param {{ error: 'none' | 'no-commit' | 'below-min', offered?: string }} result
++ * @param {{ commit: string, minVersion: string }} want
++ * @returns {string}
++ */
++function describeSelectionError(result, want) {
++	if (result.error === 'none') {
++		return '这个构建没有 WSL 服务器组件';
++	}
++	if (result.error === 'no-commit') {
++		return `没有为 commit ${want.commit} 构建的服务器组件`;
++	}
++	return `catalog offers ${result.offered ?? 'none'}, requires >= ${want.minVersion}`;
++}
++
++/**
++ * Compatibility is expressed by the handshake commit, so a component is a
++ * candidate only when it was built from this client's commit. Among candidates
++ * the newest wins, and a catalog that cannot satisfy the minimum is an error
++ * rather than a silent downgrade.
++ * @param {{ commit?: string | null, components?: any[] } | undefined} catalog
++ * @param {{ commit: string, minVersion: string }} want
++ * @returns {{ component: any } | { error: 'none' | 'no-commit' | 'below-min', offered?: string }}
++ */
++function selectComponent(catalog, want) {
++	const components = Array.isArray(catalog?.components) ? catalog.components : [];
++	if (components.length === 0) {
++		return { error: 'none' };
++	}
++	const candidates = components.filter(component => component?.kind === 'server' && component.commit === want.commit);
++	if (candidates.length === 0) {
++		return { error: 'no-commit' };
++	}
++	const highest = candidates.reduce((best, component) => (compareVersions(component.version, best.version) > 0 ? component : best));
++	if (compareVersions(highest.version, want.minVersion) < 0) {
++		return { error: 'below-min', offered: highest.version };
++	}
++	return { component: highest };
++}
++
++module.exports = { parseVersion, compareVersions, selectComponent, describeSelectionError };
 diff --git a/extensions/picket-remote-wsl/test/catalog.test.js b/extensions/picket-remote-wsl/test/catalog.test.js
 new file mode 100644
-index 00000000..350ec874
+index 00000000..b6dc5b39
 --- /dev/null
 +++ b/extensions/picket-remote-wsl/test/catalog.test.js
-@@ -0,0 +1,68 @@
+@@ -0,0 +1,91 @@
 +// RED first: this file must fail until src/catalog.js exists.
 +const test = require('node:test');
 +const assert = require('node:assert');
@@ -4301,15 +4433,18 @@ index 00000000..350ec874
 +	return dir;
 +}
 +
++const COMMIT = 'e646868227c3e3a9e3f24277c8c7220be42c0be7';
++
 +const VALID = {
-+	version: 1,
-+	tag: 'v1.143.1-picket.1-rc.4',
++	schema: 2,
++	minVersion: '1.0.0',
 +	flavor: 'ondemand',
 +	components: [{
 +		id: 'wsl-server',
 +		kind: 'server',
-+		version: 'v1.143.1-picket.1-rc.4',
-+		file: 'picket-code-server-v1.143.1-picket.1-rc.4-linux-x64.tar.gz',
++		version: '1.143.1',
++		commit: COMMIT,
++		file: 'picket-code-server-1.143.1-linux-x64.tar.gz',
 +		size: 87123456,
 +		sha256: 'a'.repeat(64)
 +	}]
@@ -4318,7 +4453,8 @@ index 00000000..350ec874
 +test('parses a valid catalog', async () => {
 +	const dir = extensionWith(JSON.stringify(VALID));
 +	const catalog = await loadCatalog(dir);
-+	assert.strictEqual(catalog.tag, 'v1.143.1-picket.1-rc.4');
++	assert.strictEqual(catalog.minVersion, '1.0.0');
++	assert.strictEqual(catalog.schema, 2);
 +	assert.strictEqual(catalog.flavor, 'ondemand');
 +	assert.strictEqual(catalog.components.length, 1);
 +	assert.strictEqual(catalog.components[0].embedded, false);
@@ -4339,7 +4475,7 @@ index 00000000..350ec874
 +test('invalid JSON yields the empty catalog instead of throwing', async () => {
 +	const dir = extensionWith('{ not json');
 +	const catalog = await loadCatalog(dir);
-+	assert.deepStrictEqual(catalog, { tag: null, flavor: 'ondemand', components: [] });
++	assert.deepStrictEqual(catalog, { schema: 2, minVersion: null, flavor: 'ondemand', components: [] });
 +});
 +
 +test('a component without a valid sha256 is dropped, the rest survive', async () => {
@@ -4354,12 +4490,31 @@ index 00000000..350ec874
 +	const catalog = await loadCatalog(dir);
 +	assert.deepStrictEqual(catalog.components.map(c => c.id), ['wsl-server']);
 +});
++
++test('a component without a commit is dropped, the rest survive', async () => {
++	const dir = extensionWith(JSON.stringify({
++		...VALID,
++		components: [
++			VALID.components[0],
++			{ ...VALID.components[0], id: 'no-commit', commit: undefined },
++			{ ...VALID.components[0], id: 'short-commit', commit: 'abc123' }
++		]
++	}));
++	const catalog = await loadCatalog(dir);
++	assert.deepStrictEqual(catalog.components.map(c => c.id), ['wsl-server']);
++});
++
++test('a schema 1 catalog is not read as if it were current', async () => {
++	const dir = extensionWith(JSON.stringify({ version: 1, tag: 'v1.143.1-picket.1-rc.4', flavor: 'ondemand', components: [VALID.components[0]] }));
++	const catalog = await loadCatalog(dir);
++	assert.deepStrictEqual(catalog, { schema: 2, minVersion: null, flavor: 'ondemand', components: [] });
++});
 diff --git a/extensions/picket-remote-wsl/test/commands.test.js b/extensions/picket-remote-wsl/test/commands.test.js
 new file mode 100644
-index 00000000..e3b3ee01
+index 00000000..cf931822
 --- /dev/null
 +++ b/extensions/picket-remote-wsl/test/commands.test.js
-@@ -0,0 +1,298 @@
+@@ -0,0 +1,299 @@
 +// RED first: this file must fail until src/commands.js exists.
 +const test = require('node:test');
 +const assert = require('node:assert');
@@ -4450,6 +4605,7 @@ index 00000000..e3b3ee01
 +		settings,
 +		memento,
 +		catalog: createCatalog({ flavor: options.flavor ?? 'ondemand' }),
++		product: { commit: 'e646868227c3e3a9e3f24277c8c7220be42c0be7', version: '1.143.1', picketServerMinVersion: '1.143.1' },
 +		createComponents,
 +		resolver: { async stop(distro) { stopped.push(distro); } },
 +		log: { info() { }, error() { } },
@@ -4560,7 +4716,7 @@ index 00000000..e3b3ee01
 +	const ctx = harness();
 +	await ctx.commands.diagnose();
 +	assert.strictEqual(ctx.host.documents.length, 1);
-+	assert.match(ctx.host.documents[0], /Product tag/);
++	assert.match(ctx.host.documents[0], /Server minimum/);
 +});
 +
 +test('setting the default distro goes through manage and refreshes the view', async () => {
@@ -4764,10 +4920,10 @@ index 00000000..c147761c
 +});
 diff --git a/extensions/picket-remote-wsl/test/diagnose.test.js b/extensions/picket-remote-wsl/test/diagnose.test.js
 new file mode 100644
-index 00000000..6ee00887
+index 00000000..1f84fddd
 --- /dev/null
 +++ b/extensions/picket-remote-wsl/test/diagnose.test.js
-@@ -0,0 +1,119 @@
+@@ -0,0 +1,121 @@
 +// RED first: this file must fail until src/diagnose.js exists.
 +const test = require('node:test');
 +const assert = require('node:assert');
@@ -4811,11 +4967,12 @@ index 00000000..6ee00887
 +	]);
 +}
 +
-+/** @param {{ picketTag?: string, gallery?: any }} [product] */
++/** @param {{ version?: string, minVersion?: string, gallery?: any }} [product] */
 +async function appRoot(product = {}) {
 +	const dir = await mkdtemp(join(tmpdir(), 'picket-diag-'));
 +	await writeFile(join(dir, 'product.json'), JSON.stringify({
-+		picketTag: product.picketTag ?? 'v1.143.1-picket.1-rc.4',
++		version: product.version ?? '1.143.1',
++		picketServerMinVersion: product.minVersion ?? '1.143.1',
 +		extensionsGallery: product.gallery
 +	}));
 +	return dir;
@@ -4839,7 +4996,7 @@ index 00000000..6ee00887
 +
 +test('the report carries a line for every thing a support request needs', async () => {
 +	const report = await diagnostics();
-+	for (const heading of ['Product tag', 'WSL', 'Distros', 'Tunnel mode', 'Components', 'iCode', 'node', 'git', 'Gallery']) {
++	for (const heading of ['Server version', 'Server minimum', 'WSL', 'Distros', 'Tunnel mode', 'Components', 'iCode', 'node', 'git', 'Gallery']) {
 +		assert.match(report, new RegExp(`^${heading}:`, 'm'), `missing the ${heading} section:\n${report}`);
 +	}
 +	assert.match(report, /Ubuntu-24\.04/);
@@ -4856,12 +5013,13 @@ index 00000000..6ee00887
 +		readWslConfig: async () => ({})
 +	});
 +	assert.match(report, /^Distros: unavailable: boom$/m);
-+	assert.match(report, /^Product tag: v1\.143\.1-picket\.1-rc\.4$/m);
++	assert.match(report, /^Server minimum: 1\.143\.1$/m);
 +});
 +
-+test('the product tag is read from the build, not from the extension manifest', async () => {
-+	const report = await diagnostics({ product: { picketTag: 'v9.9.9-picket.7' } });
-+	assert.match(report, /^Product tag: v9\.9\.9-picket\.7$/m);
++test('the server minimum is read from the build, not from the extension manifest', async () => {
++	const report = await diagnostics({ product: { version: '9.9.9', minVersion: '9.9.0' } });
++	assert.match(report, /^Server version: 9\.9\.9$/m);
++	assert.match(report, /^Server minimum: 9\.9\.0$/m);
 +});
 +
 +test('the gallery line names the build default when nothing is configured', async () => {
@@ -5434,10 +5592,10 @@ index 00000000..eab68457
 +});
 diff --git a/extensions/picket-remote-wsl/test/fixtures/fake-host.js b/extensions/picket-remote-wsl/test/fixtures/fake-host.js
 new file mode 100644
-index 00000000..ea052035
+index 00000000..b5f57597
 --- /dev/null
 +++ b/extensions/picket-remote-wsl/test/fixtures/fake-host.js
-@@ -0,0 +1,176 @@
+@@ -0,0 +1,178 @@
 +'use strict';
 +
 +/**
@@ -5568,16 +5726,18 @@ index 00000000..ea052035
 +	return components;
 +}
 +
-+/** @param {{ tag?: string, flavor?: 'embedded' | 'ondemand', version?: string }} [options] */
++/** @param {{ minVersion?: string, flavor?: 'embedded' | 'ondemand', version?: string, commit?: string }} [options] */
 +function createCatalog(options = {}) {
-+	const version = options.version ?? 'v1.143.1-picket.1-rc.4';
++	const version = options.version ?? '1.143.1';
 +	return {
-+		tag: options.tag ?? version,
++		schema: 2,
++		minVersion: options.minVersion ?? '1.143.1',
 +		flavor: options.flavor ?? 'ondemand',
 +		components: [{
 +			id: 'wsl-server',
 +			kind: 'server',
 +			version,
++			commit: options.commit ?? 'e646868227c3e3a9e3f24277c8c7220be42c0be7',
 +			file: `picket-code-server-${version}-linux-x64.tar.gz`,
 +			sha256: 'a'.repeat(64),
 +			size: 1,
@@ -7781,6 +7941,64 @@ index 00000000..bfcd4e81
 +		await tunnel.dispose();
 +		await closed(echo);
 +	}
++});
+diff --git a/extensions/picket-remote-wsl/test/version.test.js b/extensions/picket-remote-wsl/test/version.test.js
+new file mode 100644
+index 00000000..5bc3dedb
+--- /dev/null
++++ b/extensions/picket-remote-wsl/test/version.test.js
+@@ -0,0 +1,52 @@
++// RED first: this file must fail until src/version.js exists.
++const test = require('node:test');
++const assert = require('node:assert');
++const { compareVersions, parseVersion, selectComponent } = require('../src/version.js');
++
++/** @param {string[]} versions @param {string} [commit] */
++function catalogOf(versions, commit = 'abc') {
++	return {
++		schema: 2,
++		flavor: 'ondemand',
++		minVersion: '1.0.0',
++		components: versions.map(version => ({
++			id: 'wsl-server', kind: 'server', version, commit,
++			file: `picket-code-server-${version}-linux-x64.tar.gz`, size: 3, sha256: 'a'.repeat(64), embedded: false
++		}))
++	};
++}
++
++test('compares semver numerically, not lexically', () => {
++	assert.equal(compareVersions('1.10.0', '1.9.0'), 1);
++	assert.equal(compareVersions('1.2.0', '1.2.0'), 0);
++	assert.equal(compareVersions('1.2.0', '1.2.1'), -1);
++});
++
++test('a prerelease suffix does not change the ordering', () => {
++	assert.equal(parseVersion('1.143.1-picket.1-rc.5').join('.'), '1.143.1');
++	assert.equal(compareVersions('1.143.1-rc.5', '1.143.1'), 0);
++});
++
++test('an unparsable version is an error, not a silent zero', () => {
++	assert.throws(() => compareVersions('latest', '1.0.0'), TypeError);
++});
++
++test('picks the highest component for the same commit', () => {
++	const result = selectComponent(catalogOf(['1.0.0', '1.4.0', '1.2.0']), { commit: 'abc', minVersion: '1.1.0' });
++	assert.equal(result.component.version, '1.4.0');
++});
++
++test('refuses a catalog whose highest version is below the minimum', () => {
++	const result = selectComponent(catalogOf(['1.0.0']), { commit: 'abc', minVersion: '1.1.0' });
++	assert.deepEqual(result, { error: 'below-min', offered: '1.0.0' });
++});
++
++test('refuses when no component matches the client commit', () => {
++	const result = selectComponent(catalogOf(['1.0.0'], 'other'), { commit: 'abc', minVersion: '1.0.0' });
++	assert.deepEqual(result, { error: 'no-commit' });
++});
++
++test('an empty catalog is not an error the caller can paper over', () => {
++	assert.deepEqual(selectComponent({ schema: 2, flavor: 'ondemand', minVersion: '1.0.0', components: [] },
++		{ commit: 'abc', minVersion: '1.0.0' }), { error: 'none' });
 +});
 diff --git a/test/automation/src/code.ts b/test/automation/src/code.ts
 index 4c0d9bda..8ff230a3 100644
