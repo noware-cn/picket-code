@@ -1226,3 +1226,26 @@ One entry per milestone, committed with the code so a reviewer can see what was 
 6. The four human checks are the ones with no observable API (native dialog, real Windows client, visual layout, a human end-to-end pass). Everything else that used to be on that list is now a stage in `acceptance.sh`.
 
 **Not verified on this machine, deferred with owners:** the Windows-side manual pass (`docs/wsl-verification.md`, all four items), a real `wsl.exe` UTF-16 table and `wslpath`, real Windows `SIGTERM`→`SIGKILL` on a distro-side server, the embedded-payload and offline-bundle shapes in a signed build (asserted structurally by `build/check-contract.sh` and Task 12's packaging tests), and the Windows runner path in CI (only `--l2` runs on the current runners).
+
+### 增量（2026-11-05）：代理/CA、CI 验收矩阵、RC
+
+计划收尾后维护者追加批准了三项，均已落地并通过发布用 CI：
+
+1. **代理与自签证书（v1 内实现，不再是已知限制）**：`picket.wsl.useProxy`（默认 true，读
+   `http.proxy`/`http.proxyStrictSSL`）、`picket.wsl.caFile`。下载器换成自带的 HTTP 客户端
+   （直连 / 绝对 URI 代理 / CONNECT 隧道 + 自协商 TLS），因为 `fetch` 无法配代理与 CA。
+   顺手补上载荷大小校验（流式 `maxBytes` + 哈希前比对 `catalog.size`）——原实现只声明不校验。
+   仍未做：`https://` 代理、PAC、`no_proxy`。
+2. **CI 跑完整验收矩阵**：`tests-ui.yml` 新增 `wsl-acceptance` job（`xvfb-run` + `--all`），
+   输入 `server_tag`，缺凭据立即红；`release.yml` 转发 `PICKET_SERVER_TOKEN` 并让 `-rc.` tag
+   自动成为 pre-release。首次真跑即通过（run 41965322180）。
+3. **RC 发布**：`feat/picket-wsl` 上打 `v1.143.1-picket.1-rc.5`，产物 win32-x64.zip 215 MB、
+   linux-x64.tar.gz 197 MB、offline-wsl.zip 87 MB、SHA256SUMS、test-report；GitHub Release 标为
+   Pre-release（`v1.143.1` 仍为 Latest），R2 镜像三个文件均 200。
+
+**尚未验证**：`docs/wsl-verification.md` 的四项 Windows 人工验收（只在 RC 产物上能做）；CI 里
+`xvfb-run` 与窗口回收（`setsid`/`kill -- -pid`）在真 runner 上已跑通一次；真实 `wsl.exe`、
+真实 Windows `.cmd`、WSL1/ARM64 仍不在范围。
+
+**门禁数字（增量后）**：扩展单测 183 pass / 0 fail（30 次单套 + 10 次全套连跑无偶发），
+`build/wsl/test` 16/16，checkJs 干净，`check-contract.sh` ok，`gate.sh` 6/6，patch 67 = 8027 行。
