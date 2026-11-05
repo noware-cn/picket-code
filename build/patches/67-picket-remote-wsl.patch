@@ -4888,10 +4888,10 @@ index 00000000..7d568b2c
 +});
 diff --git a/extensions/picket-remote-wsl/test/download.test.js b/extensions/picket-remote-wsl/test/download.test.js
 new file mode 100644
-index 00000000..869cc656
+index 00000000..68049f54
 --- /dev/null
 +++ b/extensions/picket-remote-wsl/test/download.test.js
-@@ -0,0 +1,431 @@
+@@ -0,0 +1,435 @@
 +'use strict';
 +
 +const test = require('node:test');
@@ -5100,8 +5100,12 @@ index 00000000..869cc656
 +
 +	assert.ok(reports.length >= 2, `expected several reports, got ${reports.length}`);
 +	assert.deepStrictEqual(reports.at(-1), { downloaded: total, total, at: /** @type {any} */ (reports.at(-1)).at });
++	// 90 rather than 100: the throttle compares the clock inside the download, the
++	// reports timestamps come from the clock here, and a millisecond boundary that
++	// falls between the two reads turns an exact 100 into 99. The spacing that
++	// matters — "not one report per chunk" — is still proven by this bound.
 +	for (let index = 1; index < reports.length - 1; index += 1) {
-+		assert.ok(reports[index].at - reports[index - 1].at >= 100, `report ${index} came less than 100 ms after the previous one`);
++		assert.ok(reports[index].at - reports[index - 1].at >= 90, `report ${index} came less than 90 ms after the previous one`);
 +	}
 +	assert.ok(reports.every(report => report.total === total), 'every report knows the content length');
 +});

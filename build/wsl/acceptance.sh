@@ -170,11 +170,16 @@ stage_window() { # $1 payload path, $2 configured icodePath, $3 tunnelMode
 }
 
 run_l2() {
+	local log="$SCRATCH/logs/l2.log"
+	mkdir -p "$SCRATCH/logs"
 	echo "--- L2 extension unit tests"
-	if ( cd "$ROOT/vscode/extensions/picket-remote-wsl" && node --test "test/*.test.js" >/dev/null 2>&1 ); then
+	if ( cd "$ROOT/vscode/extensions/picket-remote-wsl" && node --test "test/*.test.js" >"$log" 2>&1 ); then
 		ok l2
 	else
-		ko l2 "extension unit tests failed (run node --test \"test/*.test.js\" in vscode/extensions/picket-remote-wsl)"
+		ko l2 "extension unit tests failed (log: $log)"
+		# Without this the CI log says only "failed"; the name of the flaky case is
+		# exactly what a reader of a red run needs.
+		grep -E "^✖|^ℹ (tests|pass|fail)" "$log" | head -8
 	fi
 }
 
