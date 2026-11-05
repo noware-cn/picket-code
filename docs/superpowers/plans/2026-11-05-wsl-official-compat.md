@@ -801,6 +801,18 @@ git commit -m "build(wsl): re-export patch 67 for the official-extension compat 
 
 ---
 
+## 执行状态（2026-11-05）
+
+| Task | 状态 | 证据 |
+| --- | --- | --- |
+| 1–4、6–9 | COMPLETE | 见 `.superpowers/sdd/2026-11-05-wsl-official-compat/progress.md` 各节提交号 |
+| 10 验收自动化 | COMPLETE | 主仓 `7f48175` + vscode `ef1c889e`/`72e09b02`；`acceptance.sh --all` 八阶段全绿 |
+| 11 文档同步 | COMPLETE | 主仓 `2433583`；`docs/wsl.md`(198 行)、`docs/wsl-verification.md`(7 项)、`docs/release-checklist.md`、`docs/wsl-server-releases.md`(新增)、`docs/manual-remote-wsl.md`(退役) |
+| 12 集成收尾 | COMPLETE | 补丁 67 重导 10225 行；gate 6/6；`check-contract.sh` passed；纯净上游 worktree 上 52–67 全链 `All patches applied` |
+| 5 服务端仓库独立发版 | **未做** | 需用户授权动 `noware-cn/picket-code-server`；客户端侧已全部就位，未对齐前用 `--from-file` |
+
+计划外补做：`code` 别名（设计里的双命令决策 A），vscode `b84b861e`，测试 263 passing。
+
 ## 执行说明
 
 - 任务顺序有依赖：T1 → T2 → T3 →（T4 可与 T3 并行但需 T2 的 schema）→ T6/T7 → T8 → T9 → T10 → T11 → T12。T5 依赖外部仓库，可在 T4 之后任意时刻做。

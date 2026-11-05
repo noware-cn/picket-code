@@ -28,8 +28,9 @@ WSL 窗口连的服务器是 `picket-code-server`，它在独立仓库
 - 资产：
   - `picket-code-server-<版本>-linux-x64.tar.gz` —— 载荷本体；
   - `picket-code-server-<版本>-SHA256SUMS` —— 校验和。
-- 载荷内置的 `product.json` 必须带 `commit`（与客户端相同）与 `version`
-  （`build/wsl/check.mjs` 会反查）。
+- 载荷内置的 `product.json` 必须带 `commit`（与客户端相同）与 `version`：客户端装配时
+  `build/wsl/fetch-payload.sh` 会从 tar 里读出它，`build/wsl/check.mjs` 再校验 catalog 与
+  产品 `product.json` 一致（`minVersion` 相等、`commit` 相等、版本 ≥ 下限）。
 
 ## 三、客户端构建怎么用
 

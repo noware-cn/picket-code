@@ -326,7 +326,7 @@ index 00000000..8d23bae8
 +module.exports = { activate, deactivate };
 diff --git a/extensions/picket-remote-wsl/package.json b/extensions/picket-remote-wsl/package.json
 new file mode 100644
-index 00000000..184524f4
+index 00000000..0dfa5687
 --- /dev/null
 +++ b/extensions/picket-remote-wsl/package.json
 @@ -0,0 +1,363 @@
@@ -456,7 +456,7 @@ index 00000000..184524f4
 +				},
 +				{
 +					"command": "picket.wsl.reopenInWindows",
-+					"when": "isWindows && !isWeb && remoteName == 'picket-wsl' && !picketWsl.blocked"
++					"when": "isWindows && !isWeb && (remoteName == 'picket-wsl' || remoteName == 'wsl') && !picketWsl.blocked"
 +				},
 +				{
 +					"command": "picket.wsl.showLog",
@@ -518,27 +518,27 @@ index 00000000..184524f4
 +			"statusBar/remoteIndicator": [
 +				{
 +					"command": "picket.wsl.openFolder",
-+					"when": "remoteName != 'picket-wsl' && !picketWsl.blocked",
++					"when": "remoteName != 'picket-wsl' && remoteName != 'wsl' && !picketWsl.blocked",
 +					"group": "remote_10_picket-wsl_0_local@1"
 +				},
 +				{
 +					"command": "picket.wsl.reopenInWsl",
-+					"when": "remoteName != 'picket-wsl' && !picketWsl.blocked",
++					"when": "remoteName != 'picket-wsl' && remoteName != 'wsl' && !picketWsl.blocked",
 +					"group": "remote_10_picket-wsl_0_local@2"
 +				},
 +				{
 +					"command": "picket.wsl.reopenInWindows",
-+					"when": "remoteName == 'picket-wsl' && !picketWsl.blocked",
++					"when": "(remoteName == 'picket-wsl' || remoteName == 'wsl') && !picketWsl.blocked",
 +					"group": "remote_10_picket-wsl_1_open@1"
 +				},
 +				{
 +					"command": "picket.wsl.stopServer",
-+					"when": "remoteName == 'picket-wsl' && !picketWsl.blocked",
++					"when": "(remoteName == 'picket-wsl' || remoteName == 'wsl') && !picketWsl.blocked",
 +					"group": "remote_10_picket-wsl_1_open@2"
 +				},
 +				{
 +					"command": "picket.wsl.diagnose",
-+					"when": "remoteName == 'picket-wsl'",
++					"when": "remoteName == 'picket-wsl' || remoteName == 'wsl'",
 +					"group": "remote_10_picket-wsl_1_open@3"
 +				},
 +				{
@@ -707,14 +707,15 @@ index 00000000..133efcc3
 +}
 diff --git a/extensions/picket-remote-wsl/src/catalog.js b/extensions/picket-remote-wsl/src/catalog.js
 new file mode 100644
-index 00000000..2ac6fe0f
+index 00000000..45983e00
 --- /dev/null
 +++ b/extensions/picket-remote-wsl/src/catalog.js
-@@ -0,0 +1,116 @@
+@@ -0,0 +1,123 @@
 +'use strict';
 +
 +const { readFile } = require('node:fs/promises');
 +const { join } = require('node:path');
++const { parseVersion } = require('./version.js');
 +
 +/**
 + * A fresh object every time, so callers cannot share one mutable catalog.
@@ -756,6 +757,12 @@ index 00000000..2ac6fe0f
 +		return undefined;
 +	}
 +	if (!nonEmpty(raw.id) || !nonEmpty(raw.version) || !nonEmpty(raw.file)) {
++		return undefined;
++	}
++	// `compareVersions` throws on anything it cannot parse, so a hand-edited or
++	// mirrored catalog must not get that far: an unreadable version drops the
++	// component instead of taking the whole selection down with it.
++	if (!parseVersion(raw.version)) {
 +		return undefined;
 +	}
 +	if (raw.kind !== 'server' && raw.kind !== 'extensions') {
@@ -4624,10 +4631,10 @@ index 00000000..c8ba4972
 +module.exports = { resolveSettings, describeOfficialSettings };
 diff --git a/extensions/picket-remote-wsl/src/shim.js b/extensions/picket-remote-wsl/src/shim.js
 new file mode 100644
-index 00000000..035c35d7
+index 00000000..4d185119
 --- /dev/null
 +++ b/extensions/picket-remote-wsl/src/shim.js
-@@ -0,0 +1,149 @@
+@@ -0,0 +1,152 @@
 +'use strict';
 +
 +// The in-distro `picket-code` shim: a small shell script that points the
@@ -4671,7 +4678,9 @@ index 00000000..035c35d7
 +// executable by the user who will run `picket-code`.
 +const VERIFY_SCRIPT = 'if [ ! -x "$2" ]; then printf not-executable; elif [ "$(readlink -f "$1")" != "$(readlink -f "$2")" ]; then printf wrong-target; else printf ok; fi';
 +const PROBE_SCRIPT = '"$1" --version >/dev/null 2>&1';
-+const REMOVE_SCRIPT = 'rm -rf "$1" "$2"';
++// Only the payload directories we created are ours to delete: the same `bin/`
++// also holds the official extension's `bin/<commit>/` server after a takeover.
++const REMOVE_SCRIPT = 'for d in "$1"/picket-*; do [ -e "$d" ] && rm -rf "$d"; done; rm -f "$2"';
 +// The `code` alias is only ours when we created it, so removal has to check
 +// where it points instead of listing the path.
 +const INSPECT_LINK_SCRIPT = 'if [ -L "$1" ]; then readlink -f "$1"; elif [ -e "$1" ]; then printf file; else printf none; fi';
@@ -4759,8 +4768,9 @@ index 00000000..035c35d7
 +}
 +
 +/**
-+ * Removes the link and every shim script we ever wrote (all tags). The shim
-+ * root is ours alone — payloads, runtime and data live in sibling directories.
++ * Removes the link and every shim script we ever wrote (all tags) — but only
++ * the `picket-*` payload directories inside `~/.vscode-server/bin`, because that
++ * root is shared with the official extension's `<commit>/` server.
 + * The `code` alias is removed only when it still resolves into that root: after
 + * a takeover it may be someone else's link, and deleting those would break the
 + * user's other tooling.
@@ -5251,10 +5261,10 @@ index 00000000..b96ee598
 +module.exports = { parseVersion, compareVersions, normalizeWant, selectComponent, describeSelectionError, engineMinimum };
 diff --git a/extensions/picket-remote-wsl/test/catalog.test.js b/extensions/picket-remote-wsl/test/catalog.test.js
 new file mode 100644
-index 00000000..b6dc5b39
+index 00000000..1d666a4e
 --- /dev/null
 +++ b/extensions/picket-remote-wsl/test/catalog.test.js
-@@ -0,0 +1,91 @@
+@@ -0,0 +1,106 @@
 +// RED first: this file must fail until src/catalog.js exists.
 +const test = require('node:test');
 +const assert = require('node:assert');
@@ -5345,6 +5355,21 @@ index 00000000..b6dc5b39
 +	const dir = extensionWith(JSON.stringify({ version: 1, tag: 'v1.143.1-picket.1-rc.4', flavor: 'ondemand', components: [VALID.components[0]] }));
 +	const catalog = await loadCatalog(dir);
 +	assert.deepStrictEqual(catalog, { schema: 2, minVersion: null, flavor: 'ondemand', components: [] });
++});
++
++test('an unparsable version is dropped instead of reaching the comparator', async () => {
++	// `compareVersions` throws on these, and one bad entry in a mirrored catalog
++	// must not be able to take the whole selection down.
++	const dir = extensionWith(JSON.stringify({
++		...VALID,
++		components: [
++			{ ...VALID.components[0], id: 'prefixed', version: 'v1.4.0' },
++			{ ...VALID.components[0], id: 'dated', version: '2026-11-05' },
++			VALID.components[0]
++		]
++	}));
++	const catalog = await loadCatalog(dir);
++	assert.deepStrictEqual(catalog.components.map(c => c.id), ['wsl-server']);
 +});
 diff --git a/extensions/picket-remote-wsl/test/commands.test.js b/extensions/picket-remote-wsl/test/commands.test.js
 new file mode 100644
@@ -8923,10 +8948,10 @@ index 00000000..b38aabc8
 +});
 diff --git a/extensions/picket-remote-wsl/test/shim.test.js b/extensions/picket-remote-wsl/test/shim.test.js
 new file mode 100644
-index 00000000..88c99249
+index 00000000..ffd788ff
 --- /dev/null
 +++ b/extensions/picket-remote-wsl/test/shim.test.js
-@@ -0,0 +1,164 @@
+@@ -0,0 +1,169 @@
 +'use strict';
 +
 +// RED first: this file must fail until src/shim.js exists.
@@ -9080,12 +9105,17 @@ index 00000000..88c99249
 +	assert.match(result.message ?? '', /wrong-target/);
 +});
 +
-+test('removeShim removes the shim root and the link, and only our own code alias', async () => {
++test('removeShim deletes only our payloads, the link and our own code alias', async () => {
 +	const r = recordingRunner([]);
 +	await removeShim({ runner: r, distro: 'Ubuntu', home: HOME });
 +	assert.strictEqual(r.calls.length, 2);
++	// `~/.vscode-server/bin` is shared with the official extension, so the script
++	// may only walk the picket-* children — never the directory itself.
++	const script = r.calls[0].args[5];
 +	assert.ok(r.calls[0].args.includes(`${HOME}/.vscode-server/bin`));
 +	assert.ok(r.calls[0].args.includes(`${HOME}/.local/bin/picket-code`));
++	assert.match(script, /"\$1"\/picket-\*/);
++	assert.doesNotMatch(script, /rm -rf "\$1"/, 'the shared bin directory must survive');
 +	// The alias has to be checked, not listed: a `code` that is not ours stays.
 +	assert.ok(r.calls[1].args.includes(`${HOME}/.vscode-server/bin`));
 +	assert.ok(r.calls[1].args.includes(`${HOME}/.local/bin/code`));

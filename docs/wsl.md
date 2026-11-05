@@ -41,7 +41,7 @@ Remote-WSL 扩展已卸载**（它装在本产品上时，WSL 功能整体关闭
 
 ## 组件来源
 
-窗口要连的服务器是 `picket-code-server-<版本>-linux-x64.tar.gz`（约 84 MB），它由独立仓库
+窗口要连的服务器是 `picket-code-server-<版本>-linux-x64.tar.gz`（约 88 MB），它由独立仓库
 `noware-cn/picket-code-server` 单独发行、**版本号独立演进**：本产品对它的要求只有两条——同一
 个 vscode commit（握手时比对），以及版本不低于随包的 `catalog.json` 里写死的 `minVersion`。
 所以升级服务端不必跟着客户端发版。三来源，优先级从高到低：
@@ -136,7 +136,8 @@ Open VSX / 自定义地址 / 关闭。
 - `Picket: 诊断 WSL 支持`：逐项检查 `wsl.exe` 是否可用、发行版列表、载荷版本、
   运行时文件与端口、连接方式、iCode 检测结果。
 - 连不上时先看运行时的磁盘状态（见下节）：`runtime/<发行版>.json` 里记着
-  `port`、`pid`、`tag`、`tunnelMode`。文件在但端口不通 = 服务器被杀或崩了。
+  `port`、`token`、`version`、`commit`、`pid`、`startedAt`、`tunnelMode`（装了 iCode 时还有
+  `icode`）。文件在但端口不通 = 服务器被杀或崩了。`token` 是连接凭据，别贴进 issue。
 - 启动超时：`picket.wsl.startTimeoutSeconds`（默认 90 秒无输出判死）。
 - 退出码 99 表示发行版与客户端 OS 不兼容（WSL 自己的约定），不是我们的 bug。
 - 连接方式：`picket.wsl.tunnelMode = auto`（默认）读 `%USERPROFILE%\.wslconfig`：

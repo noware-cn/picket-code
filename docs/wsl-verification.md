@@ -64,8 +64,10 @@ shim 的写链路有 L2 argv 断言，但只有真实的 Windows 客户端能证
 - 卸载后 `~/.vscode-server/{data,extensions}` 里的东西都在：原来的远程扩展出现在扩展视图里、
   原来的 `settings.json` 生效（`remote.Settings` 类设置仍在）；
 - `WSL 目标` 视图恢复成发行版列表（不再是禁用提示）；
-- 旧 `wsl+` 地址能直接打开，且 `诊断 WSL 支持` 的 `Extensions` 段逐条给出 `compatible=yes/no`，
-  `no` 的那些写明是 `engines.vscode` 比本产品高。
+- 旧 `wsl+` 地址能直接打开，且远程指示器菜单里有 `Reopen Folder in Windows`、`Stop WSL Server`
+  与 `诊断 WSL 支持`（`remoteName` 是 `wsl` 而不是 `picket-wsl` 时也要给全）；
+- `诊断 WSL 支持` 的 `Extensions` 段逐条给出 `compatible=yes/no`，`no` 的那些写明是
+  `engines.vscode` 比本产品高。
 
 ## 6. 命令行别名
 
