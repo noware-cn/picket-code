@@ -402,7 +402,10 @@ jobs:
           files: |
             artifacts/picket-code-*
             test-report-*.tar.gz
-          prerelease: ${{ github.event.inputs.pre_release == 'true' }}
+          # A tag push carries no inputs, so the manual `pre_release` switch alone made
+          # every `-rc.N` tag publish as a full release competing for the Latest badge.
+          # The tag name decides; the switch only adds to it.
+          prerelease: ${{ github.event.inputs.pre_release == 'true' || contains(github.ref_name, '-rc.') }}
           generate_release_notes: true
 
       # Put the mirror links on top of the generated notes; the script is shared with
