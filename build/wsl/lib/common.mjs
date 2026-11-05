@@ -62,6 +62,29 @@ export async function sha256File(path) {
 }
 
 /**
+ * Byte size of a release asset, read from a `curl -D` header dump.
+ *
+ * GitHub answers `github.com/…/releases/download/…` with a 302 whose own
+ * `Content-Length` is 0 and defers the real size to the CDN host it redirects
+ * to, so the **last** `Content-Length` header is the only useful one.
+ * @param {string} headers
+ * @returns {number} the size, or 0 when no header carried a non-zero value
+ */
+export function assetSizeFromHeaders(headers) {
+	let size = 0;
+	for (const line of headers.split('\n')) {
+		const match = /^content-length:\s*(\d+)\s*$/i.exec(line.trim());
+		if (match) {
+			const value = Number(match[1]);
+			if (value > 0) {
+				size = value;
+			}
+		}
+	}
+	return size;
+}
+
+/**
  * Minimal `--key value` reader for the packaging CLIs.
  * @param {string[]} argv
  * @returns {Record<string, string>}

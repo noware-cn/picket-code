@@ -14,7 +14,7 @@
 | L2 进程集成 | **真实 `icode acp` 协议边界**：我们的 `createIcodeTransport`/`IcodeAcpClient` 与一个**假 ACP CLI**（真进程、真 stdio、真 NDJSON） | 同上 + Node | ✅ 完全 | 1–2 min |
 | L3 宿主端到端 | 真实 agent host 进程（`agentHostServerMain.js`）+ 真实 provider + 假 ACP CLI，**AHP over WebSocket**：建会话、发消息、收到 `ChatDelta`/工具调用、恢复、审批、取消 | 同上 + `ws` | ✅ 完全（不需要 Electron/X） | 8 个用例 ~13s + 复用 build 缓存 |
 | L4 UI 冒烟 | 真实 Electron 窗口 + Agents Window + 聊天面板：文本渲染、diff 视图、ask_user 表单、审批横幅、重启后历史回填 | 完整编译（gulp 全套 + 扩展）+ Electron 二进制 + **Xvfb** | ✅ 可以做，代价 ~35–45 min | 见 §4.3 |
-| L4+ WSL 远程窗口 | 真实远程窗口（`picket-wsl+<发行版>`）+ **真实服务器载荷**，`wsl.exe` 边界由替身承担：`build/wsl/acceptance.sh --all`（remote / tunnel / ui / lifecycle / icode 五阶段 + 扩展单测） | 同上 + `xvfb-run` + 私有仓库的载荷（`PICKET_SERVER_TAG` / `PICKET_SERVER_TOKEN`）+ 带空格与中文的验收目录 | ✅ 完全（`tests-ui.yml` 的 `wsl-acceptance` job） | 10–15 min（另加 ~10 min 准备） |
+| L4+ WSL 远程窗口 | 真实远程窗口（`picket-wsl+<发行版>`）+ **真实服务器载荷**，`wsl.exe` 边界由替身承担：`build/wsl/acceptance.sh --all`（remote / tunnel / ui / lifecycle / icode 五阶段 + 扩展单测） | 同上 + `xvfb-run` + 公开仓库的载荷（`PICKET_SERVER_TAG`，匿名 HTTPS 下载）+ 带空格与中文的验收目录 | ✅ 完全（`tests-ui.yml` 的 `wsl-acceptance` job） | 10–15 min（另加 ~10 min 准备） |
 | L5 打包产物 | 安装包启动、asar 布局、无 Copilot 残留、真实窗口在 Xvfb 下启动 | 打包产物 | ✅ 已存在（`verify-release.yml`） | 8–15 min |
 | L6 真实模型质量 | iCode 回复内容是否合理、真实模型调用、Windows 真机 `.cmd` 启动 | 真模型、真 Windows | ❌ 不能自动化（无凭据、非确定性、成本不可控） | 人工 |
 

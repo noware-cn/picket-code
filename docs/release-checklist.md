@@ -20,13 +20,13 @@
 
 ## 0. 发布前置配置（一次性，改了就检查）
 
-`build/build.sh` 从 WSL 组件装配开始就**要求**下面两个值，缺任一个编译直接失败：
+`build/build.sh` 从 WSL 组件装配开始就**要求** `PICKET_SERVER_TAG`，缺它就编译失败：
 
 - 仓库变量 `PICKET_SERVER_TAG`：`noware-cn/picket-code-server` 的载荷 tag，例如
   `v1.143.1-picket.1-rc.4`。它决定这个构建内部钉的是哪份服务器载荷。
-- 仓库密钥 `PICKET_SERVER_TOKEN`：能读那个私有仓库 Release 的令牌。**应当是一个只读
-  Contents 的 fine-grained PAT**；用个人 OAuth token（`gh auth token`）能跑通，但重新登录
-  就会静默失效，而自检步骤在看到空字符串之前不会报警。
+- **不需要令牌**：那个仓库已经公开，`build/wsl/fetch-payload.sh` 用普通 HTTPS 取 Release
+  资产（`curl`，带重试与停顿检测），不再依赖 `gh`。将来若把载荷挪到私有镜像，设
+  `PICKET_SERVER_REPO` 与该仓库的只读 PAT（`PICKET_SERVER_TOKEN`）即可，脚本自动切回 `gh`。
 - `verify-release.yml` 跑完再确认一次：`gh release view <tag> --json assets` 里应有
   `…-offline-wsl.zip`（离线组件包），大小约 87 MB。
 

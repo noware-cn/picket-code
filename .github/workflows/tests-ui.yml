@@ -42,12 +42,12 @@ on:
         description: "noware-cn/picket-code-server tag whose payload the WSL job installs. Defaults to the repository variable PICKET_SERVER_TAG."
         required: false
         type: string
-    # Not `required: true`: the job guards it itself, so a missing token fails with an
-    # explanation instead of GitHub's generic "secret not provided" error. A skipped
-    # job would look green in the release gate, which is the failure mode to avoid.
+    # Optional: noware-cn/picket-code-server is public, so the payload comes down over
+    # plain HTTPS. A token is only needed when the tag points at a private mirror, and
+    # fetch-payload.sh switches to `gh` when it sees one.
     secrets:
       PICKET_SERVER_TOKEN:
-        description: "PAT that can read noware-cn/picket-code-server releases (the WSL payload). Forwarded by release.yml."
+        description: "Optional PAT for a private mirror of the WSL payload. Unused for noware-cn/picket-code-server."
         required: false
 
 permissions:
@@ -357,9 +357,9 @@ jobs:
           fetch-depth: 0
 
       # Fail in seconds with an actionable message, and never skip: a skipped job looks
-      # green in the release gate. The payload lives in the private
-      # noware-cn/picket-code-server repository, so a PAT is mandatory.
-      - name: Guard the payload credentials
+      # green in the release gate. The payload repository is public, so only the tag is
+      # required; a token is checked only when one was supplied.
+      - name: Guard the payload inputs
         shell: bash
         env:
           SERVER_TOKEN: ${{ secrets.PICKET_SERVER_TOKEN }}
@@ -374,24 +374,15 @@ jobs:
             echo "      workflow with the 'server_tag' input."
             missing=1
           fi
-          if [ -z "${SERVER_TOKEN:-}" ]; then
-            echo "FAIL: PICKET_SERVER_TOKEN is empty."
-            echo "      Set the repository secret PICKET_SERVER_TOKEN to a PAT that can read"
-            echo "      noware-cn/picket-code-server releases; build/wsl/fetch-payload.sh uses"
-            echo "      it as GH_TOKEN. release.yml must forward it on the 'uses: ..."
-            echo "      tests-ui.yml' call, or the release gate loses this job."
-            missing=1
-          fi
-          if ! command -v gh >/dev/null 2>&1; then
-            echo "FAIL: the gh CLI is missing; build/wsl/fetch-payload.sh reads the payload"
-            echo "      with 'gh release download'."
+          if [ -n "${SERVER_TOKEN:-}" ] && ! command -v gh >/dev/null 2>&1; then
+            echo "FAIL: PICKET_SERVER_TOKEN is set but the gh CLI is missing;"
+            echo "      build/wsl/fetch-payload.sh reads a private mirror with 'gh release download'."
             missing=1
           fi
           if [ "$missing" -ne 0 ]; then
             exit 1
           fi
-          gh_version="$(gh --version)"
-          echo "ok: payload tag $PICKET_SERVER_TAG (${gh_version%%$'\n'*})"
+          echo "ok: payload tag $PICKET_SERVER_TAG (anonymous download)"
 
       - name: Resolve tag (input → release tag → newest release tag → upstream latest)
         id: resolve
@@ -592,9 +583,9 @@ jobs:
           path: build/wsl/download
           key: wsl-payload-${{ env.PICKET_SERVER_TAG }}
 
-      # fetch-payload.sh reads the release with the gh CLI, verifies the tarball against
-      # SHA256SUMS and writes catalog.json from the release metadata — all of which the
-      # driver (and the smoke area) then read.
+      # fetch-payload.sh downloads the release over plain HTTPS (the payload repository is
+      # public), verifies the tarball against SHA256SUMS and writes catalog.json from the
+      # release metadata — all of which the driver (and the smoke area) then read.
       - name: Fetch the server payload (cache miss only)
         if: steps.payload.outputs.cache-hit != 'true'
         shell: bash
@@ -602,7 +593,8 @@ jobs:
           PICKET_SERVER_TOKEN: ${{ secrets.PICKET_SERVER_TOKEN }}
         run: |
           set -euo pipefail
-          echo "==> bash build/wsl/fetch-payload.sh $PICKET_SERVER_TAG"
+          token="${PICKET_SERVER_TOKEN:+with token}"
+          echo "==> bash build/wsl/fetch-payload.sh $PICKET_SERVER_TAG ${token:-anonymously}"
           bash build/wsl/fetch-payload.sh "$PICKET_SERVER_TAG"
 
       # Existence alone is not enough: a cache restored from an interrupted download

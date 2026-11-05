@@ -24,12 +24,13 @@ permissions:
 # inside the app, zero first-use download) are cut by the internal
 # distribution from a checkout that overrides PICKET_WSL_PAYLOAD=embedded.
 # PICKET_SERVER_TAG pins the noware-cn/picket-code-server release whose
-# payload ships; set it in the repo variables. PICKET_SERVER_TOKEN is a PAT
-# that can read that private repository.
+# payload ships; set it in the repo variables. That repository is public, so
+# the payload is fetched over plain HTTPS and no token is involved. (Setting
+# PICKET_SERVER_TOKEN still switches fetch-payload.sh to `gh`, for a private
+# mirror via PICKET_SERVER_REPO.)
 env:
   PICKET_WSL_PAYLOAD: ondemand
   PICKET_SERVER_TAG: ${{ vars.PICKET_SERVER_TAG }}
-  PICKET_SERVER_TOKEN: ${{ secrets.PICKET_SERVER_TOKEN }}
 
 # Gate order (docs/testing.md §3.1): the automated test layers run before anything is
 # compiled, packaged or published, so a red layer means no artifacts and no release.
@@ -100,9 +101,10 @@ jobs:
     with:
       vscode_version: ${{ needs.versions.outputs.vscode }}
     secrets:
-      # The WSL job installs the private noware-cn/picket-code-server payload, and a
-      # reusable workflow only sees the secrets the caller names explicitly. The tag
-      # travels through the PICKET_SERVER_TAG repository variable, not a secret.
+      # The WSL job installs the noware-cn/picket-code-server payload, which is
+      # public and needs no credential. A reusable workflow still only sees the
+      # secrets the caller names, so the optional token is forwarded for the
+      # private-mirror case; the tag travels through PICKET_SERVER_TAG.
       PICKET_SERVER_TOKEN: ${{ secrets.PICKET_SERVER_TOKEN }}
 
   # Compile stage: clone + patch + npm ci + upstream min build, then ship the

@@ -1012,12 +1012,12 @@ The resolver gains `endpointFor()`: a `direct` record yields the VM port, a `std
 - `assemble.mjs --app <resources/app> --tag <server-tag> --flavor embedded|ondemand [--payload f] [--sums f] [--size n]` — writes `<app>/extensions/picket-remote-wsl/payloads/catalog.json`, stamps `product.json.picketTag`, copies the payload to `resources/wsl-payloads/` for embedded (the directory `extension.js` actually reads — the plan's `payloads/` was wrong), refuses payload names without the tag, cross-checks `--sums` when given, asserts no `*.tar.gz` leaks into ondemand apps.
 - `check.mjs --app <resources/app> --flavor f [--max-embedded-mb 110]` — exit 1 + stderr message on: missing proposal key, catalog.tag ≠ picketTag, catalog.flavor ≠ `--flavor`, no component for the payload name, embedded payload missing / sha / size mismatch, extension tree over budget (`embedded payload exceeds N MB`), ondemand app containing a payload.
 - `offline-bundle.mjs --dir <download> --tag <tag> --out <zip>` — validates the staged trio (payload present, SHA256SUMS has the entry, digest matches, catalog.tag matches, catalog has the component), then zips the three files flat (`zip -j -X`, or `Compress-Archive` on win32 runners).
-- `fetch-payload.sh <server-tag> [--metadata-only]` — `gh release download` from `noware-cn/picket-code-server` (`PICKET_SERVER_REPO` overridable, `PICKET_SERVER_TOKEN`→`GH_TOKEN`); the sums asset is named `picket-code-server-<tag>-SHA256SUMS` and is renamed to `SHA256SUMS` locally; always writes `payload-size.txt` (via the releases API) and derives `catalog.json` (single writer); full mode also downloads the payload and verifies its digest before staging.
+- `fetch-payload.sh <server-tag> [--metadata-only]` — anonymous HTTPS download from the **public** `noware-cn/picket-code-server` (`PICKET_SERVER_REPO`/`PICKET_SERVER_TOKEN` overridable, and a token switches the script to `gh` for a private mirror); the sums asset is named `picket-code-server-<tag>-SHA256SUMS` and is renamed to `SHA256SUMS` locally; always writes `payload-size.txt` (from the last `Content-Length` of the redirect chain, see `lib/asset-size.mjs`) and derives `catalog.json` (single writer); full mode also downloads the payload and verifies its digest before staging.
 
 **Wiring (deviations from the original step text):**
 - `--tag` is the **server** tag from `PICKET_SERVER_TAG` (the payload repo versions independently), not the client `$2`; `picketTag` therefore identifies the shipped server payload, which is what resolver/components/diagnose key on.
 - assemble runs for **both** platforms in `build.sh` (linux gets `--flavor ondemand` too), with `--app` pointing at `VSCode-$PLATFORM-$ARCH/resources/app` — product.json and extensions/ live under `resources/app`, not the product root.
-- Flavor comes from workflow-level env `PICKET_WSL_PAYLOAD` (public releases: `ondemand`; the internal distribution overrides to `embedded`); `PICKET_SERVER_TAG` from repo variables, `PICKET_SERVER_TOKEN` from secrets.
+- Flavor comes from workflow-level env `PICKET_WSL_PAYLOAD` (public releases: `ondemand`; the internal distribution overrides to `embedded`); `PICKET_SERVER_TAG` from repo variables. No token: the payload repository is public (2026-11-05).
 - The offline bundle is built **once, in the win32 package job** (platform-independent content; duplicate artifact names would collide), uploaded as `picket-code-<ref>-offline-wsl.zip`; the release job's `picket-code-*` glob publishes it.
 - `check-contract.sh` §5: proposal key present in `build/product.json` + the four `build/wsl` tools exist + all three package paths call `check.mjs`.
 - `docs/testing.md` was left alone (it is the iCode ACP matrix); the WSL verification story lands in `docs/wsl-verification.md` in Task 14.
@@ -1237,9 +1237,15 @@ One entry per milestone, committed with the code so a reviewer can see what was 
    顺手补上载荷大小校验（流式 `maxBytes` + 哈希前比对 `catalog.size`）——原实现只声明不校验。
    仍未做：`https://` 代理、PAC、`no_proxy`。
 2. **CI 跑完整验收矩阵**：`tests-ui.yml` 新增 `wsl-acceptance` job（`xvfb-run` + `--all`），
-   输入 `server_tag`，缺凭据立即红；`release.yml` 转发 `PICKET_SERVER_TOKEN` 并让 `-rc.` tag
-   自动成为 pre-release。首次真跑即通过（run 41965322180）。
-3. **RC 发布**：`feat/picket-wsl` 上打 `v1.143.1-picket.1-rc.5`，产物 win32-x64.zip 215 MB、
+   输入 `server_tag`，缺 tag 立即红（载荷仓库后来转公开，令牌不再是前置条件）；
+   `release.yml` 让 `-rc.` tag 自动成为 pre-release。首次真跑即通过（run 41965322180）。
+3. **载荷仓库转公开（2026-11-05）**：`noware-cn/picket-code-server` 从私有改为公开，
+   `PICKET_SERVER_TOKEN` 随之删除，`fetch-payload.sh` 改用匿名 HTTPS（`curl` 带
+   `--retry-all-errors`；GitHub 的首跳 302 把自己的 `Content-Length` 写成 0，真实大小在
+   CDN 那一跳，`lib/asset-size.mjs` + 单测覆盖这个坑）。这也消掉了服务端流水线里那句
+   匿名 `git clone` 的隐患——两个仓库都公开了。代价：载荷对所有人可见（本来也已经随
+   `offline-wsl.zip` 公开分发）。
+4. **RC 发布**：`feat/picket-wsl` 上打 `v1.143.1-picket.1-rc.5`，产物 win32-x64.zip 215 MB、
    linux-x64.tar.gz 197 MB、offline-wsl.zip 87 MB、SHA256SUMS、test-report；GitHub Release 标为
    Pre-release（`v1.143.1` 仍为 Latest），R2 镜像三个文件均 200。
 
