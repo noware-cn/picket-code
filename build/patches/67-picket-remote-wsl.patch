@@ -9,10 +9,10 @@ index 00000000..96fab092
 +tsconfig.json
 diff --git a/extensions/picket-remote-wsl/extension.js b/extensions/picket-remote-wsl/extension.js
 new file mode 100644
-index 00000000..da8c343e
+index 00000000..93d7fecb
 --- /dev/null
 +++ b/extensions/picket-remote-wsl/extension.js
-@@ -0,0 +1,193 @@
+@@ -0,0 +1,211 @@
 +'use strict';
 +
 +const { join } = require('node:path');
@@ -26,6 +26,7 @@ index 00000000..da8c343e
 +const { AUTHORITY_PREFIX, parseAuthority } = require('./src/remoteUri.js');
 +const { buildDistroNodes } = require('./src/tree.js');
 +const { registerCommands, downloadFromSettings } = require('./src/commands.js');
++const { resolveSettings } = require('./src/settings.js');
 +const { maybeNudge } = require('./src/nudge.js');
 +
 +/** @param {vscode.ExtensionContext} context */
@@ -44,6 +45,20 @@ index 00000000..da8c343e
 +	/** @returns {vscode.WorkspaceConfiguration} */
 +	const config = () => vscode.workspace.getConfiguration('picket.wsl');
 +
++	// The official extension's settings, read from the root scope exactly as it
++	// read them, so a value a user carried over keeps its meaning here.
++	const readOfficial = (/** @type {string} */ key) => vscode.workspace.getConfiguration().get(key);
++
++	// The `shell` setting has a manifest default of `login`, so a plain read can
++	// never tell "the user chose login" from "nobody chose anything". Only an
++	// explicit value may outrank `remote.WSL.useShellEnvironment`.
++	const readPicket = (/** @type {string} */ key) => {
++		const inspect = config().inspect(key);
++		return inspect?.globalValue ?? inspect?.workspaceValue ?? inspect?.workspaceFolderValue
++			?? inspect?.globalLanguageValue ?? inspect?.workspaceLanguageValue ?? inspect?.workspaceFolderLanguageValue;
++	};
++	const officialSettings = { readPicket, readOfficial };
++
 +	// Getters, not values: a setting changed while a window is open must apply to
 +	// the next connection without a reload.
 +	const settings = {
@@ -54,7 +69,10 @@ index 00000000..da8c343e
 +		get useProxy() { return config().get('useProxy', true); },
 +		get icodePath() { return config().get('icodePath', ''); },
 +		get tunnelMode() { return config().get('tunnelMode', 'auto'); },
-+		get startTimeoutSeconds() { return config().get('startTimeoutSeconds', 90); }
++		get startTimeoutSeconds() { return config().get('startTimeoutSeconds', 90); },
++		get loginShell() { return resolveSettings(officialSettings).loginShell; },
++		get probeRetryTimeoutMs() { return resolveSettings(officialSettings).probeRetryTimeoutMs; },
++		officialSettings
 +	};
 +
 +	// VS Code's own proxy settings, read the same way: a user who already routed
@@ -208,10 +226,10 @@ index 00000000..da8c343e
 +module.exports = { activate, deactivate };
 diff --git a/extensions/picket-remote-wsl/package.json b/extensions/picket-remote-wsl/package.json
 new file mode 100644
-index 00000000..6ca8bb7e
+index 00000000..212049af
 --- /dev/null
 +++ b/extensions/picket-remote-wsl/package.json
-@@ -0,0 +1,316 @@
+@@ -0,0 +1,329 @@
 +{
 +	"name": "picket-remote-wsl",
 +	"displayName": "Picket Remote - WSL",
@@ -504,6 +522,19 @@ index 00000000..6ca8bb7e
 +					"default": 90,
 +					"minimum": 10,
 +					"description": "服务器启动无输出多久后判定失败。"
++				},
++				"picket.wsl.shell": {
++					"type": "string",
++					"enum": [
++						"login",
++						"none"
++					],
++					"enumDescriptions": [
++						"通过登录 shell（`sh -lc`）启动服务器，继承用户 profile 里的 PATH 与工具链。",
++						"通过 `sh -c` 启动，不 source 用户 profile。"
++					],
++					"default": "login",
++					"markdownDescription": "启动服务器时是否使用登录 shell。显式设置此项会覆盖官方 Remote-WSL 的 `#remote.WSL.useShellEnvironment#`；保持默认值时不覆盖（由官方设置决定，缺省为登录 shell）。"
 +				},
 +				"picket.wsl.probeRetrySeconds": {
 +					"type": "number",
@@ -1416,10 +1447,10 @@ index 00000000..6a6d596c
 +module.exports = { createComponentManager, markerPath };
 diff --git a/extensions/picket-remote-wsl/src/diagnose.js b/extensions/picket-remote-wsl/src/diagnose.js
 new file mode 100644
-index 00000000..f0164b2e
+index 00000000..01c2d46c
 --- /dev/null
 +++ b/extensions/picket-remote-wsl/src/diagnose.js
-@@ -0,0 +1,168 @@
+@@ -0,0 +1,176 @@
 +'use strict';
 +
 +const { readFile } = require('node:fs/promises');
@@ -1429,6 +1460,7 @@ index 00000000..f0164b2e
 +const { detectIcode } = require('./icode.js');
 +const { describeGallery } = require('./marketplace.js');
 +const { chooseTunnelMode, readWslConfigFile, wslConfigPath } = require('./preflight.js');
++const { describeOfficialSettings } = require('./settings.js');
 +
 +/**
 + * A support report is only useful if it is complete, so every probe is fenced:
@@ -1480,6 +1512,13 @@ index 00000000..f0164b2e
 +
 +	await section('Server version', async () => (await readProduct(appRoot)).version || 'none');
 +	await section('Server minimum', async () => (await readProduct(appRoot)).picketServerMinVersion || 'none');
++
++	// A user arriving from the official extension carries `remote.WSL.*` in their
++	// settings; this is the one place that says which of those keys still do
++	// something here. Without the readers every line reads "(not set)".
++	await section('Official settings', async () => describeOfficialSettings(
++		settings.officialSettings ?? { readPicket: () => undefined, readOfficial: () => undefined }
++	));
 +
 +	await section('WSL', async () => {
 +		const status = await wslStatus(runner);
@@ -2247,10 +2286,10 @@ index 00000000..cf40b908
 +module.exports = { detectIcode };
 diff --git a/extensions/picket-remote-wsl/src/launch.js b/extensions/picket-remote-wsl/src/launch.js
 new file mode 100644
-index 00000000..5a9273b7
+index 00000000..a2ffb26d
 --- /dev/null
 +++ b/extensions/picket-remote-wsl/src/launch.js
-@@ -0,0 +1,414 @@
+@@ -0,0 +1,417 @@
 +'use strict';
 +
 +const { randomBytes } = require('node:crypto');
@@ -2322,14 +2361,17 @@ index 00000000..5a9273b7
 +}
 +
 +/**
-+ * @param {{ paths: ReturnType<typeof serverPaths>, connectionToken: string, icodeBin?: string, distro: string }} options
++ * @param {{ paths: ReturnType<typeof serverPaths>, connectionToken: string, icodeBin?: string, distro: string, loginShell?: boolean }} options
 + * @returns {string[]}
 + */
 +function buildServerArgs(options) {
 +	const { paths, connectionToken, icodeBin, distro } = options;
++	// `-l` is what makes a login shell read `/etc/profile` and the user's
++	// profile, which is where `nvm`, `pyenv` and custom `PATH` entries live.
++	const shell = options.loginShell === false ? '-c' : '-lc';
 +	const flags = SERVER_FLAGS.flatMap(flag => flag === '--port=0' ? [flag, `--connection-token=${connectionToken}`] : [flag]);
 +	return [
-+		'-d', distro, '-e', 'sh', '-lc', LAUNCH_SCRIPT, paths.binary, paths.envSetupFile, icodeBin ?? '',
++		'-d', distro, '-e', 'sh', shell, LAUNCH_SCRIPT, paths.binary, paths.envSetupFile, icodeBin ?? '',
 +		...flags,
 +		`--user-data-dir=${paths.dataDir}`,
 +		`--extensions-dir=${paths.extensionsDir}`,
@@ -3638,10 +3680,10 @@ index 00000000..f736d42b
 +module.exports = { AUTHORITY_PREFIX, parseAuthority, remoteUriFor, parseUncPath, toPosixPath, toWindowsPath };
 diff --git a/extensions/picket-remote-wsl/src/resolver.js b/extensions/picket-remote-wsl/src/resolver.js
 new file mode 100644
-index 00000000..06759da5
+index 00000000..05487640
 --- /dev/null
 +++ b/extensions/picket-remote-wsl/src/resolver.js
-@@ -0,0 +1,356 @@
+@@ -0,0 +1,399 @@
 +'use strict';
 +
 +const { listDistros, defaultDistro, visibleDistros, distroHome } = require('./distro.js');
@@ -3657,7 +3699,7 @@ index 00000000..06759da5
 +/** @typedef {{ host: string, port: number, connectionToken: string }} IResolverResult */
 +/** @typedef {{ info(...parts: unknown[]): void, error(...parts: unknown[]): void }} ILog */
 +/** @typedef {{ ensure(id: string): Promise<{ payloadDir: string }> }} IComponentManager */
-+/** @typedef {{ startTimeoutSeconds?: number, probeRetrySeconds?: number, icodePath?: string, tunnelMode?: string }} ISettings */
++/** @typedef {{ startTimeoutSeconds?: number, probeRetrySeconds?: number, probeRetryTimeoutMs?: number, loginShell?: boolean, icodePath?: string, tunnelMode?: string }} ISettings */
 +
 +/**
 + * A remote authority names a distro and nothing else; everything a connection
@@ -3800,6 +3842,49 @@ index 00000000..06759da5
 +	}
 +
 +	/**
++	 * `remote.WSL.serverProbeRetryTimeout` (seconds, `0` disables retries): a
++	 * record that does not answer yet is not a record that is wrong — the server
++	 * may still be starting, or the tunnel may still be coming up. Waiting is
++	 * cheaper than a second server fighting the first over the data directory.
++	 */
++	function probeRetryMs() {
++		const value = settings.probeRetryTimeoutMs;
++		return typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : 60000;
++	}
++
++	/** @param {string} distro @param {number} pid */
++	async function isProcessAlive(distro, pid) {
++		if (!Number.isInteger(pid) || pid <= 0) {
++			return false;
++		}
++		const result = await runner.exec(['-d', distro, '-e', 'sh', '-c', 'kill -0 "$1" 2>/dev/null', 'sh', String(pid)])
++			.catch(() => ({ code: 1 }));
++		return result.code === 0;
++	}
++
++	/**
++	 * @param {IRuntimeInfo} info
++	 * @param {string} distro
++	 * @param {ReturnType<typeof serverPaths>} paths
++	 * @returns {Promise<'alive' | 'bad-token' | 'dead'>}
++	 */
++	async function probeWithRetries(info, distro, paths) {
++		const deadline = Date.now() + probeRetryMs();
++		let verdict = await probeRecorded(info, distro, paths);
++		while (verdict === 'dead' && Date.now() < deadline) {
++			// A crash or a reboot leaves a record whose process is gone. No amount
++			// of waiting brings it back, and the caller needs a start either way.
++			if (!await isProcessAlive(distro, info.pid)) {
++				return verdict;
++			}
++			const interval = Math.max(10, (settings.probeRetrySeconds ?? 2) * 1000);
++			await new Promise(resolve => setTimeout(resolve, Math.min(interval, Math.max(1, deadline - Date.now()))));
++			verdict = await probeRecorded(info, distro, paths);
++		}
++		return verdict;
++	}
++
++	/**
 +	 * @param {IRuntimeInfo} info
 +	 * @param {string} distro
 +	 * @param {ReturnType<typeof serverPaths>} paths
@@ -3818,7 +3903,7 @@ index 00000000..06759da5
 +		const stored = await lockAndRead(runner, distro, runtimeFile);
 +		if (stored && reusable(stored)) {
 +			const paths = serverPaths(home, stored.version);
-+			const verdict = await probeRecorded(stored, distro, paths);
++			const verdict = await probeWithRetries(stored, distro, paths);
 +			if (verdict === 'alive') {
 +				log.info(`Reusing ${paths.binary} on port ${stored.port} for ${distro}`);
 +				return coordinates(stored, distro, paths);
@@ -3919,7 +4004,7 @@ index 00000000..06759da5
 +		log.info(`Starting ${paths.binary}: tunnel=${tunnelMode}, icode=${icode.path ?? 'missing'} (${icode.source})`);
 +
 +		const connectionToken = newConnectionToken();
-+		const args = buildServerArgs({ paths, connectionToken, distro, icodeBin: icode.path ?? '' });
++		const args = buildServerArgs({ paths, connectionToken, distro, icodeBin: icode.path ?? '', loginShell: settings.loginShell !== false });
 +		const info = await start({
 +			runner,
 +			distro,
@@ -3998,6 +4083,97 @@ index 00000000..06759da5
 +}
 +
 +module.exports = { createResolver };
+diff --git a/extensions/picket-remote-wsl/src/settings.js b/extensions/picket-remote-wsl/src/settings.js
+new file mode 100644
+index 00000000..c8ba4972
+--- /dev/null
++++ b/extensions/picket-remote-wsl/src/settings.js
+@@ -0,0 +1,85 @@
++'use strict';
++
++/**
++ * Two of the official extension's settings have a real meaning in this
++ * implementation, and a user who came from `ms-vscode-remote.remote-wsl`
++ * expects them to keep working. Everything else it offers describes how *its*
++ * server is built, so the report names those keys instead of pretending.
++ */
++
++const PROBE_RETRY_DEFAULT_MS = 60000;
++/**
++ * The official setting is seconds of retrying; five minutes is long enough for
++ * a slow distro to come up and short enough that a typo cannot look like a hang.
++ */
++const PROBE_RETRY_MAX_MS = 300000;
++
++const IGNORED = [
++	['remote.WSL.debug', 'the Picket WSL log already records every step'],
++	['remote.WSL.downloadInBackground', 'a payload is fetched on first use only'],
++	['remote.WSL.experimental.scriptLessStartup', 'the server is always started through sh'],
++	['remote.WSL.fileWatcher.polling', 'the server uses native file watching'],
++	['remote.WSL.fileWatcher.pollingInterval', 'the server uses native file watching'],
++	['remote.WSL1.connectionMethod', 'WSL 1 is not supported'],
++	['remote.WSL2.connectionMethod', 'picket.wsl.tunnelMode decides how the port is reached']
++];
++
++/**
++ * `remote.WSL.serverProbeRetryTimeout` counts whole seconds and 0 means "do not
++ * retry". Anything else is treated as absent, which is what the official
++ * extension does too.
++ * @param {(key: string) => any} readOfficial
++ */
++function probeRetryTimeoutMs(readOfficial) {
++	const seconds = readOfficial('remote.WSL.serverProbeRetryTimeout');
++	if (typeof seconds !== 'number' || !Number.isInteger(seconds) || seconds < 0) {
++		return PROBE_RETRY_DEFAULT_MS;
++	}
++	return Math.min(seconds * 1000, PROBE_RETRY_MAX_MS);
++}
++
++/**
++ * @param {{ readPicket: (key: string) => any, readOfficial: (key: string) => any }} readers
++ * @returns {{ loginShell: boolean, probeRetryTimeoutMs: number }}
++ */
++function resolveSettings(readers) {
++	const shell = readers.readPicket('shell');
++	const login = shell === 'login' ? true
++		: shell === 'none' ? false
++			: readers.readOfficial('remote.WSL.useShellEnvironment') !== false;
++	return { loginShell: login, probeRetryTimeoutMs: probeRetryTimeoutMs(readers.readOfficial) };
++}
++
++/** @param {any} value */
++function format(value) {
++	return value === undefined ? '(not set)' : String(value);
++}
++
++/**
++ * The report is where a user finds out that a setting they carried over does
++ * nothing, so the reason has to be on the line itself.
++ * @param {{ readPicket: (key: string) => any, readOfficial: (key: string) => any }} readers
++ * @returns {string[]}
++ */
++function describeOfficialSettings(readers) {
++	const shell = readers.readPicket('shell');
++	const officialShell = readers.readOfficial('remote.WSL.useShellEnvironment');
++	const resolved = resolveSettings(readers);
++	const lines = [];
++
++	if (shell === 'login' || shell === 'none') {
++		lines.push(`remote.WSL.useShellEnvironment = ${format(officialShell)} (ignored: picket.wsl.shell = ${shell} decides)`);
++	} else {
++		lines.push(`remote.WSL.useShellEnvironment = ${format(officialShell)} (honoured: login shell ${resolved.loginShell ? 'on' : 'off'})`);
++	}
++
++	const seconds = readers.readOfficial('remote.WSL.serverProbeRetryTimeout');
++	lines.push(`remote.WSL.serverProbeRetryTimeout = ${format(seconds ?? 60)} (honoured: retry probes for ${resolved.probeRetryTimeoutMs} ms)`);
++
++	for (const [key, reason] of IGNORED) {
++		lines.push(`${key} = ${format(readers.readOfficial(key))} (ignored: ${reason})`);
++	}
++	return lines;
++}
++
++module.exports = { resolveSettings, describeOfficialSettings };
 diff --git a/extensions/picket-remote-wsl/src/shim.js b/extensions/picket-remote-wsl/src/shim.js
 new file mode 100644
 index 00000000..f13a2ded
@@ -5088,10 +5264,10 @@ index 00000000..f1c40886
 +});
 diff --git a/extensions/picket-remote-wsl/test/diagnose.test.js b/extensions/picket-remote-wsl/test/diagnose.test.js
 new file mode 100644
-index 00000000..1f84fddd
+index 00000000..abb7fa16
 --- /dev/null
 +++ b/extensions/picket-remote-wsl/test/diagnose.test.js
-@@ -0,0 +1,121 @@
+@@ -0,0 +1,139 @@
 +// RED first: this file must fail until src/diagnose.js exists.
 +const test = require('node:test');
 +const assert = require('node:assert');
@@ -5147,13 +5323,13 @@ index 00000000..1f84fddd
 +}
 +
 +/**
-+ * @param {{ runner?: any, settings?: any, product?: any, gallery?: any }} [options]
++ * @param {{ runner?: any, settings?: any, product?: any, gallery?: any, officialSettings?: any }} [options]
 + */
 +async function diagnostics(options = {}) {
 +	const root = await appRoot(options.product);
 +	return buildDiagnostics({
 +		runner: options.runner ?? happyRunner(),
-+		settings: options.settings ?? { tunnelMode: 'auto', icodePath: '', defaultDistro: '' },
++		settings: { tunnelMode: 'auto', icodePath: '', defaultDistro: '', ...(options.settings ?? {}), ...(options.officialSettings ? { officialSettings: options.officialSettings } : {}) },
 +		catalog: createCatalog(),
 +		components: () => createFakeComponents({ state: 'installed' }),
 +		appRoot: root,
@@ -5212,6 +5388,24 @@ index 00000000..1f84fddd
 +	const report = await diagnostics();
 +	assert.match(report, /wsl-server\s+installed/);
 +	assert.match(report, /picket-v1\.143\.1-picket\.1-rc\.4/);
++});
++
++test('the report lists every official setting with what it does here', async () => {
++	const report = await diagnostics({
++		officialSettings: {
++			readPicket: (/** @type {string} */ key) => (/** @type {any} */ ({ shell: 'none' }))[key],
++			readOfficial: (/** @type {string} */ key) => (/** @type {any} */ ({ 'remote.WSL.serverProbeRetryTimeout': 5 }))[key]
++		}
++	});
++	assert.match(report, /^Official settings:$/m);
++	assert.match(report, /^ {2}remote\.WSL\.useShellEnvironment = \(not set\) \(ignored: picket\.wsl\.shell = none decides\)$/m);
++	assert.match(report, /^ {2}remote\.WSL\.serverProbeRetryTimeout = 5 \(honoured: retry probes for 5000 ms\)$/m);
++	assert.match(report, /^ {2}remote\.WSL\.fileWatcher\.polling = /m);
++});
++
++test('without the readers the section still explains the defaults', async () => {
++	const report = await diagnostics();
++	assert.match(report, /^ {2}remote\.WSL\.useShellEnvironment = \(not set\) \(honoured: login shell on\)$/m);
 +});
 diff --git a/extensions/picket-remote-wsl/test/distro.test.js b/extensions/picket-remote-wsl/test/distro.test.js
 new file mode 100644
@@ -6124,10 +6318,10 @@ index 00000000..5e31eaaa
 +});
 diff --git a/extensions/picket-remote-wsl/test/launch.test.js b/extensions/picket-remote-wsl/test/launch.test.js
 new file mode 100644
-index 00000000..e49e622e
+index 00000000..15ee9c64
 --- /dev/null
 +++ b/extensions/picket-remote-wsl/test/launch.test.js
-@@ -0,0 +1,265 @@
+@@ -0,0 +1,272 @@
 +// RED first: this file must fail until src/launch.js exists.
 +const test = require('node:test');
 +const assert = require('node:assert');
@@ -6176,6 +6370,13 @@ index 00000000..e49e622e
 +	const args = buildServerArgs({ paths: p, connectionToken: 'x', icodeBin: "/home/u/my tools/it's icode", distro: 'Ubuntu 22.04 LTS' });
 +	assert.strictEqual(args[1], 'Ubuntu 22.04 LTS');
 +	assert.strictEqual(args[8], "/home/u/my tools/it's icode");
++});
++
++test('useShellEnvironment=false starts the server without a login shell', () => {
++	const p = serverPaths('/home/u', 'T');
++	const args = buildServerArgs({ paths: p, connectionToken: 'x', icodeBin: '', distro: 'Ubuntu', loginShell: false });
++	assert.strictEqual(args[4], '-c', 'no profile is sourced, so the environment is whatever wsl.exe hands over');
++	assert.strictEqual(args[6], p.binary, 'the flags after the shell keep their positions');
 +});
 +
 +test('the launch parser ignores banners and trailing noise', () => {
@@ -7163,10 +7364,10 @@ index 00000000..69414920
 +});
 diff --git a/extensions/picket-remote-wsl/test/resolver.test.js b/extensions/picket-remote-wsl/test/resolver.test.js
 new file mode 100644
-index 00000000..7888f317
+index 00000000..84ca7e37
 --- /dev/null
 +++ b/extensions/picket-remote-wsl/test/resolver.test.js
-@@ -0,0 +1,582 @@
+@@ -0,0 +1,664 @@
 +// RED first: this file must fail until src/resolver.js exists.
 +const test = require('node:test');
 +const assert = require('node:assert');
@@ -7206,7 +7407,7 @@ index 00000000..7888f317
 + * Answers the three shapes the resolver sends through `sh -c`: the lock probe,
 + * the runtime read, and (for the component manager) `ls -1t` plus marker and
 + * removal writes.
-+ * @param {{ runtime?: any, runtimeSequence?: any[], payloadDirs?: string[], home?: string, table?: string, icode?: string, locked?: boolean, lockAgeSeconds?: number }} [options]
++ * @param {{ runtime?: any, runtimeSequence?: any[], payloadDirs?: string[], home?: string, table?: string, icode?: string, locked?: boolean, lockAgeSeconds?: number, pidAlive?: boolean }} [options]
 + */
 +function makeRunner(options = {}) {
 +	const calls = [];
@@ -7252,6 +7453,9 @@ index 00000000..7888f317
 +			}
 +			if (script.includes('command -v icode')) {
 +				return { code: options.icode === undefined ? 1 : 0, stdout: options.icode ?? '', stderr: '' };
++			}
++			if (script.includes('kill -0')) {
++				return { code: options.pidAlive === true ? 0 : 1, stdout: '', stderr: '' };
 +			}
 +			if (script.startsWith('test -x')) {
 +				return { code: 1, stdout: '', stderr: '' };
@@ -7748,6 +7952,145 @@ index 00000000..7888f317
 +	assert.strictEqual(result.port, 5555);
 +	assert.strictEqual(attempts, 1);
 +	assert.strictEqual(starts.length, 1, 'an unreachable tunnel means the recorded server is gone');
++});
++
++test('a cached server that is briefly unreachable is probed again instead of being replaced', async () => {
++	// remote.WSL.serverProbeRetryTimeout exists for exactly this: WSL is up, the
++	// recorded server is starting or the network is settling, and swapping in a
++	// second server would fight the first for the data directory.
++	const runner = makeRunner({ runtime: recorded(), pidAlive: true });
++	const { starts, startServer } = startsRecording();
++	const verdicts = ['dead', 'dead', 'alive'];
++	let probed = 0;
++	const resolver = createResolver({
++		runner, product: PRODUCT, settings: { probeRetryTimeoutMs: 2000, probeRetrySeconds: 0.01 }, log: silentLog(), startServer,
++		components: () => { throw new Error('must not install when the recorded server answers in time'); },
++		probe: async () => verdicts[Math.min(probed++, verdicts.length - 1)]
++	});
++
++	assert.strictEqual((await resolver.resolve('picket-wsl+Ubuntu')).port, 41234);
++	assert.strictEqual(starts.length, 0);
++	assert.ok(probed >= 3, `the retry window was not used (${probed} probes)`);
++});
++
++test('a cached record whose process is gone is replaced without waiting out the retry window', async () => {
++	const runner = makeRunner({ runtime: recorded(), pidAlive: false });
++	const { starts, startServer } = startsRecording();
++	let probed = 0;
++	const resolver = createResolver({
++		runner, product: PRODUCT, settings: { probeRetryTimeoutMs: 30000, probeRetrySeconds: 0.01 }, log: silentLog(), startServer,
++		components: components(),
++		probe: async () => { probed += 1; return 'dead'; }
++	});
++
++	const before = Date.now();
++	assert.strictEqual((await resolver.resolve('picket-wsl+Ubuntu')).port, 5555);
++	assert.ok(Date.now() - before < 5000, 'waiting for a pid that no longer exists buys nothing');
++	assert.strictEqual(probed, 1);
++	assert.strictEqual(starts.length, 1);
++});
++
++test('a wrong token is not retried: the record is wrong, not late', async () => {
++	const runner = makeRunner({ runtime: recorded(), pidAlive: true });
++	const { starts, startServer } = startsRecording();
++	let probed = 0;
++	const resolver = createResolver({
++		runner, product: PRODUCT, settings: { probeRetryTimeoutMs: 30000, probeRetrySeconds: 0.01 }, log: silentLog(), startServer,
++		components: components(),
++		probe: async () => { probed += 1; return 'bad-token'; }
++	});
++
++	assert.strictEqual((await resolver.resolve('picket-wsl+Ubuntu')).port, 5555);
++	assert.strictEqual(probed, 1, 'a server that rejects our token will keep rejecting it');
++	assert.strictEqual(starts.length, 1);
++});
++
++test('zero retries means one probe, as the official setting documents', async () => {
++	const runner = makeRunner({ runtime: recorded(), pidAlive: true });
++	const { starts, startServer } = startsRecording();
++	let probed = 0;
++	const resolver = createResolver({
++		runner, product: PRODUCT, settings: { probeRetryTimeoutMs: 0, probeRetrySeconds: 0.01 }, log: silentLog(), startServer,
++		components: components(),
++		probe: async () => { probed += 1; return 'dead'; }
++	});
++
++	assert.strictEqual((await resolver.resolve('picket-wsl+Ubuntu')).port, 5555);
++	assert.strictEqual(probed, 1);
++	assert.strictEqual(starts.length, 1);
++});
++
++test('the login shell setting reaches the started server', async () => {
++	const runner = makeRunner();
++	const { starts, startServer } = startsRecording();
++	const resolver = createResolver({
++		runner, product: PRODUCT, settings: { loginShell: false }, log: silentLog(), startServer,
++		components: components(),
++		readWslConfig: async () => ({})
++	});
++
++	await resolver.resolve('picket-wsl+Ubuntu');
++	assert.strictEqual(starts[0].args[4], '-c');
++});
+diff --git a/extensions/picket-remote-wsl/test/settings.test.js b/extensions/picket-remote-wsl/test/settings.test.js
+new file mode 100644
+index 00000000..b38aabc8
+--- /dev/null
++++ b/extensions/picket-remote-wsl/test/settings.test.js
+@@ -0,0 +1,54 @@
++// RED first: this file must fail until src/settings.js exists.
++const test = require('node:test');
++const assert = require('node:assert');
++const { resolveSettings, describeOfficialSettings } = require('../src/settings.js');
++
++/** @param {Record<string, any>} values */
++function readers(values = {}) {
++	return {
++		readPicket: (/** @type {string} */ key) => values[`picket.${key}`],
++		readOfficial: (/** @type {string} */ key) => values[key]
++	};
++}
++
++test('an explicit Picket setting wins over the official one', () => {
++	const s = resolveSettings(readers({ 'picket.shell': 'none', 'remote.WSL.useShellEnvironment': true }));
++	assert.equal(s.loginShell, false);
++	assert.equal(resolveSettings(readers({ 'picket.shell': 'login', 'remote.WSL.useShellEnvironment': false })).loginShell, true);
++});
++
++test('the official useShellEnvironment=false is honoured', () => {
++	assert.equal(resolveSettings(readers({ 'remote.WSL.useShellEnvironment': false })).loginShell, false);
++});
++
++test('the login shell is the default when neither setting is present', () => {
++	assert.equal(resolveSettings(readers()).loginShell, true);
++});
++
++test('the official probe timeout is read in seconds and clamped', () => {
++	assert.equal(resolveSettings(readers({ 'remote.WSL.serverProbeRetryTimeout': 30 })).probeRetryTimeoutMs, 30000);
++	assert.equal(resolveSettings(readers({ 'remote.WSL.serverProbeRetryTimeout': 0 })).probeRetryTimeoutMs, 0, 'zero disables retries');
++	assert.equal(resolveSettings(readers({ 'remote.WSL.serverProbeRetryTimeout': 9e9 })).probeRetryTimeoutMs, 300000);
++});
++
++test('the probe timeout falls back to the official default of 60 s', () => {
++	assert.equal(resolveSettings(readers()).probeRetryTimeoutMs, 60000);
++	assert.equal(resolveSettings(readers({ 'remote.WSL.serverProbeRetryTimeout': -1 })).probeRetryTimeoutMs, 60000);
++	assert.equal(resolveSettings(readers({ 'remote.WSL.serverProbeRetryTimeout': 1.5 })).probeRetryTimeoutMs, 60000);
++	assert.equal(resolveSettings(readers({ 'remote.WSL.serverProbeRetryTimeout': 'thirty' })).probeRetryTimeoutMs, 60000);
++});
++
++test('the report names the two official settings we honour and why the rest are ignored', () => {
++	const lines = describeOfficialSettings(readers({ 'remote.WSL.useShellEnvironment': false, 'remote.WSL.debug': true }));
++	const joined = lines.join('\n');
++
++	assert.match(joined, /^remote\.WSL\.useShellEnvironment = false \(honoured: login shell off\)$/m);
++	assert.match(joined, /^remote\.WSL\.serverProbeRetryTimeout = 60 \(honoured: retry probes for 60000 ms\)$/m);
++	assert.match(joined, /^remote\.WSL\.debug = true \(ignored: /m);
++	assert.match(joined, /^remote\.WSL\.fileWatcher\.polling = /m);
++});
++
++test('the report says when picket.wsl.shell overrides the official setting', () => {
++	const lines = describeOfficialSettings(readers({ 'picket.shell': 'none', 'remote.WSL.useShellEnvironment': true }));
++	assert.match(lines.join('\n'), /^remote\.WSL\.useShellEnvironment = true \(ignored: picket\.wsl\.shell = none decides\)$/m);
 +});
 diff --git a/extensions/picket-remote-wsl/test/shim.test.js b/extensions/picket-remote-wsl/test/shim.test.js
 new file mode 100644
