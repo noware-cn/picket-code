@@ -9,10 +9,10 @@ index 00000000..96fab092
 +tsconfig.json
 diff --git a/extensions/picket-remote-wsl/extension.js b/extensions/picket-remote-wsl/extension.js
 new file mode 100644
-index 00000000..9116d370
+index 00000000..5b445cc1
 --- /dev/null
 +++ b/extensions/picket-remote-wsl/extension.js
-@@ -0,0 +1,226 @@
+@@ -0,0 +1,310 @@
 +'use strict';
 +
 +const { join } = require('node:path');
@@ -24,8 +24,9 @@ index 00000000..9116d370
 +const { createComponentManager } = require('./src/components.js');
 +const { createResolver } = require('./src/resolver.js');
 +const { AUTHORITY_PREFIX, LEGACY_AUTHORITY_PREFIX, parseAuthority, canonicalAuthority } = require('./src/remoteUri.js');
-+const { buildDistroNodes } = require('./src/tree.js');
-+const { registerCommands, downloadFromSettings } = require('./src/commands.js');
++const { buildDistroNodes, buildBlockedNode } = require('./src/tree.js');
++const { registerCommands, downloadFromSettings, RESIDENT_COMMANDS } = require('./src/commands.js');
++const { createOfficialGate, OFFICIAL_EXTENSION_ID } = require('./src/official.js');
 +const { resolveSettings } = require('./src/settings.js');
 +const { maybeNudge } = require('./src/nudge.js');
 +
@@ -39,6 +40,25 @@ index 00000000..9116d370
 +	// the handshake compares, `picketServerMinVersion` is the catalog floor.
 +	const product = await readProduct(vscode.env.appRoot).catch(() => undefined);
 +	log.info(`Picket WSL activated (catalog=schema-${catalog.schema}, min=${catalog.minVersion ?? 'none'}, components=${catalog.components.length}, commit=${product?.commit ?? 'none'}, server-min=${product?.picketServerMinVersion ?? 'none'})`);
++
++	// The official extension being installed turns off every WSL feature here —
++	// not "until it activates", but for as long as it exists. See src/official.js
++	// for why the two cannot share a window.
++	const gate = createOfficialGate({
++		extensions: {
++			get: (id) => vscode.extensions.getExtension(id),
++			onDidChange: (callback) => vscode.extensions.onDidChange(callback)
++		}
++	});
++	context.subscriptions.push(gate);
++
++	// The context key is what every menu entry and view button is gated on, so it
++	// is set before anything else can be clicked.
++	const setBlockedContext = () => vscode.commands.executeCommand('setContext', 'picketWsl.blocked', gate.blocked);
++	await setBlockedContext();
++	if (gate.blocked) {
++		log.info(`${OFFICIAL_EXTENSION_ID} is installed: WSL features are disabled until it is uninstalled (data is kept).`);
++	}
 +
 +	context.subscriptions.push(vscode.commands.registerCommand('picket.wsl.showLog', () => log.show()));
 +
@@ -107,37 +127,14 @@ index 00000000..9116d370
 +		download: download ?? downloadFromSettings({ settings, http: httpSettings })
 +	});
 +
-+	const resolver = createResolver({
-+		runner,
-+		product,
-+		settings,
-+		log,
-+		warn: (message) => void vscode.window.showWarningMessage(message),
-+		components: createComponents
-+	});
-+
-+	// One resolver object for both authorities: `picket-wsl+Ubuntu` is what this
-+	// extension writes, `wsl+Ubuntu` is what the official extension left behind
-+	// in saved workspaces and history. Canonicalising means each folder opens
-+	// under one identity instead of forking its state on the first reload.
-+	const authorityResolver = {
-+		resolve: async (/** @type {string} */ authority) => {
-+			const result = await resolver.resolve(authority);
-+			return new vscode.ResolvedAuthority(result.host, result.port, result.connectionToken);
-+		},
-+		getCanonicalURI: (/** @type {vscode.Uri} */ uri) => {
-+			const parsed = parseAuthority(uri.authority);
-+			if (!parsed) {
-+				return undefined;
-+			}
-+			const authority = canonicalAuthority(AUTHORITY_PREFIX, parsed.distro);
-+			return authority === uri.authority ? undefined : uri.with({ authority });
-+		}
++	// A resolver only exists while the surface is mounted. The command layer gets
++	// this handle instead of a snapshot, so a block/unblock cycle cannot leave a
++	// command holding a disposed resolver.
++	/** @type {ReturnType<typeof createResolver> | undefined} */
++	let resolver;
++	const resolverHandle = {
++		stop: (/** @type {string | undefined} */ distro) => (resolver ? resolver.stop(distro) : Promise.resolve())
 +	};
-+	for (const prefix of [AUTHORITY_PREFIX, LEGACY_AUTHORITY_PREFIX]) {
-+		context.subscriptions.push(vscode.workspace.registerRemoteAuthorityResolver(prefix, authorityResolver));
-+	}
-+	context.subscriptions.push({ dispose: () => resolver.dispose() });
 +
 +	const changed = new vscode.EventEmitter();
 +	context.subscriptions.push(changed);
@@ -151,6 +148,11 @@ index 00000000..9116d370
 +		async getChildren(element) {
 +			if (element) {
 +				return [];
++			}
++			// An empty tree would read as "WSL is broken"; one node that says why and
++			// what to do is the whole point of the gate being visible.
++			if (gate.blocked) {
++				return [buildBlockedNode()];
 +			}
 +			const activeDistro = parseAuthority(vscode.env.remoteAuthority ?? '')?.distro ?? '';
 +			try {
@@ -167,6 +169,11 @@ index 00000000..9116d370
 +			item.description = node.description;
 +			item.tooltip = node.tooltip;
 +			item.contextValue = node.contextValue;
++			if (node.blocked) {
++				item.iconPath = new vscode.ThemeIcon('warning');
++				item.command = { command: node.command, title: '卸载官方 Remote-WSL 扩展' };
++				return item;
++			}
 +			item.iconPath = new vscode.ThemeIcon(node.contextValue === 'activeDistro' ? 'vm-active' : 'vm-outline');
 +			item.command = { command: 'picket.wsl.openFolder', title: 'Open Folder', arguments: [node.distro] };
 +			return item;
@@ -208,14 +215,14 @@ index 00000000..9116d370
 +		update: async (key, value) => vscode.workspace.getConfiguration('extensions.gallery').update(key, value, vscode.ConfigurationTarget.Global)
 +	};
 +
-+	context.subscriptions.push(...registerCommands({
++	const commandOptions = {
 +		host,
 +		runner,
 +		settings,
 +		catalog,
 +		product,
 +		createComponents,
-+		resolver,
++		resolver: resolverHandle,
 +		memento: context.globalState,
 +		log,
 +		http: httpSettings,
@@ -223,17 +230,94 @@ index 00000000..9116d370
 +		gallery,
 +		currentFolders: () => vscode.workspace.workspaceFolders ?? [],
 +		currentAuthority: () => vscode.env.remoteAuthority ?? '',
-+		register: (id, run) => vscode.commands.registerCommand(id, run)
-+	}));
++		official: () => ({ installed: gate.installed, blocked: gate.blocked }),
++		// The build's own version is what `engines.vscode` is compared against:
++		// `env` exposes no version, and the product file is already read above.
++		productsVersion: product?.version,
++		register: (/** @type {string} */ id, /** @type {any} */ run) => vscode.commands.registerCommand(id, run)
++	};
 +
-+	if (!(vscode.env.remoteAuthority ?? '')) {
-+		void maybeNudge({
-+			host,
-+			memento: context.globalState,
-+			folders: vscode.workspace.workspaceFolders,
-+			openFolderInWsl: async () => { await vscode.commands.executeCommand('picket.wsl.reopenInWsl'); }
-+		}).catch((error) => log.error(`Could not show the WSL nudge: ${error.message}`));
++	// Diagnostics must answer with the gate closed: the report is the only place
++	// that says which extension is blocking and what came over from its server.
++	context.subscriptions.push(...registerCommands({ ...commandOptions, only: RESIDENT_COMMANDS }));
++
++	/** @type {Array<{ dispose(): void }>} */
++	let surface = [];
++
++	const mountWsl = () => {
++		if (surface.length > 0) {
++			return;
++		}
++		resolver = createResolver({
++			runner,
++			product,
++			settings,
++			log,
++			warn: (message) => void vscode.window.showWarningMessage(message),
++			components: createComponents
++		});
++
++		// One resolver object for both authorities: `picket-wsl+Ubuntu` is what this
++		// extension writes, `wsl+Ubuntu` is what the official extension left behind
++		// in saved workspaces and history. Canonicalising means each folder opens
++		// under one identity instead of forking its state on the first reload.
++		const authorityResolver = {
++			resolve: async (/** @type {string} */ authority) => {
++				const result = await resolver.resolve(authority);
++				return new vscode.ResolvedAuthority(result.host, result.port, result.connectionToken);
++			},
++			getCanonicalURI: (/** @type {vscode.Uri} */ uri) => {
++				const parsed = parseAuthority(uri.authority);
++				if (!parsed) {
++					return undefined;
++				}
++				const authority = canonicalAuthority(AUTHORITY_PREFIX, parsed.distro);
++				return authority === uri.authority ? undefined : uri.with({ authority });
++			}
++		};
++		for (const prefix of [AUTHORITY_PREFIX, LEGACY_AUTHORITY_PREFIX]) {
++			surface.push(vscode.workspace.registerRemoteAuthorityResolver(prefix, authorityResolver));
++		}
++		surface.push(...registerCommands({ ...commandOptions, except: RESIDENT_COMMANDS }));
++
++		if (!(vscode.env.remoteAuthority ?? '')) {
++			void maybeNudge({
++				host,
++				memento: context.globalState,
++				folders: vscode.workspace.workspaceFolders,
++				openFolderInWsl: async () => { await vscode.commands.executeCommand('picket.wsl.reopenInWsl'); }
++			}).catch((error) => log.error(`Could not show the WSL nudge: ${error.message}`));
++		}
++	};
++
++	const unmountWsl = () => {
++		for (const item of surface.splice(0)) {
++			item.dispose();
++		}
++		resolver?.dispose();
++		resolver = undefined;
++	};
++	context.subscriptions.push({ dispose: unmountWsl });
++
++	if (!gate.blocked) {
++		mountWsl();
 +	}
++
++	// Installing or removing the official extension takes effect now, not at the
++	// next reload: the folders this window cannot serve should not look available.
++	context.subscriptions.push(gate.onChange((state) => {
++		void (async () => {
++			await setBlockedContext();
++			if (state.blocked) {
++				unmountWsl();
++				log.info(`${OFFICIAL_EXTENSION_ID} was installed: WSL features are now disabled.`);
++			} else {
++				mountWsl();
++				log.info(`${OFFICIAL_EXTENSION_ID} was removed: WSL features are enabled again.`);
++			}
++			treeProvider.refresh();
++		})();
++	}));
 +}
 +
 +function deactivate() { }
@@ -241,7 +325,7 @@ index 00000000..9116d370
 +module.exports = { activate, deactivate };
 diff --git a/extensions/picket-remote-wsl/package.json b/extensions/picket-remote-wsl/package.json
 new file mode 100644
-index 00000000..78e0a1b4
+index 00000000..74f4413e
 --- /dev/null
 +++ b/extensions/picket-remote-wsl/package.json
 @@ -0,0 +1,339 @@
@@ -352,15 +436,15 @@ index 00000000..78e0a1b4
 +			"commandPalette": [
 +				{
 +					"command": "picket.wsl.openFolder",
-+					"when": "isWindows && !isWeb"
++					"when": "isWindows && !isWeb && !picketWsl.blocked"
 +				},
 +				{
 +					"command": "picket.wsl.reopenInWsl",
-+					"when": "isWindows && !isWeb && remoteName == '' && workspaceFolderCount > 0"
++					"when": "isWindows && !isWeb && remoteName == '' && workspaceFolderCount > 0 && !picketWsl.blocked"
 +				},
 +				{
 +					"command": "picket.wsl.reopenInWindows",
-+					"when": "isWindows && !isWeb && remoteName == 'picket-wsl'"
++					"when": "isWindows && !isWeb && remoteName == 'picket-wsl' && !picketWsl.blocked"
 +				},
 +				{
 +					"command": "picket.wsl.showLog",
@@ -368,11 +452,11 @@ index 00000000..78e0a1b4
 +				},
 +				{
 +					"command": "picket.wsl.stopServer",
-+					"when": "isWindows && !isWeb"
++					"when": "isWindows && !isWeb && !picketWsl.blocked"
 +				},
 +				{
 +					"command": "picket.wsl.components",
-+					"when": "isWindows && !isWeb"
++					"when": "isWindows && !isWeb && !picketWsl.blocked"
 +				},
 +				{
 +					"command": "picket.wsl.diagnose",
@@ -380,56 +464,56 @@ index 00000000..78e0a1b4
 +				},
 +				{
 +					"command": "picket.wsl.selectGallery",
-+					"when": "isWindows && !isWeb"
++					"when": "isWindows && !isWeb && !picketWsl.blocked"
 +				},
 +				{
 +					"command": "picket.wsl.installVsix",
-+					"when": "isWindows && !isWeb"
++					"when": "isWindows && !isWeb && !picketWsl.blocked"
 +				},
 +				{
 +					"command": "picket.wsl.addDistro",
-+					"when": "isWindows && !isWeb"
++					"when": "isWindows && !isWeb && !picketWsl.blocked"
 +				},
 +				{
 +					"command": "picket.wsl.setDefaultDistro",
-+					"when": "isWindows && !isWeb"
++					"when": "isWindows && !isWeb && !picketWsl.blocked"
 +				},
 +				{
 +					"command": "picket.wsl.deleteDistro",
-+					"when": "isWindows && !isWeb"
++					"when": "isWindows && !isWeb && !picketWsl.blocked"
 +				},
 +				{
 +					"command": "picket.wsl.installCli",
-+					"when": "isWindows && !isWeb"
++					"when": "isWindows && !isWeb && !picketWsl.blocked"
 +				},
 +				{
 +					"command": "picket.wsl.removeCli",
-+					"when": "isWindows && !isWeb"
++					"when": "isWindows && !isWeb && !picketWsl.blocked"
 +				},
 +				{
 +					"command": "picket.wsl.refreshTargets",
-+					"when": "isWindows && !isWeb"
++					"when": "isWindows && !isWeb && !picketWsl.blocked"
 +				}
 +			],
 +			"statusBar/remoteIndicator": [
 +				{
 +					"command": "picket.wsl.openFolder",
-+					"when": "remoteName != 'picket-wsl'",
++					"when": "remoteName != 'picket-wsl' && !picketWsl.blocked",
 +					"group": "remote_10_picket-wsl_0_local@1"
 +				},
 +				{
 +					"command": "picket.wsl.reopenInWsl",
-+					"when": "remoteName != 'picket-wsl'",
++					"when": "remoteName != 'picket-wsl' && !picketWsl.blocked",
 +					"group": "remote_10_picket-wsl_0_local@2"
 +				},
 +				{
 +					"command": "picket.wsl.reopenInWindows",
-+					"when": "remoteName == 'picket-wsl'",
++					"when": "remoteName == 'picket-wsl' && !picketWsl.blocked",
 +					"group": "remote_10_picket-wsl_1_open@1"
 +				},
 +				{
 +					"command": "picket.wsl.stopServer",
-+					"when": "remoteName == 'picket-wsl'",
++					"when": "remoteName == 'picket-wsl' && !picketWsl.blocked",
 +					"group": "remote_10_picket-wsl_1_open@2"
 +				},
 +				{
@@ -445,12 +529,12 @@ index 00000000..78e0a1b4
 +			"view/title": [
 +				{
 +					"command": "picket.wsl.refreshTargets",
-+					"when": "view == picketWsl.targets",
++					"when": "view == picketWsl.targets && !picketWsl.blocked",
 +					"group": "navigation@1"
 +				},
 +				{
 +					"command": "picket.wsl.addDistro",
-+					"when": "view == picketWsl.targets",
++					"when": "view == picketWsl.targets && !picketWsl.blocked",
 +					"group": "navigation@2"
 +				}
 +			],
@@ -720,10 +804,10 @@ index 00000000..2ac6fe0f
 +module.exports = { loadCatalog };
 diff --git a/extensions/picket-remote-wsl/src/commands.js b/extensions/picket-remote-wsl/src/commands.js
 new file mode 100644
-index 00000000..73439111
+index 00000000..6020cbb6
 --- /dev/null
 +++ b/extensions/picket-remote-wsl/src/commands.js
-@@ -0,0 +1,486 @@
+@@ -0,0 +1,502 @@
 +'use strict';
 +
 +const { listDistros, distroHome, visibleDistros } = require('./distro.js');
@@ -782,7 +866,9 @@ index 00000000..73439111
 + *   gallery?: { get(key: string): any, update(key: string, value: any): Promise<void> },
 + *   currentFolders?: () => readonly any[],
 + *   currentAuthority?: () => string,
-+ *   clientPath?: string
++ *   clientPath?: string,
++ *   official?: { installed: boolean, blocked: boolean } | (() => { installed: boolean, blocked: boolean }),
++ *   productsVersion?: string
 + * }} options
 + */
 +function createCommands(options) {
@@ -1047,7 +1133,9 @@ index 00000000..73439111
 +			catalog,
 +			components: createComponents,
 +			appRoot: options.appRoot,
-+			gallery: options.gallery ? { serviceUrl: options.gallery.get('serviceUrl') } : undefined
++			gallery: options.gallery ? { serviceUrl: options.gallery.get('serviceUrl') } : undefined,
++			official: options.official,
++			productsVersion: options.productsVersion
 +		});
 +		await host.showDocument(report);
 +	}
@@ -1199,17 +1287,29 @@ index 00000000..73439111
 +};
 +
 +/**
++ * A resident command answers whether or not the surface is mounted, because it
++ * is how a user finds out *why* nothing else works.
++ */
++const RESIDENT_COMMANDS = ['picket.wsl.diagnose'];
++
++/**
 + * `register` is `vscode.commands.registerCommand`, injected so this file never
-+ * requires `vscode`.
-+ * @param {Parameters<typeof createCommands>[0] & { register: (id: string, run: (...args: any[]) => any) => any }} options
++ * requires `vscode`. `only` and `except` split the table across the gate: an id
++ * can be registered once per window, and the resident commands are registered
++ * before the surface exists.
++ * @param {Parameters<typeof createCommands>[0] & { register: (id: string, run: (...args: any[]) => any) => any, only?: string[], except?: string[] }} options
 + * @returns {any[]}
 + */
 +function registerCommands(options) {
 +	const api = createCommands(options);
-+	return Object.entries(COMMANDS).map(([id, handler]) => options.register(id, handler(api)));
++	const only = options.only ? new Set(options.only) : undefined;
++	const except = new Set(options.except ?? []);
++	return Object.entries(COMMANDS)
++		.filter(([id]) => (only ? only.has(id) : true) && !except.has(id))
++		.map(([id, handler]) => options.register(id, handler(api)));
 +}
 +
-+module.exports = { createCommands, registerCommands, downloadFromSettings, COMMANDS, LAST_DISTRO };
++module.exports = { createCommands, registerCommands, downloadFromSettings, COMMANDS, RESIDENT_COMMANDS, LAST_DISTRO };
 diff --git a/extensions/picket-remote-wsl/src/components.js b/extensions/picket-remote-wsl/src/components.js
 new file mode 100644
 index 00000000..6a6d596c
@@ -1472,10 +1572,10 @@ index 00000000..6a6d596c
 +module.exports = { createComponentManager, markerPath };
 diff --git a/extensions/picket-remote-wsl/src/diagnose.js b/extensions/picket-remote-wsl/src/diagnose.js
 new file mode 100644
-index 00000000..01c2d46c
+index 00000000..965b4657
 --- /dev/null
 +++ b/extensions/picket-remote-wsl/src/diagnose.js
-@@ -0,0 +1,176 @@
+@@ -0,0 +1,279 @@
 +'use strict';
 +
 +const { readFile } = require('node:fs/promises');
@@ -1486,6 +1586,86 @@ index 00000000..01c2d46c
 +const { describeGallery } = require('./marketplace.js');
 +const { chooseTunnelMode, readWslConfigFile, wslConfigPath } = require('./preflight.js');
 +const { describeOfficialSettings } = require('./settings.js');
++const { compareVersions, engineMinimum } = require('./version.js');
++
++// One shell pass for every installed extension's manifest: a per-extension round
++// trip through `wsl.exe` would make the report take seconds on a machine with a
++// normal number of extensions. The tab is the only separator that cannot appear
++// in a path we hand in ourselves.
++const READ_MANIFESTS = 'for p in "$@"; do printf \'%s\\t\' "$p"; cat "$p/package.json" 2>/dev/null | tr -d \'\\r\\n\'; printf \'\\n\'; done';
++
++/**
++ * The shared `~/.vscode-server` is what makes takeover work, and it is also what
++ * carries the previous owner's extensions over: one built for the official server
++ * may declare an `engines.vscode` this client cannot satisfy, and the only
++ * symptom is that the extension quietly never activates. This section turns that
++ * into a line someone can act on.
++ * @param {{ runner: any, distro: string, home: string, productsVersion?: string }} options
++ * @returns {Promise<string[]>}
++ */
++async function extensionLines(options) {
++	const { runner, distro, home, productsVersion } = options;
++	const root = `${home}/.vscode-server/extensions`;
++	const read = async (/** @type {string} */ path) => String((await runner.exec(['-d', distro, '-e', 'sh', '-c', 'cat "$1" 2>/dev/null || true', 'sh', path])).stdout);
++
++	const raw = (await read(`${root}/extensions.json`)).trim();
++	if (!raw) {
++		return ['(none)'];
++	}
++	/** @type {any[]} */
++	let entries;
++	try {
++		const parsed = JSON.parse(raw);
++		// Written as an array, documented as `{ extensions: [] }`: both are in the wild.
++		entries = Array.isArray(parsed) ? parsed : Array.isArray(parsed?.extensions) ? parsed.extensions : [];
++	} catch {
++		return ['(none)'];
++	}
++	if (entries.length === 0) {
++		return ['(none)'];
++	}
++
++	const located = entries.map(entry => {
++		const location = entry?.location;
++		const path = String((typeof location === 'string' ? location : location?.path ?? location?.fsPath) || '');
++		return {
++			id: String(entry?.identifier?.id ?? entry?.id ?? 'unknown'),
++			version: String(entry?.version ?? '?'),
++			path: path || (entry?.relativeLocation ? `${root}/${entry.relativeLocation}` : '')
++		};
++	});
++
++	/** @type {Map<string, string | undefined>} */
++	const engines = new Map();
++	const paths = located.map(entry => entry.path).filter(Boolean);
++	if (paths.length > 0) {
++		const output = String((await runner.exec(['-d', distro, '-e', 'sh', '-c', READ_MANIFESTS, 'sh', ...paths])).stdout);
++		for (const line of output.split(/\r?\n/)) {
++			const tab = line.indexOf('\t');
++			if (tab <= 0) {
++				continue;
++			}
++			try {
++				engines.set(line.slice(0, tab), JSON.parse(line.slice(tab + 1))?.engines?.vscode);
++			} catch {
++				// Unparsable manifest: not evidence of a clash, so leave it unknown.
++			}
++		}
++	}
++
++	const lines = located.map(entry => {
++		const range = engines.get(entry.path);
++		const minimum = engineMinimum(range);
++		const compatible = !minimum || !productsVersion
++			? 'unknown'
++			: compareVersions(productsVersion, minimum) >= 0 ? 'yes' : 'no';
++		return `${entry.id}@${entry.version}  engines=${range || 'unknown'}  compatible=${compatible}`;
++	});
++	if (lines.some(line => line.endsWith('compatible=no'))) {
++		lines.push('the extensions marked compatible=no were installed for the official server; reinstall them from this build');
++	}
++	return lines;
++}
 +
 +/**
 + * A support report is only useful if it is complete, so every probe is fenced:
@@ -1499,6 +1679,8 @@ index 00000000..01c2d46c
 + *   appRoot?: string,
 + *   gallery?: { serviceUrl?: string },
 + *   platform?: string,
++ *   official?: { installed: boolean, blocked: boolean } | (() => { installed: boolean, blocked: boolean }),
++ *   productsVersion?: string,
 + *   readWslConfig?: () => Promise<{ localhostForwarding?: boolean, networkingMode?: string }>
 + * }} options
 + * @returns {Promise<string>}
@@ -1544,6 +1726,14 @@ index 00000000..01c2d46c
 +	await section('Official settings', async () => describeOfficialSettings(
 +		settings.officialSettings ?? { readPicket: () => undefined, readOfficial: () => undefined }
 +	));
++
++	await section('Official extension', async () => {
++		const state = typeof options.official === 'function' ? options.official() : options.official;
++		if (!state) {
++			return 'unknown';
++		}
++		return `installed=${state.installed ? 'yes' : 'no'}  blocked=${state.blocked ? 'yes' : 'no'}`;
++	});
 +
 +	await section('WSL', async () => {
 +		const status = await wslStatus(runner);
@@ -1599,6 +1789,19 @@ index 00000000..01c2d46c
 +		const home = await distroHome(runner, primary);
 +		const rows = await components({ distro: primary, home, runner }).list();
 +		return rows.map(row => `${row.id}  ${row.state}${row.version ? `  ${row.version}` : ''}${row.payloadDir ? `  ${row.payloadDir}` : ''}`);
++	});
++
++	// Extensions came with the shared root, not with this client; see extensionLines.
++	await section('Extensions', async () => {
++		if (!primary) {
++			throw new Error('no WSL distro installed');
++		}
++		return extensionLines({
++			runner,
++			distro: primary,
++			home: await distroHome(runner, primary),
++			productsVersion: options.productsVersion
++		});
 +	});
 +
 +	// The old private root is not deleted on upgrade: it is the only copy of
@@ -3071,6 +3274,79 @@ index 00000000..f1756287
 +}
 +
 +module.exports = { maybeNudge, NUDGE_KEY };
+diff --git a/extensions/picket-remote-wsl/src/official.js b/extensions/picket-remote-wsl/src/official.js
+new file mode 100644
+index 00000000..d74358c5
+--- /dev/null
++++ b/extensions/picket-remote-wsl/src/official.js
+@@ -0,0 +1,67 @@
++'use strict';
++
++/**
++ * `ms-vscode-remote.remote-wsl` is the extension this one replaces, and the two
++ * cannot share a window: they fight over the same `wsl+` authority, the same
++ * `~/.vscode-server` tree and the same server port, and whichever resolves
++ * first wins the folder. So the official extension being *installed* — enabled,
++ * disabled, activated or not — turns every WSL feature here off. This is not a
++ * preference; the only way back is to remove it.
++ */
++const OFFICIAL_EXTENSION_ID = 'ms-vscode-remote.remote-wsl';
++
++/** @typedef {{ blocked: boolean, installed: boolean }} IGateState */
++/** @typedef {{ get(id: string): any, onDidChange(callback: () => void): { dispose(): void } }} IExtensions */
++
++/**
++ * @param {{ extensions: IExtensions }} options
++ */
++function createOfficialGate(options) {
++	const { extensions } = options;
++	/** @type {IGateState} */
++	let state = { blocked: false, installed: false };
++	/** @type {Set<(state: IGateState) => void>} */
++	const listeners = new Set();
++
++	/** @returns {IGateState} */
++	function evaluate() {
++		let installed = false;
++		try {
++			installed = Boolean(extensions.get(OFFICIAL_EXTENSION_ID));
++		} catch {
++			// An extensions API that throws must not take WSL down with it; the
++			// next onDidChange re-evaluates, and the report shows the state.
++			installed = false;
++		}
++		state = { blocked: installed, installed };
++		return { ...state };
++	}
++
++	evaluate();
++	const subscription = extensions.onDidChange(() => {
++		const before = state.blocked;
++		const next = evaluate();
++		if (next.blocked !== before) {
++			for (const listener of [...listeners]) {
++				listener(next);
++			}
++		}
++	});
++
++	return {
++		evaluate,
++		get blocked() { return state.blocked; },
++		get installed() { return state.installed; },
++		/** @param {(state: IGateState) => void} listener */
++		onChange(listener) {
++			listeners.add(listener);
++			return { dispose() { listeners.delete(listener); } };
++		},
++		dispose() {
++			listeners.clear();
++			subscription.dispose();
++		}
++	};
++}
++
++module.exports = { OFFICIAL_EXTENSION_ID, createOfficialGate };
 diff --git a/extensions/picket-remote-wsl/src/offline.js b/extensions/picket-remote-wsl/src/offline.js
 new file mode 100644
 index 00000000..5a909a32
@@ -4401,10 +4677,10 @@ index 00000000..f13a2ded
 +module.exports = { shQuote, shimScript, installShim, removeShim };
 diff --git a/extensions/picket-remote-wsl/src/tree.js b/extensions/picket-remote-wsl/src/tree.js
 new file mode 100644
-index 00000000..83dc02a7
+index 00000000..7362fce7
 --- /dev/null
 +++ b/extensions/picket-remote-wsl/src/tree.js
-@@ -0,0 +1,33 @@
+@@ -0,0 +1,52 @@
 +'use strict';
 +
 +/**
@@ -4437,7 +4713,26 @@ index 00000000..83dc02a7
 +		.map(entry => entry.node);
 +}
 +
-+module.exports = { buildDistroNodes };
++/**
++ * A blocked tree is not an empty tree: the single node is the whole explanation
++ * and the whole fix, because "nothing here" would leave a user guessing whether
++ * WSL is broken or the feature is off.
++ * @returns {{ id: string, distro: string, label: string, description: string, contextValue: 'blocked', blocked: true, command: string, tooltip: string }}
++ */
++function buildBlockedNode() {
++	return {
++		id: 'blocked:official',
++		distro: '',
++		label: '已禁用：检测到官方 Remote-WSL 扩展',
++		description: '卸载后自动恢复',
++		contextValue: 'blocked',
++		blocked: true,
++		command: 'picket.wsl.uninstallOfficial',
++		tooltip: 'WSL 功能已禁用\n\n官方 Remote-WSL 扩展与本扩展争用同一个 wsl+ 授权、同一个 ~/.vscode-server 目录和同一个服务端口，\n两者不能同时工作。卸载官方扩展（保留数据）后，WSL 功能立即恢复。'
++	};
++}
++
++module.exports = { buildDistroNodes, buildBlockedNode };
 diff --git a/extensions/picket-remote-wsl/src/tunnel.js b/extensions/picket-remote-wsl/src/tunnel.js
 new file mode 100644
 index 00000000..07f34d81
@@ -4685,10 +4980,10 @@ index 00000000..07f34d81
 +module.exports = { PIPE_SCRIPT, createStdioTunnel };
 diff --git a/extensions/picket-remote-wsl/src/version.js b/extensions/picket-remote-wsl/src/version.js
 new file mode 100644
-index 00000000..2d8b619d
+index 00000000..b96ee598
 --- /dev/null
 +++ b/extensions/picket-remote-wsl/src/version.js
-@@ -0,0 +1,92 @@
+@@ -0,0 +1,105 @@
 +'use strict';
 +
 +/**
@@ -4780,7 +5075,20 @@ index 00000000..2d8b619d
 +	return { component: highest };
 +}
 +
-+module.exports = { parseVersion, compareVersions, normalizeWant, selectComponent, describeSelectionError };
++/**
++ * `engines.vscode` is a range, and this client only ever needs one number from
++ * it: the lowest editor the extension will load in. Anything that is not a
++ * concrete bound (`*`, deeply compound ranges) yields `undefined`, which the
++ * report prints as `unknown` rather than guessing.
++ * @param {string | undefined} range
++ * @returns {string | undefined}
++ */
++function engineMinimum(range) {
++	const match = /(?:^|[\s|])(?:\^|~|>=?|=)?\s*v?(\d+\.\d+\.\d+)/.exec(String(range ?? ''));
++	return match ? match[1] : undefined;
++}
++
++module.exports = { parseVersion, compareVersions, normalizeWant, selectComponent, describeSelectionError, engineMinimum };
 diff --git a/extensions/picket-remote-wsl/test/catalog.test.js b/extensions/picket-remote-wsl/test/catalog.test.js
 new file mode 100644
 index 00000000..b6dc5b39
@@ -5360,10 +5668,10 @@ index 00000000..f1c40886
 +});
 diff --git a/extensions/picket-remote-wsl/test/diagnose.test.js b/extensions/picket-remote-wsl/test/diagnose.test.js
 new file mode 100644
-index 00000000..abb7fa16
+index 00000000..1f3f3966
 --- /dev/null
 +++ b/extensions/picket-remote-wsl/test/diagnose.test.js
-@@ -0,0 +1,139 @@
+@@ -0,0 +1,186 @@
 +// RED first: this file must fail until src/diagnose.js exists.
 +const test = require('node:test');
 +const assert = require('node:assert');
@@ -5419,7 +5727,7 @@ index 00000000..abb7fa16
 +}
 +
 +/**
-+ * @param {{ runner?: any, settings?: any, product?: any, gallery?: any, officialSettings?: any }} [options]
++ * @param {{ runner?: any, settings?: any, product?: any, gallery?: any, officialSettings?: any, official?: any, productsVersion?: string }} [options]
 + */
 +async function diagnostics(options = {}) {
 +	const root = await appRoot(options.product);
@@ -5430,13 +5738,28 @@ index 00000000..abb7fa16
 +		components: () => createFakeComponents({ state: 'installed' }),
 +		appRoot: root,
 +		gallery: options.gallery,
++		official: options.official,
++		productsVersion: options.productsVersion,
 +		readWslConfig: async () => ({ localhostForwarding: true })
 +	});
 +}
 +
++/**
++ * `extensions.json` is read with one `cat`, the manifests with one loop: the
++ * runner sees exactly those two shapes.
++ * @param {any[]} entries
++ * @param {Array<[string, string]>} manifests
++ */
++function extensionsRunner(entries, manifests) {
++	return happyRunner([
++		['extensions.json', { stdout: JSON.stringify({ extensions: entries }) }],
++		['for p in', { stdout: manifests.map(([path, range]) => `${path}\t${JSON.stringify({ engines: { vscode: range } })}`).join('\n') + '\n' }]
++	]);
++}
++
 +test('the report carries a line for every thing a support request needs', async () => {
 +	const report = await diagnostics();
-+	for (const heading of ['Server version', 'Server minimum', 'WSL', 'Distros', 'Tunnel mode', 'Components', 'iCode', 'node', 'git', 'Gallery']) {
++	for (const heading of ['Server version', 'Server minimum', 'Official extension', 'Official settings', 'WSL', 'Distros', 'Tunnel mode', 'Components', 'Extensions', 'iCode', 'node', 'git', 'Gallery']) {
 +		assert.match(report, new RegExp(`^${heading}:`, 'm'), `missing the ${heading} section:\n${report}`);
 +	}
 +	assert.match(report, /Ubuntu-24\.04/);
@@ -5502,6 +5825,38 @@ index 00000000..abb7fa16
 +test('without the readers the section still explains the defaults', async () => {
 +	const report = await diagnostics();
 +	assert.match(report, /^ {2}remote\.WSL\.useShellEnvironment = \(not set\) \(honoured: login shell on\)$/m);
++});
++
++test('the official extension is a line of its own, because it decides everything else', async () => {
++	const blocked = await diagnostics({ official: { installed: true, blocked: true } });
++	assert.match(blocked, /^Official extension: installed=yes {2}blocked=yes$/m);
++	// A getter, so a report opened after an uninstall tells the truth.
++	const released = await diagnostics({ official: () => ({ installed: false, blocked: false }) });
++	assert.match(released, /^Official extension: installed=no {2}blocked=no$/m);
++	const unknown = await diagnostics();
++	assert.match(unknown, /^Official extension: unknown$/m);
++});
++
++test('an extension carried over from the official server is reported as too new', async () => {
++	const report = await diagnostics({
++		productsVersion: '1.143.1',
++		runner: extensionsRunner(
++			[
++				{ identifier: { id: 'ms-vscode-remote.remote-containers' }, version: '0.340.0', location: { path: '/home/u/.vscode-server/extensions/containers-0.340.0' } },
++				{ identifier: { id: 'esbenp.prettier-vscode' }, version: '10.1.0', location: { path: '/home/u/.vscode-server/extensions/prettier-10.1.0' } }
++			],
++			[['/home/u/.vscode-server/extensions/containers-0.340.0', '^1.150.0'], ['/home/u/.vscode-server/extensions/prettier-10.1.0', '^1.80.0']]
++		)
++	});
++	assert.match(report, /^ {2}ms-vscode-remote\.remote-containers@0\.340\.0 {2}engines=\^1\.150\.0 {2}compatible=no$/m);
++	assert.match(report, /^ {2}esbenp\.prettier-vscode@10\.1\.0 {2}engines=\^1\.80\.0 {2}compatible=yes$/m);
++	assert.match(report, /reinstall them from this build/);
++});
++
++test('an unreadable extension list is a state, not a crash', async () => {
++	const report = await diagnostics();
++	assert.match(report, /^Extensions:$/m);
++	assert.match(report, /^ {2}\(none\)$/m);
 +});
 diff --git a/extensions/picket-remote-wsl/test/distro.test.js b/extensions/picket-remote-wsl/test/distro.test.js
 new file mode 100644
@@ -6764,16 +7119,16 @@ index 00000000..118dde5d
 +});
 diff --git a/extensions/picket-remote-wsl/test/manifest.test.js b/extensions/picket-remote-wsl/test/manifest.test.js
 new file mode 100644
-index 00000000..21f7dc0a
+index 00000000..41473a16
 --- /dev/null
 +++ b/extensions/picket-remote-wsl/test/manifest.test.js
-@@ -0,0 +1,74 @@
+@@ -0,0 +1,97 @@
 +// RED first: the manifest and the code must agree about which commands exist.
 +const test = require('node:test');
 +const assert = require('node:assert');
 +const { readFileSync } = require('node:fs');
 +const { join } = require('node:path');
-+const { COMMANDS } = require('../src/commands.js');
++const { COMMANDS, RESIDENT_COMMANDS } = require('../src/commands.js');
 +
 +const root = join(__dirname, '..');
 +const manifest = JSON.parse(readFileSync(join(root, 'package.json'), 'utf8'));
@@ -6841,6 +7196,29 @@ index 00000000..21f7dc0a
 +	const authorities = manifest.contributes.resourceLabelFormatters.map((/** @type {any} */ entry) => entry.authority);
 +	assert.ok(authorities.includes('picket-wsl+*'));
 +	assert.ok(authorities.includes('wsl+*'), 'a workspace carried over from the official extension must look like ours');
++});
++
++test('the surface is mounted only while the gate is open', () => {
++	// The branch is the guarantee: resolver, tree commands and the nudge live in
++	// `mountWsl`, and nothing but this call reaches it.
++	assert.match(extension, /if \(!gate\.blocked\) \{\s*mountWsl\(\);/);
++	assert.match(extension, /registerCommands\(\{ \.\.\.commandOptions, only: RESIDENT_COMMANDS \}\)/);
++	assert.match(extension, /registerCommands\(\{ \.\.\.commandOptions, except: RESIDENT_COMMANDS \}\)/);
++	assert.match(extension, /'setContext', 'picketWsl\.blocked'/);
++});
++
++test('every clickable command is hidden while the gate is closed', () => {
++	const resident = new Set([...RESIDENT_COMMANDS, 'picket.wsl.showLog']);
++	for (const entry of manifest.contributes.menus.commandPalette) {
++		if (resident.has(entry.command)) {
++			assert.doesNotMatch(entry.when, /blocked/, `${entry.command} must stay reachable while blocked`);
++			continue;
++		}
++		assert.match(entry.when, /!picketWsl\.blocked/, `${entry.command} stays clickable while blocked`);
++	}
++	for (const entry of manifest.contributes.menus['view/title']) {
++		assert.match(entry.when, /!picketWsl\.blocked/, `${entry.command} stays clickable while blocked`);
++	}
 +});
 diff --git a/extensions/picket-remote-wsl/test/marketplace.test.js b/extensions/picket-remote-wsl/test/marketplace.test.js
 new file mode 100644
@@ -7021,6 +7399,88 @@ index 00000000..1ae6d0d9
 +	const host = createFakeHost();
 +	assert.strictEqual(await maybeNudge({ host, memento: memento(), folders: [] }), false);
 +	assert.deepStrictEqual(host.messages, []);
++});
+diff --git a/extensions/picket-remote-wsl/test/official.test.js b/extensions/picket-remote-wsl/test/official.test.js
+new file mode 100644
+index 00000000..96f2dca3
+--- /dev/null
++++ b/extensions/picket-remote-wsl/test/official.test.js
+@@ -0,0 +1,76 @@
++// RED first: this file must fail until src/official.js exists.
++const test = require('node:test');
++const assert = require('node:assert');
++const { OFFICIAL_EXTENSION_ID, createOfficialGate } = require('../src/official.js');
++
++/** @param {{ installed?: () => any }} [options] */
++function fakeExtensions(options = {}) {
++	const listeners = [];
++	return {
++		listeners,
++		get: () => (options.installed ? options.installed() : undefined),
++		onDidChange: (/** @type {() => void} */ callback) => {
++			listeners.push(callback);
++			return { dispose() { listeners.splice(listeners.indexOf(callback), 1); } };
++		}
++	};
++}
++
++test('an installed official extension blocks everything, enabled or not', () => {
++	const gate = createOfficialGate({ extensions: fakeExtensions({ installed: () => ({ id: OFFICIAL_EXTENSION_ID, isActive: false }) }) });
++	assert.deepStrictEqual(gate.evaluate(), { blocked: true, installed: true });
++	assert.strictEqual(gate.blocked, true);
++});
++
++test('nothing installed means nothing blocked', () => {
++	const gate = createOfficialGate({ extensions: fakeExtensions() });
++	assert.deepStrictEqual(gate.evaluate(), { blocked: false, installed: false });
++});
++
++test('installing it while the window is open flips the gate', () => {
++	let installed = false;
++	const extensions = fakeExtensions({ installed: () => (installed ? { id: OFFICIAL_EXTENSION_ID } : undefined) });
++	const gate = createOfficialGate({ extensions });
++	/** @type {boolean[]} */
++	const seen = [];
++	gate.onChange((/** @type {any} */ state) => seen.push(state.blocked));
++
++	installed = true;
++	extensions.listeners.forEach(callback => callback());
++	assert.deepStrictEqual(seen, [true]);
++
++	// A second event with no change must not flap the surface.
++	extensions.listeners.forEach(callback => callback());
++	assert.deepStrictEqual(seen, [true]);
++});
++
++test('uninstalling it releases the gate again', () => {
++	let installed = true;
++	const extensions = fakeExtensions({ installed: () => (installed ? { id: OFFICIAL_EXTENSION_ID } : undefined) });
++	const gate = createOfficialGate({ extensions });
++	/** @type {boolean[]} */
++	const seen = [];
++	gate.onChange((/** @type {any} */ state) => seen.push(state.blocked));
++
++	installed = false;
++	extensions.listeners.forEach(callback => callback());
++	assert.deepStrictEqual(seen, [false]);
++	assert.strictEqual(gate.blocked, false);
++});
++
++test('a throwing extensions API does not block WSL', () => {
++	const gate = createOfficialGate({
++		extensions: {
++			get() { throw new Error('Extensions API unavailable'); },
++			onDidChange: () => ({ dispose() { } })
++		}
++	});
++	assert.strictEqual(gate.blocked, false);
++});
++
++test('dispose detaches from the extensions API', () => {
++	const extensions = fakeExtensions();
++	const gate = createOfficialGate({ extensions });
++	gate.dispose();
++	assert.strictEqual(extensions.listeners.length, 0);
 +});
 diff --git a/extensions/picket-remote-wsl/test/offline.test.js b/extensions/picket-remote-wsl/test/offline.test.js
 new file mode 100644
@@ -8417,14 +8877,14 @@ index 00000000..b73665c7
 +});
 diff --git a/extensions/picket-remote-wsl/test/tree.test.js b/extensions/picket-remote-wsl/test/tree.test.js
 new file mode 100644
-index 00000000..864c9d17
+index 00000000..5f307544
 --- /dev/null
 +++ b/extensions/picket-remote-wsl/test/tree.test.js
-@@ -0,0 +1,45 @@
+@@ -0,0 +1,53 @@
 +// RED first: this file must fail until src/tree.js exists.
 +const test = require('node:test');
 +const assert = require('node:assert');
-+const { buildDistroNodes } = require('../src/tree.js');
++const { buildDistroNodes, buildBlockedNode } = require('../src/tree.js');
 +const { visibleDistros } = require('../src/distro.js');
 +
 +const LIST = [
@@ -8465,6 +8925,14 @@ index 00000000..864c9d17
 +
 +test('no distros produce no nodes rather than an error', () => {
 +	assert.deepStrictEqual(buildDistroNodes([], {}), []);
++});
++
++test('a blocked tree has one node that says why and what to do', () => {
++	const node = buildBlockedNode();
++	assert.strictEqual(node.blocked, true);
++	assert.match(node.label, /官方 Remote-WSL/);
++	assert.strictEqual(node.command, 'picket.wsl.uninstallOfficial');
++	assert.strictEqual(node.contextValue, 'blocked');
 +});
 diff --git a/extensions/picket-remote-wsl/test/tunnel.test.js b/extensions/picket-remote-wsl/test/tunnel.test.js
 new file mode 100644
@@ -8696,14 +9164,14 @@ index 00000000..bfcd4e81
 +});
 diff --git a/extensions/picket-remote-wsl/test/version.test.js b/extensions/picket-remote-wsl/test/version.test.js
 new file mode 100644
-index 00000000..c5533c26
+index 00000000..093514e6
 --- /dev/null
 +++ b/extensions/picket-remote-wsl/test/version.test.js
-@@ -0,0 +1,64 @@
+@@ -0,0 +1,74 @@
 +// RED first: this file must fail until src/version.js exists.
 +const test = require('node:test');
 +const assert = require('node:assert');
-+const { compareVersions, normalizeWant, parseVersion, selectComponent } = require('../src/version.js');
++const { compareVersions, engineMinimum, normalizeWant, parseVersion, selectComponent } = require('../src/version.js');
 +
 +/** @param {string[]} versions @param {string} [commit] */
 +function catalogOf(versions, commit = 'abc') {
@@ -8763,6 +9231,16 @@ index 00000000..c5533c26
 +
 +test('a stamped build is never treated as stampless', () => {
 +	assert.deepEqual(normalizeWant({ commit: 'abc', minVersion: '1.2.0' }), { commit: 'abc', minVersion: '1.2.0', anyCommit: false });
++});
++
++test('the engines lower bound is what decides whether an extension can load', () => {
++	assert.strictEqual(engineMinimum('^1.143.0'), '1.143.0');
++	assert.strictEqual(engineMinimum('>=1.80.0'), '1.80.0');
++	assert.strictEqual(engineMinimum('~1.90.0'), '1.90.0');
++	assert.strictEqual(engineMinimum('1.75.0'), '1.75.0');
++	assert.strictEqual(engineMinimum('>=1.80.0 <2.0.0'), '1.80.0');
++	assert.strictEqual(engineMinimum('*'), undefined);
++	assert.strictEqual(engineMinimum(undefined), undefined);
 +});
 diff --git a/test/automation/src/code.ts b/test/automation/src/code.ts
 index 4c0d9bda..8ff230a3 100644

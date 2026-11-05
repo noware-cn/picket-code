@@ -81,6 +81,12 @@ fi
 # ---- 5. the WSL server component stays wired into the packaging pipeline ----
 grep -q '"noware.picket-remote-wsl"' "$ROOT_DIR/build/product.json" \
   || fail "build/product.json lost the picket-remote-wsl API proposal"
+# The official extension is what we replace, so it must not keep API rights in a
+# build that cannot contain it: a proposal granted to an id nothing ships is a
+# silent hole for anyone who installs that id later.
+if grep -q '"ms-vscode-remote.remote-wsl"' "$ROOT_DIR/build/product.json"; then
+  fail "build/product.json still grants API proposals to ms-vscode-remote.remote-wsl"
+fi
 for f in build.sh win32/package.sh linux/package.sh; do
   grep -q 'wsl/check.mjs' "$SCRIPT_DIR/$f" \
     || fail "$f no longer verifies the WSL component before packaging"
