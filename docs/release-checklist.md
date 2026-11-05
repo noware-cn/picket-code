@@ -18,6 +18,18 @@
   - [ ] `tests-ui.yml` 的 `wsl-acceptance` job（WSL 验收矩阵，`build/wsl/acceptance.sh --all`）
   - [ ] `verify-release.yml`（L5 打包产物启动）
 
+## 0. 发布前置配置（一次性，改了就检查）
+
+`build/build.sh` 从 WSL 组件装配开始就**要求**下面两个值，缺任一个编译直接失败：
+
+- 仓库变量 `PICKET_SERVER_TAG`：`noware-cn/picket-code-server` 的载荷 tag，例如
+  `v1.143.1-picket.1-rc.4`。它决定这个构建内部钉的是哪份服务器载荷。
+- 仓库密钥 `PICKET_SERVER_TOKEN`：能读那个私有仓库 Release 的令牌。**应当是一个只读
+  Contents 的 fine-grained PAT**；用个人 OAuth token（`gh auth token`）能跑通，但重新登录
+  就会静默失效，而自检步骤在看到空字符串之前不会报警。
+- `verify-release.yml` 跑完再确认一次：`gh release view <tag> --json assets` 里应有
+  `…-offline-wsl.zip`（离线组件包），大小约 87 MB。
+
 报告链接取法（发布后再补）：`gh release view <tag> --json assets --jq '.assets[].name'`
 —— 附件里是全部 `test-results/*.xml` 与汇总 `summary.md`；同一次发布的 Markdown 汇总
 同时出现在 Release workflow 的 Summary 页（`GITHUB_STEP_SUMMARY`）。
