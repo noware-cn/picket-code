@@ -6,14 +6,26 @@ name: tests (UI)
 # never runs on a PR — only on a schedule, by hand, or as a release gate (release.yml
 # calls this file on tag pushes).
 #
-# The single job deliberately mirrors upstream microsoft/vscode's smoke-test workflow:
+# The `ui` job deliberately mirrors upstream microsoft/vscode's smoke-test workflow:
 # clone the pinned tree, apply the Picket Code patches, compile, then
 # `npm run smoketest-no-compile -- -f icode`.
+#
+# The second job, `wsl-acceptance`, runs the whole picket-remote-wsl matrix
+# (`build/wsl/acceptance.sh --all`: remote window, stdio tunnel, WSL smoke area,
+# lifecycle, icode) on the same kind of Electron-on-Linux runner. It lives here
+# rather than in its own workflow because it needs exactly the install path above —
+# clone + patches + transpile + preLaunch + the two smoke-harness packages + Xvfb +
+# the unprivileged-userns sysctl; a separate file would be a near-copy of those
+# twelve steps. It costs 10–15 minutes and, like `ui`, never runs on a PR.
 on:
   workflow_dispatch:
     inputs:
       vscode_version:
         description: "Upstream VS Code tag to test (e.g. 1.143.1). Defaults to the newest picket-code release tag."
+        required: false
+        type: string
+      server_tag:
+        description: "noware-cn/picket-code-server tag whose payload the WSL job installs. Defaults to the repository variable PICKET_SERVER_TAG."
         required: false
         type: string
   schedule:
@@ -26,6 +38,17 @@ on:
         description: "Upstream VS Code tag to test (e.g. 1.143.1). Defaults to the newest picket-code release tag."
         required: false
         type: string
+      server_tag:
+        description: "noware-cn/picket-code-server tag whose payload the WSL job installs. Defaults to the repository variable PICKET_SERVER_TAG."
+        required: false
+        type: string
+    # Not `required: true`: the job guards it itself, so a missing token fails with an
+    # explanation instead of GitHub's generic "secret not provided" error. A skipped
+    # job would look green in the release gate, which is the failure mode to avoid.
+    secrets:
+      PICKET_SERVER_TOKEN:
+        description: "PAT that can read noware-cn/picket-code-server releases (the WSL payload). Forwarded by release.yml."
+        required: false
 
 permissions:
   contents: read
@@ -282,6 +305,434 @@ jobs:
           path: |
             vscode/.build/logs
             vscode/test/smoke/smoke-test-runner.log
+            test-results
+          if-no-files-found: warn
+          retention-days: 14
+
+  # ---------------------------------------------------------------------------------
+  # L4+, WSL: the picket-remote-wsl feature matrix on a Linux desktop session.
+  #
+  # `build/wsl/acceptance.sh --all` is the documented entry point
+  # (docs/wsl-verification.md):
+  #   --l2         extension unit tests (no display, seconds)
+  #   --remote     a real Electron window on picket-wsl+<distro>, opened through the
+  #                stand-in wsl.exe (test/wsl-harness/fake-wsl.mjs), which installs the
+  #                *real* server payload into a scratch HOME
+  #   --tunnel     the same window over the stdio relay (picket.wsl.tunnelMode: stdio)
+  #   --ui         the WSL area of the smoke suite (test/smoke/src/areas/wsl)
+  #   --lifecycle  20 open/close cycles reusing exactly one server process
+  #   --icode      a bogus picket.wsl.icodePath must not be exported into the distro
+  # Only the wsl.exe boundary is faked. The payload, the server process and the window
+  # are real, which is why this needs a Linux desktop runner, not a unit-test job.
+  #
+  # Setup repeats `ui` on purpose: jobs do not share a filesystem, and the payload +
+  # matrix are the only WSL-specific parts. The apt set is deliberately identical, so a
+  # package rename on a new runner image breaks one list, not two divergent ones.
+  # ---------------------------------------------------------------------------------
+  wsl-acceptance:
+    name: "WSL acceptance (L4+: remote window, tunnel, lifecycle)"
+    runs-on: ubuntu-latest
+    # ~10 min of setup (clone, npm ci, transpile, preLaunch, payload) plus ~10–15 min of
+    # matrix; the acceptance driver's own deadlines are 180 s per window.
+    timeout-minutes: 40
+    # /tmp/picket-wsl-accept is shared state: the driver wipes the scratch HOME between
+    # stages, so two runs must never overlap on one runner. The workflow-level group
+    # above already serialises this workflow per ref; this group states the guarantee
+    # for the one directory the job does not own.
+    concurrency:
+      group: wsl-acceptance-${{ github.ref }}
+      cancel-in-progress: false
+    env:
+      # The driver's own default, named here so the artifact paths below cannot drift
+      # from the directory the script actually used.
+      PICKET_WSL_ACCEPT_HOME: /tmp/picket-wsl-accept
+      # Release of noware-cn/picket-code-server whose payload is installed into the
+      # scratch distro. Repository variable — release.yml pins the shipped build with
+      # the same one; the dispatch input overrides it for an unreleased payload.
+      PICKET_SERVER_TAG: ${{ inputs.server_tag || vars.PICKET_SERVER_TAG }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # git tag --list needs the tags, see the resolve step.
+          fetch-depth: 0
+
+      # Fail in seconds with an actionable message, and never skip: a skipped job looks
+      # green in the release gate. The payload lives in the private
+      # noware-cn/picket-code-server repository, so a PAT is mandatory.
+      - name: Guard the payload credentials
+        shell: bash
+        env:
+          SERVER_TOKEN: ${{ secrets.PICKET_SERVER_TOKEN }}
+        run: |
+          set -euo pipefail
+          missing=0
+          if [ -z "${PICKET_SERVER_TAG:-}" ]; then
+            echo "FAIL: PICKET_SERVER_TAG is empty."
+            echo "      Set the repository variable PICKET_SERVER_TAG (Settings -> Secrets and"
+            echo "      variables -> Actions -> Variables) to the noware-cn/picket-code-server"
+            echo "      release tag whose payload this branch installs, or dispatch this"
+            echo "      workflow with the 'server_tag' input."
+            missing=1
+          fi
+          if [ -z "${SERVER_TOKEN:-}" ]; then
+            echo "FAIL: PICKET_SERVER_TOKEN is empty."
+            echo "      Set the repository secret PICKET_SERVER_TOKEN to a PAT that can read"
+            echo "      noware-cn/picket-code-server releases; build/wsl/fetch-payload.sh uses"
+            echo "      it as GH_TOKEN. release.yml must forward it on the 'uses: ..."
+            echo "      tests-ui.yml' call, or the release gate loses this job."
+            missing=1
+          fi
+          if ! command -v gh >/dev/null 2>&1; then
+            echo "FAIL: the gh CLI is missing; build/wsl/fetch-payload.sh reads the payload"
+            echo "      with 'gh release download'."
+            missing=1
+          fi
+          if [ "$missing" -ne 0 ]; then
+            exit 1
+          fi
+          gh_version="$(gh --version)"
+          echo "ok: payload tag $PICKET_SERVER_TAG (${gh_version%%$'\n'*})"
+
+      - name: Resolve tag (input → release tag → newest release tag → upstream latest)
+        id: resolve
+        shell: bash
+        env:
+          INPUT_TAG: ${{ inputs.vscode_version }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          tag="$INPUT_TAG"
+          if [ -z "$tag" ] && [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            tag="${GITHUB_REF_NAME#v}"
+            tag="${tag%%-p*}"
+          fi
+          if [ -z "$tag" ]; then
+            newest="$(git tag --list 'v[0-9]*' --sort=-v:refname | head -1 || true)"
+            echo "newest release tag in this repository: ${newest:-<none>}"
+            tag="$(printf '%s' "$newest" | sed -e 's/^v//' -e 's/-p.*$//')"
+          fi
+          if ! [[ "$tag" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "no usable tag found; falling back to the latest stable microsoft/vscode release"
+            tag="$(curl -fsSL -H "Authorization: Bearer $GITHUB_TOKEN" \
+              https://api.github.com/repos/microsoft/vscode/releases/latest \
+              | python3 -c 'import sys,json;print(json.load(sys.stdin)["tag_name"])')"
+          fi
+          tag="$(printf '%s' "$tag" | tr -d '[:space:]')"
+          node_version="$(curl -fsSL "https://raw.githubusercontent.com/microsoft/vscode/$tag/.nvmrc" | tr -d '[:space:]')"
+          echo "testing upstream VS Code $tag with node $node_version"
+          echo "vscode=$tag" >> "$GITHUB_OUTPUT"
+          echo "node=$node_version" >> "$GITHUB_OUTPUT"
+
+      # The extension, its suites, the remote harness and the smoke area all arrive with
+      # patch 67; without it every stage below would match an empty tree and read green.
+      - name: Assert the WSL patch is enabled
+        shell: bash
+        run: |
+          set -euo pipefail
+          patch_name=67-picket-remote-wsl.patch
+          if ! grep -qx "$patch_name" build/patches/apply-list.txt; then
+            echo "FAIL: $patch_name is not enabled in build/patches/apply-list.txt;"
+            echo "      the acceptance matrix would test an empty tree and pass vacuously."
+            exit 1
+          fi
+          test -f "build/patches/$patch_name"
+          echo "ok: $patch_name is enabled"
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: ${{ steps.resolve.outputs.node }}
+
+      # Identical to the `ui` job above: Xvfb plus Electron's shared libraries plus the
+      # compile-time headers node-gyp needs. libatk1.0-0 comes in as a dependency of
+      # libatk-bridge2.0-0 / libgtk-3-0, so it is not listed again here.
+      - name: Install Linux UI dependencies (Xvfb + Electron runtime + dev headers)
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "==> sudo apt-get install -y xvfb libnss3 libxss1 libatk-bridge2.0-0 libgtk-3-0 libasound2t64 libgbm1 libxkbcommon0 libkrb5-dev libx11-dev libxkbfile-dev libsecret-1-dev libxext-dev libxrender-dev libxrandr-dev"
+          sudo apt-get update
+          sudo apt-get install -y \
+            xvfb libnss3 libxss1 libatk-bridge2.0-0 libgtk-3-0 libasound2t64 libgbm1 libxkbcommon0 \
+            libkrb5-dev libx11-dev libxkbfile-dev libsecret-1-dev libxext-dev libxrender-dev libxrandr-dev
+
+      # Package names move between runner images (libasound2 -> libasound2t64 on 24.04).
+      # A rename must fail here, in seconds, instead of surfacing as "cannot open
+      # display" or a missing .so after the ten-minute clone + transpile below.
+      - name: Assert the desktop session prerequisites
+        shell: bash
+        run: |
+          set -euo pipefail
+          missing=0
+          for bin in xvfb-run Xvfb setsid pgrep; do
+            if command -v "$bin" >/dev/null 2>&1; then
+              echo "ok: $bin"
+            else
+              echo "MISSING: $bin"
+              missing=1
+            fi
+          done
+          # Dump the linker cache to a file first: `ldconfig -p | grep -q` makes grep
+          # exit at the first hit, and the SIGPIPE would fail the pipeline under pipefail.
+          ldconfig -p > "${RUNNER_TEMP:-/tmp}/ldconfig.txt"
+          for lib in libnss3.so libgbm.so.1 libgtk-3.so.0 libasound.so.2 \
+                     libatk-1.0.so.0 libatk-bridge-2.0.so.0 libxkbcommon.so.0; do
+            if grep -qF -- "$lib" "${RUNNER_TEMP:-/tmp}/ldconfig.txt"; then
+              echo "ok: $lib"
+            else
+              echo "MISSING: $lib (which apt package provides it on this runner image?)"
+              missing=1
+            fi
+          done
+          if [ "$missing" -ne 0 ]; then
+            echo "FAIL: Electron's desktop dependencies are incomplete on this runner;"
+            echo "      no window can start, so the whole matrix would fail anyway."
+            exit 1
+          fi
+          echo "ok: desktop session prerequisites present"
+
+      # --no-transpile: this job needs the real transpile below, which rewrites out/.
+      - name: Clone the pinned tree, apply the patches and npm ci
+        shell: bash
+        env:
+          VSCODE_TAG: ${{ steps.resolve.outputs.vscode }}
+        run: |
+          set -euo pipefail
+          echo "==> bash build/test/prepare-vscode.sh $VSCODE_TAG --no-transpile"
+          bash build/test/prepare-vscode.sh "$VSCODE_TAG" --no-transpile
+
+      # Everything the driver reads must exist, or a stage silently measures nothing:
+      # the extension and its unit suites, the stand-in wsl.exe, the in-window harness
+      # extension, and the smoke area that `-f wsl` selects.
+      - name: Assert the WSL assets are in the patched tree
+        shell: bash
+        run: |
+          set -euo pipefail
+          missing=0
+          for f in \
+            vscode/extensions/picket-remote-wsl/extension.js \
+            vscode/extensions/picket-remote-wsl/test/resolver.test.js \
+            vscode/test/wsl-harness/fake-wsl.mjs \
+            vscode/test/wsl-harness/remote/extension.js \
+            vscode/test/smoke/src/areas/wsl/remote.test.ts; do
+            if [ -f "$f" ]; then
+              echo "ok: $f"
+            else
+              echo "MISSING: $f"
+              missing=1
+            fi
+          done
+          if [ "$missing" -ne 0 ]; then
+            echo "FAIL: the WSL extension, harness and smoke area ship with patch 67 in"
+            echo "      build/patches/apply-list.txt; without them there is nothing to test."
+            exit 1
+          fi
+
+      # Restore only: the `ui` job above is the writer for this key, and two jobs saving
+      # the same key in one run would race. A miss here just means preLaunch downloads
+      # Electron again.
+      - name: Restore the Electron binary
+        uses: actions/cache/restore@v4
+        with:
+          path: vscode/.build/electron
+          key: electron-${{ steps.resolve.outputs.vscode }}-${{ runner.os }}-${{ runner.arch }}
+
+      # Same reason as `ui`: `npm run compile` is broken on this tree (patch 53 removed
+      # compile-copilot) and gulp's monaco-typecheck trips over vendored fixtures.
+      # `scripts/code.sh` only needs out/.
+      - name: "Build out/ (transpile, no typecheck)"
+        shell: bash
+        env:
+          NODE_OPTIONS: --max-old-space-size=8192
+        run: |
+          set -euo pipefail
+          echo "==> cd vscode && npm run transpile-client"
+          cd vscode
+          npm run transpile-client
+
+      # Downloads Electron into vscode/.build/electron (what scripts/code.sh launches)
+      # and the built-in extensions, which are fetched from GitHub releases.
+      - name: Prepare Electron and the built-in extensions
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          echo "==> cd vscode && node build/lib/preLaunch.ts"
+          cd vscode
+          node build/lib/preLaunch.ts
+
+      # chrome-sandbox needs unprivileged user namespaces; Ubuntu 24.04 blocks them by
+      # default and the window then dies with "The SUID sandbox helper binary was found,
+      # but is not configured correctly".
+      - name: Allow unprivileged user namespaces (Electron sandbox)
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+
+      # The --ui stage compiles and runs test/automation + test/smoke, whose own locks
+      # the root `npm ci` does not install.
+      - name: Install the smoke harness dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "==> cd vscode/test/automation && npm ci"
+          cd vscode/test/automation
+          npm ci --no-audit --no-fund
+          echo "==> cd vscode/test/smoke && npm ci"
+          cd ../smoke
+          npm ci --no-audit --no-fund
+
+      # The payload is ~90 MB and only changes with the pinned tag. build/wsl/download/
+      # is gitignored, so restoring here cannot shadow a tracked file.
+      - name: Cache the server payload
+        id: payload
+        uses: actions/cache@v4
+        with:
+          path: build/wsl/download
+          key: wsl-payload-${{ env.PICKET_SERVER_TAG }}
+
+      # fetch-payload.sh reads the release with the gh CLI, verifies the tarball against
+      # SHA256SUMS and writes catalog.json from the release metadata — all of which the
+      # driver (and the smoke area) then read.
+      - name: Fetch the server payload (cache miss only)
+        if: steps.payload.outputs.cache-hit != 'true'
+        shell: bash
+        env:
+          PICKET_SERVER_TOKEN: ${{ secrets.PICKET_SERVER_TOKEN }}
+        run: |
+          set -euo pipefail
+          echo "==> bash build/wsl/fetch-payload.sh $PICKET_SERVER_TAG"
+          bash build/wsl/fetch-payload.sh "$PICKET_SERVER_TAG"
+
+      # Existence alone is not enough: a cache restored from an interrupted download
+      # would hand the driver a truncated tarball, and `tar` failures deep inside the
+      # window look like an extension bug. Re-check the release checksum here, the same
+      # way fetch-payload.sh does before it lifts the file into place.
+      - name: Assert the payload is staged and intact
+        shell: bash
+        run: |
+          set -euo pipefail
+          dir=build/wsl/download
+          for f in catalog.json payload-size.txt SHA256SUMS; do
+            if [ ! -f "$dir/$f" ]; then
+              echo "FAIL: $dir/$f is missing; fetch-payload.sh writes it."
+              exit 1
+            fi
+          done
+          tarball="$dir/picket-code-server-$PICKET_SERVER_TAG-linux-x64.tar.gz"
+          if [ ! -f "$tarball" ]; then
+            echo "FAIL: $tarball is missing after fetch-payload.sh ran."
+            ls -l "$dir"
+            exit 1
+          fi
+          expected="$(awk -v n="$(basename "$tarball")" '{ sub(/^\*/, "", $2) } $2 == n { print $1 }' "$dir/SHA256SUMS")"
+          if [ -z "$expected" ]; then
+            echo "FAIL: SHA256SUMS has no entry for $(basename "$tarball")."
+            exit 1
+          fi
+          actual="$(sha256sum "$tarball" | awk '{ print $1 }')"
+          if [ "$expected" != "$actual" ]; then
+            echo "FAIL: sha256 mismatch for $(basename "$tarball"):"
+            echo "      SHA256SUMS says $expected, the staged file hashes to $actual"
+            echo "      (a poisoned actions/cache entry: delete it and re-run)."
+            exit 1
+          fi
+          echo "ok: $(basename "$tarball") ($(stat -c %s "$tarball") bytes, sha256 verified)"
+
+      # One entry point, as documented: --all runs every stage and reports every failure
+      # instead of stopping at the first. The whole run sits inside one Xvfb session, so
+      # all six stages share one display (the driver only defaults DISPLAY to :0;
+      # xvfb-run's value wins). test-results/ must exist: the smoke runner keys its
+      # JUnit path off $GITHUB_WORKSPACE and does not create the directory.
+      - name: Run the acceptance matrix (xvfb-run, --all)
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p test-results
+          echo '==> xvfb-run -a --server-args "-screen 0 1280x1024x24" bash build/wsl/acceptance.sh --all'
+          xvfb-run -a --server-args "-screen 0 1280x1024x24" \
+            bash build/wsl/acceptance.sh --all
+
+      # The --ui stage gates on mocha --fail-zero, and this makes the report prove it: a
+      # filter that matched nothing (missing payload, skipped suite) must not read green.
+      - name: Assert the WSL smoke area actually ran
+        if: success()
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          reports=(test-results/*.xml)
+          shopt -u nullglob
+          if [ "${#reports[@]}" -eq 0 ]; then
+            echo "FAIL: the smoke stage wrote no JUnit report into test-results/."
+            exit 1
+          fi
+          report="${reports[0]}"
+          tests="$(grep -o -m 1 'tests="[0-9]*"' "$report" | tr -dc '0-9' || true)"
+          echo "executed tests: ${tests:-0} ($report)"
+          if [ "${tests:-0}" -eq 0 ]; then
+            echo "FAIL: the JUnit report has no test cases; the wsl filter matched nothing."
+            exit 1
+          fi
+          # The `ui` job of this workflow writes the same basename — the smoke runner
+          # derives it from platform + arch + the fixed suite title "Desktop Smoke Tests",
+          # not from -f. release.yml merges every `test-results-*` artifact into one
+          # directory with `merge-multiple: true`, so identical names would silently drop
+          # one of the two L4 reports. Prefix this one.
+          renamed="test-results/wsl-$(basename "$report")"
+          mv "$report" "$renamed"
+          echo "report: $renamed"
+
+      - name: Summarize the JUnit reports
+        if: always()
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "==> node build/test/summarize.mjs --dir test-results"
+          node build/test/summarize.mjs --dir test-results
+
+      - name: Upload the JUnit reports
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: test-results-wsl
+          path: test-results
+          if-no-files-found: warn
+          retention-days: 30
+
+      # The driver deletes the scratch directory on success and keeps it on failure, so
+      # this copy only matters when something failed — which is exactly when the logs
+      # (one per stage: remote.log, tunnel.log, ui.log, lifecycle-<n>.log, icode.log)
+      # and the harness assertion JSON are the only evidence left.
+      - name: Collect the acceptance artifacts
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          out="$GITHUB_WORKSPACE/wsl-accept-artifacts"
+          rm -rf "$out"
+          mkdir -p "$out"
+          scratch="$(printf '%s' "$PICKET_WSL_ACCEPT_HOME" | sed 's:/*$::')"
+          if [ -d "$scratch/logs" ]; then
+            cp -a "$scratch/logs" "$out/logs" || true
+          fi
+          results="$scratch/home/.picket-code-server/harness-results.json"
+          if [ -f "$results" ]; then
+            cp "$results" "$out/harness-results.json" || true
+          fi
+          echo "collected:"
+          ls -la "$out" || true
+
+      - name: Upload the acceptance logs and results (failure only)
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: test-logs-wsl
+          path: |
+            wsl-accept-artifacts
+            vscode/.build/logs/smoke-tests-electron
             test-results
           if-no-files-found: warn
           retention-days: 14

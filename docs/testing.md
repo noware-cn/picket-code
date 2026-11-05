@@ -14,6 +14,7 @@
 | L2 进程集成 | **真实 `icode acp` 协议边界**：我们的 `createIcodeTransport`/`IcodeAcpClient` 与一个**假 ACP CLI**（真进程、真 stdio、真 NDJSON） | 同上 + Node | ✅ 完全 | 1–2 min |
 | L3 宿主端到端 | 真实 agent host 进程（`agentHostServerMain.js`）+ 真实 provider + 假 ACP CLI，**AHP over WebSocket**：建会话、发消息、收到 `ChatDelta`/工具调用、恢复、审批、取消 | 同上 + `ws` | ✅ 完全（不需要 Electron/X） | 8 个用例 ~13s + 复用 build 缓存 |
 | L4 UI 冒烟 | 真实 Electron 窗口 + Agents Window + 聊天面板：文本渲染、diff 视图、ask_user 表单、审批横幅、重启后历史回填 | 完整编译（gulp 全套 + 扩展）+ Electron 二进制 + **Xvfb** | ✅ 可以做，代价 ~35–45 min | 见 §4.3 |
+| L4+ WSL 远程窗口 | 真实远程窗口（`picket-wsl+<发行版>`）+ **真实服务器载荷**，`wsl.exe` 边界由替身承担：`build/wsl/acceptance.sh --all`（remote / tunnel / ui / lifecycle / icode 五阶段 + 扩展单测） | 同上 + `xvfb-run` + 私有仓库的载荷（`PICKET_SERVER_TAG` / `PICKET_SERVER_TOKEN`）+ 带空格与中文的验收目录 | ✅ 完全（`tests-ui.yml` 的 `wsl-acceptance` job） | 10–15 min（另加 ~10 min 准备） |
 | L5 打包产物 | 安装包启动、asar 布局、无 Copilot 残留、真实窗口在 Xvfb 下启动 | 打包产物 | ✅ 已存在（`verify-release.yml`） | 8–15 min |
 | L6 真实模型质量 | iCode 回复内容是否合理、真实模型调用、Windows 真机 `.cmd` 启动 | 真模型、真 Windows | ❌ 不能自动化（无凭据、非确定性、成本不可控） | 人工 |
 
@@ -97,7 +98,7 @@
 | 工作流 | 触发 | 内容 | 阻断发布 |
 |---|---|---|---|
 | `tests.yml`（新） | `pull_request`、`push: main`、`workflow_call` | L1+L2+L3，ubuntu + windows 双平台（L1/L2 only，L3 只 ubuntu） | PR 必过 |
-| `tests-ui.yml`（新） | `workflow_dispatch`、`schedule`（每日）、`workflow_call` | 编译 + L4 单个 shard | 发布前必须绿（人工触发或发布流水线调用） |
+| `tests-ui.yml`（新） | `workflow_dispatch`、`schedule`（每日）、`workflow_call` | 编译 + L4 单个 shard（`ui` job）；`wsl-acceptance` job 跑 `build/wsl/acceptance.sh --all`（WSL 远程窗口全矩阵，见 L4+） | 发布前必须绿（两个 job 任一失败即 `tests-ui` 红，人工触发或发布流水线调用） |
 | `release.yml`（改） | `v*` tag | 先 `workflow_call: tests.yml` + `tests-ui.yml`，再编译/打包/发布 | ✅ 任一失败即不发布 |
 | `verify-release.yml`（已存在） | 发布完成后 | L5 | 不再改 |
 
@@ -111,6 +112,13 @@
 
 L1–L3：`libkrb5-dev libx11-dev libxkbfile-dev libsecret-1-dev libxext-dev libxrender-dev libxrandr-dev`（编译期）。
 L4 追加：`xvfb libnss3 libxss1 libatk-bridge2.0-0 libgtk-3-0 libasound2t64 libgbm1 libxkbcommon0`，用 `xvfb-run -a`。
+L4+（`wsl-acceptance`）不追加任何包：它沿用上面两行，装完后再自检一遍
+（`xvfb-run` / `Xvfb` 可执行，`ldconfig -p` 里有 `libnss3.so`、`libgbm.so.1`、
+`libgtk-3.so.0`、`libasound.so.2`、`libatk-1.0.so.0`、`libatk-bridge-2.0.so.0`、
+`libxkbcommon.so.0`）确认 runner 镜像是能起窗口的那一版——包名在镜像之间会改名
+（`libasound2` → `libasound2t64`），改名必须在 30 秒内红，而不是等到 10 分钟编译后
+报 "cannot open display"。`libatk1.0-0` 由 `libatk-bridge2.0-0` / `libgtk-3-0`
+依赖带入，不单独列。
 
 ## 4. 测试报告
 

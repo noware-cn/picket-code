@@ -11,7 +11,8 @@
 #
 # Everything except --l2 needs a desktop session (Electron) and the payload
 # tarball plus catalog.json under build/wsl/download/ (see fetch-payload.sh).
-# CI runs only --l2.
+# CI runs the whole matrix: the `wsl-acceptance` job of .github/workflows/tests-ui.yml
+# runs `--all` under `xvfb-run` on ubuntu-latest.
 set -uo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -99,6 +100,14 @@ print_results() { # requires b2..b5 to be present; returns 1 on any fail or gap
 	' "$RESULTS" b2 b3 b4 b5
 }
 
+snapshot_results() { # $1 = stage. logs/ survives stage_window (which wipes home/), so a
+	# per-stage copy is the only way CI can still show stage N's assertions after stage
+	# N+1 has overwritten them.
+	if [ -f "$RESULTS" ]; then
+		cp "$RESULTS" "$SCRATCH/logs/$1-results.json" 2>/dev/null || true
+	fi
+}
+
 export_accept_env() {
 	export PICKET_WSL_RUNNER="$FAKE_WSL"
 	export PICKET_WSL_FAKE_HOME="$SCRATCH/home"
@@ -182,6 +191,7 @@ run_remote() {
 		ko remote "harness results did not appear within ${REMOTE_DEADLINE}s (log: $log)"
 		return
 	fi
+	snapshot_results remote
 	kill_window "$pid"
 	if print_results; then ok remote; else ko remote "harness checks failed (log: $log)"; fi
 }
@@ -199,6 +209,7 @@ run_tunnel() {
 		ko tunnel "harness results did not appear within ${REMOTE_DEADLINE}s over the tunnel (log: $log)"
 		return
 	fi
+	snapshot_results tunnel
 	kill_window "$pid"
 	if print_results; then ok tunnel; else ko tunnel "harness checks failed over the stdio tunnel (log: $log)"; fi
 }
@@ -239,6 +250,7 @@ run_lifecycle() {
 		kill_window "$pid"
 		ko lifecycle "first window never connected (log: $log)"; return
 	fi
+	snapshot_results lifecycle
 	kill_window "$pid"
 	local first_pid
 	first_pid=$(server_pids | head -1)
@@ -283,6 +295,7 @@ run_icode() {
 		ko icode "window never connected (log: $log)"
 		return
 	fi
+	snapshot_results icode
 	kill_window "$pid"
 	local icode_check
 	icode_check=$(node -e 'const r=require(process.argv[1]); process.stdout.write(r.icode ? (r.icode.ok ? "ok" : "fail: "+r.icode.detail) : "absent")' "$RESULTS")

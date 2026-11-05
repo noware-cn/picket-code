@@ -34,7 +34,11 @@ env:
 # Gate order (docs/testing.md §3.1): the automated test layers run before anything is
 # compiled, packaged or published, so a red layer means no artifacts and no release.
 #   tests     → L1 (iCode + agentHostChangeset) and L2 (fake ACP CLI) + contract checks
-#   tests-ui  → L4 (Electron/Agents Window smoke), tag pushes only: it costs ~40 minutes
+#   tests-ui  → L4 (Electron/Agents Window smoke) + the WSL acceptance matrix
+#               (build/wsl/acceptance.sh --all), tag pushes only: ~40 and ~15 minutes
+# `tests-ui` reports one result for both of its jobs, so a red WSL job blocks the release
+# through the existing `needs.tests-ui.result == 'success'` guards below — no extra
+# condition, and no way for the WSL layer to be skipped into a green state.
 # A reusable-workflow job cannot carry `timeout-minutes`; every job inside tests.yml and
 # tests-ui.yml sets its own, which bounds those jobs.
 jobs:
@@ -86,14 +90,20 @@ jobs:
       # Test the tree this release is built from, not "whatever is newest upstream".
       vscode_version: ${{ needs.versions.outputs.vscode }}
 
-  # 35–45 minutes: only worth it when something is about to be published.
+  # 35–45 minutes for the UI job plus ~15 for the WSL matrix: only worth it when
+  # something is about to be published.
   tests-ui:
-    name: "Tests (L4 UI smoke)"
+    name: "Tests (L4 UI smoke + WSL acceptance)"
     needs: versions
     if: startsWith(github.ref, 'refs/tags/')
     uses: ./.github/workflows/tests-ui.yml
     with:
       vscode_version: ${{ needs.versions.outputs.vscode }}
+    secrets:
+      # The WSL job installs the private noware-cn/picket-code-server payload, and a
+      # reusable workflow only sees the secrets the caller names explicitly. The tag
+      # travels through the PICKET_SERVER_TAG repository variable, not a secret.
+      PICKET_SERVER_TOKEN: ${{ secrets.PICKET_SERVER_TOKEN }}
 
   # Compile stage: clone + patch + npm ci + upstream min build, then ship the
   # vscode/ tree + built VSCode-<plat>-<arch> as vscode.tar.gz. Mirrors
@@ -359,7 +369,8 @@ jobs:
 
       # The JUnit XML from the gate jobs, merged into one directory: L1/L2/L3 from
       # tests.yml (test-results-unit, test-results-acp-process, test-results-host-e2e),
-      # L4 from tests-ui.yml.
+      # L4 from tests-ui.yml (test-results-ui) and the WSL smoke area from the same
+      # workflow (test-results-wsl).
       - name: Download the test reports (L1–L4)
         uses: actions/download-artifact@v8
         with:

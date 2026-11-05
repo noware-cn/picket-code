@@ -14,7 +14,8 @@
 - 测试报告附件：`test-report-<tag>.tar.gz` —— 链接：
 - 自动化结果（逐项确认绿的 run 链接）：
   - [ ] `tests.yml`（contract / L1 / L2）
-  - [ ] `tests-ui.yml`（L4 UI 冒烟）
+  - [ ] `tests-ui.yml` 的 `ui` job（L4 UI 冒烟）
+  - [ ] `tests-ui.yml` 的 `wsl-acceptance` job（WSL 验收矩阵，`build/wsl/acceptance.sh --all`）
   - [ ] `verify-release.yml`（L5 打包产物启动）
 
 报告链接取法（发布后再补）：`gh release view <tag> --json assets --jq '.assets[].name'`
@@ -42,7 +43,7 @@ Linux x64 包上依次执行，任一项失败即停止发布。
 | Linux x64 | L1–L5 全绿 | 第 1 节 6 条 | - [ ] 通过 |
 | Windows x64 | L1/L2 单测 + 打包产物启动冒烟 | `.cmd` 真实启动、审批、diff | - [ ] 通过 |
 | Windows x64（历史欠账） | `.cmd` 转义只到单测（`icodeLaunchConfig`） | 在真机上用 `.cmd` 版 iCode 跑一轮对话 | - [ ] 通过 |
-| Windows x64 + WSL2（远程窗口） | `build/wsl/acceptance.sh --all`（Linux 桌面跑，`wsl.exe` 用替身，服务器载荷是真的）+ L4 冒烟用例 A5/A6 | `docs/wsl-verification.md` 四项：原生文件夹对话框、真实 `picket-code .`、界面观感、M4 末 15 分钟走查。**Windows Server 与 WSL1 不在范围** | - [ ] 通过 |
+| Windows x64 + WSL2（远程窗口） | `.github/workflows/tests-ui.yml` 的 `wsl-acceptance` job（`workflow_dispatch` / 每日 `schedule` / `release.yml` 通过 `workflow_call` 调用），在 `xvfb-run` 下跑 `build/wsl/acceptance.sh --all`：remote / tunnel / ui / lifecycle / icode 五阶段 + 扩展单测，Linux 桌面跑，`wsl.exe` 用替身、服务器载荷是真的 + L4 冒烟用例 A5/A6 | `docs/wsl-verification.md` 四项：原生文件夹对话框、真实 `picket-code .`、界面观感、M4 末 15 分钟走查。**Windows Server 与 WSL1 不在范围** | - [ ] 通过 |
 | macOS | 未覆盖 | v1 不发布 macOS 则跳过此项 | - [ ] 不适用 / - [ ] 通过 |
 
 ## 3. 未验证项及原因
