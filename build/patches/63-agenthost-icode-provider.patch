@@ -455,10 +455,10 @@ index 00000000..7febc833
 +}
 diff --git a/src/vs/platform/agentHost/node/icode/icodeAgent.ts b/src/vs/platform/agentHost/node/icode/icodeAgent.ts
 new file mode 100644
-index 00000000..ab511f9a
+index 00000000..e2b1355b
 --- /dev/null
 +++ b/src/vs/platform/agentHost/node/icode/icodeAgent.ts
-@@ -0,0 +1,971 @@
+@@ -0,0 +1,999 @@
 +/*---------------------------------------------------------------------------------------------
 + *  Copyright (c) Microsoft Corporation. All rights reserved.
 + *  Licensed under the MIT License. See License.txt in the project root for license information.
@@ -542,6 +542,19 @@ index 00000000..ab511f9a
 +}
 +
 +/**
++ * One `session/load` replay, buffered while its request is still in flight.
++ *
++ * ACP session ids are only unique inside one process, and several chats can
++ * restore at the same time, so a replay belongs to the process it runs on and
++ * to the chat that asked for it — never to the agent as a whole.
++ */
++interface IIcodeReplay {
++	readonly sessionId: string;
++	readonly chatKey: string;
++	readonly updates: IcodeSessionUpdate[];
++}
++
++/**
 + * One `icode acp` process and the state that belongs to it.
 + *
 + * ACP session ids are only unique inside one process, so session routing is
@@ -554,6 +567,8 @@ index 00000000..ab511f9a
 +	readonly store: DisposableStore;
 +	/** ACP session id to chat, for `session/update` and the reverse requests. */
 +	readonly chatsBySessionId: Map<string, URI>;
++	/** Replays streaming on this process, by the ACP session id they replay. */
++	readonly replays: Map<string, IIcodeReplay>;
 +}
 +
 +/** A chat this agent has been told about; recorded for diagnostics only. */
@@ -653,8 +668,6 @@ index 00000000..ab511f9a
 +	private readonly _history = new Map<string, readonly Turn[]>();
 +	/** Chats whose `providerData` was already published; one blob per ACP session. */
 +	private readonly _announcedChats = new Set<string>();
-+	/** Set while a `session/load` replay is streaming, so its updates are not treated as live. */
-+	private _replay: { readonly sessionId: string; readonly chatKey: string; readonly updates: IcodeSessionUpdate[] } | undefined;
 +	/** One in-flight turn per chat; the value is the running `sendMessage`. */
 +	private readonly _activePrompts = new Map<string, Promise<void>>();
 +	/** Live turns by turn id, so a process exit can report each one with its duration. */
@@ -720,9 +733,7 @@ index 00000000..ab511f9a
 +			this._cancelPendingPermissions(key => key === chatKey);
 +			this._cancelPendingInputs(key => key === chatKey);
 +			// A replay still streaming for this chat must not be buffered any further.
-+			if (this._replay?.chatKey === chatKey) {
-+				this._replay = undefined;
-+			}
++			this._dropChatReplays(chatKey);
 +
 +			const session = this._sessions.get(chatKey);
 +			if (!session) {
@@ -817,14 +828,19 @@ index 00000000..ab511f9a
 +		this._sessions.set(chatKey, { sessionId: data.sessionId, cwd: data.cwd });
 +		this._announcedChats.add(chatKey);
 +
-+		const replay = { sessionId: data.sessionId, chatKey, updates: [] as IcodeSessionUpdate[] };
-+		this._replay = replay;
++		const replay: IIcodeReplay = { sessionId: data.sessionId, chatKey, updates: [] };
++		let entry: IIcodeClientEntry | undefined;
 +		try {
 +			// The session lives in the process of the directory it was created in.
-+			const entry = await this._ensureClient(data.cwd);
++			entry = await this._ensureClient(data.cwd);
 +			entry.chatsBySessionId.set(data.sessionId, chat);
++			// Register before asking: the replayed updates arrive while the request
++			// is still in flight, and each chat buffers its own.
++			entry.replays.set(data.sessionId, replay);
 +			await entry.client.request('session/load', { sessionId: data.sessionId, cwd: data.cwd, mcpServers: [] });
-+			if (this._replay === replay) {
++			// A replay dropped mid-flight (chat disposed, process gone) must not
++			// publish a half-collected transcript.
++			if (entry.replays.get(data.sessionId) === replay) {
 +				this._history.set(chatKey, buildIcodeTurns(replay.updates));
 +			}
 +		} catch (error) {
@@ -835,8 +851,8 @@ index 00000000..ab511f9a
 +			this._clients.get(data.cwd)?.chatsBySessionId.delete(data.sessionId);
 +			this._history.delete(chatKey);
 +		} finally {
-+			if (this._replay === replay) {
-+				this._replay = undefined;
++			if (entry?.replays.get(data.sessionId) === replay) {
++				entry.replays.delete(data.sessionId);
 +			}
 +		}
 +	}
@@ -1144,7 +1160,7 @@ index 00000000..ab511f9a
 +
 +		// Register before subscribing: an exit that fires during wiring must find
 +		// the entry and drop it, instead of leaving a dead process behind.
-+		const entry: IIcodeClientEntry = { cwd, client, store: new DisposableStore(), chatsBySessionId: new Map() };
++		const entry: IIcodeClientEntry = { cwd, client, store: new DisposableStore(), chatsBySessionId: new Map(), replays: new Map() };
 +		this._clients.set(cwd, entry);
 +		this._clientStore.add(entry.store);
 +
@@ -1287,6 +1303,17 @@ index 00000000..ab511f9a
 +		}
 +	}
 +
++	/** Drops the replays still buffering for one chat, on whichever process they run. */
++	private _dropChatReplays(chatKey: string): void {
++		for (const entry of this._clients.values()) {
++			for (const [sessionId, replay] of entry.replays) {
++				if (replay.chatKey === chatKey) {
++					entry.replays.delete(sessionId);
++				}
++			}
++		}
++	}
++
 +	/**
 +	 * Forgets one dead process. Only the chats and sessions created in it are
 +	 * dropped: every other directory keeps its process and its live turns.
@@ -1304,9 +1331,7 @@ index 00000000..ab511f9a
 +		entry.store.dispose();
 +
 +		const chatKeys = new Set<string>();
-+		const sessionIds = new Set<string>();
 +		for (const [sessionId, chat] of entry.chatsBySessionId) {
-+			sessionIds.add(sessionId);
 +			const chatKey = chat.toString();
 +			chatKeys.add(chatKey);
 +			if (this._sessions.get(chatKey)?.sessionId === sessionId) {
@@ -1316,10 +1341,9 @@ index 00000000..ab511f9a
 +		}
 +		entry.chatsBySessionId.clear();
 +
-+		// Nothing more will be replayed into an in-flight load of this process.
-+		if (this._replay && sessionIds.has(this._replay.sessionId)) {
-+			this._replay = undefined;
-+		}
++		// Nothing more will be replayed into an in-flight load of this process;
++		// replays buffering on another process belong to chats that are still alive.
++		entry.replays.clear();
 +		this._cancelPendingPermissions(chatKey => chatKeys.has(chatKey));
 +		this._cancelPendingInputs(chatKey => chatKeys.has(chatKey));
 +
@@ -1351,8 +1375,8 @@ index 00000000..ab511f9a
 +
 +		// A `session/load` replays the whole stored transcript before it resolves;
 +		// those updates are history, not progress for a live turn.
-+		const replay = this._replay;
-+		if (replay && replay.sessionId === sessionId) {
++		const replay = entry.replays.get(sessionId);
++		if (replay) {
 +			replay.updates.push(update as IcodeSessionUpdate);
 +			return;
 +		}
@@ -1417,14 +1441,18 @@ index 00000000..ab511f9a
 +	private _disposeClients(): void {
 +		this._cancelPendingPermissions();
 +		this._cancelPendingInputs();
-+		const clients = [...this._clients.values()].map(entry => entry.client);
++		const entries = [...this._clients.values()];
++		// Nothing more will be replayed into the in-flight loads of these processes.
++		for (const entry of entries) {
++			entry.replays.clear();
++		}
++		const clients = entries.map(entry => entry.client);
 +		this._clients.clear();
 +		this._clientCreations.clear();
 +		// Drop every handler first, so a kill cannot re-enter this agent.
 +		this._clientStore.clear();
 +		this._sessions.clear();
 +		this._turns.clear();
-+		this._replay = undefined;
 +		for (const client of clients) {
 +			client.dispose();
 +		}
@@ -1432,10 +1460,10 @@ index 00000000..ab511f9a
 +}
 diff --git a/src/vs/platform/agentHost/node/icode/icodeHistory.ts b/src/vs/platform/agentHost/node/icode/icodeHistory.ts
 new file mode 100644
-index 00000000..c7603b7c
+index 00000000..5c09c194
 --- /dev/null
 +++ b/src/vs/platform/agentHost/node/icode/icodeHistory.ts
-@@ -0,0 +1,224 @@
+@@ -0,0 +1,232 @@
 +/*---------------------------------------------------------------------------------------------
 + *  Copyright (c) Microsoft Corporation. All rights reserved.
 + *  Licensed under the MIT License. See License.txt in the project root for license information.
@@ -1560,7 +1588,13 @@ index 00000000..c7603b7c
 +	const displayName = update.title ?? existing?.toolCall.displayName ?? toolCallId;
 +	// ACP completes a call with a `tool_call_update` that does not repeat the
 +	// call's `kind`, so keep the name the announcement produced.
-+	const state = createToolCallState(toolCallId, displayName, update, existing?.toolCall.toolName);
++	const previousKind = existing?.toolCall.toolName;
++	// Nor does it repeat the `rawInput` the announcement carried.
++	const previousToolCall = existing?.toolCall;
++	const previousInput = previousToolCall !== undefined && previousToolCall.status !== ToolCallStatus.Streaming && typeof previousToolCall.toolInput === 'string'
++		? previousToolCall.toolInput
++		: undefined;
++	const state = createToolCallState(toolCallId, displayName, update, previousKind, previousInput);
 +	if (existing) {
 +		existing.toolCall = state;
 +	} else {
@@ -1575,9 +1609,11 @@ index 00000000..c7603b7c
 +	builder.turn.responseParts.push(part);
 +}
 +
-+function createToolCallState(toolCallId: string, displayName: string, update: IcodeSessionUpdate, previousToolName?: string): ToolCallState {
++function createToolCallState(toolCallId: string, displayName: string, update: IcodeSessionUpdate, previousToolName?: string, previousToolInput?: string): ToolCallState {
 +	const invocationMessage = displayName;
-+	const toolInput = update.rawInput !== undefined ? JSON.stringify(update.rawInput) : undefined;
++	// `rawInput` only comes with the announcement, so a follow-up that omits it
++	// must keep the input already known instead of wiping it.
++	const toolInput = update.rawInput !== undefined ? JSON.stringify(update.rawInput) : previousToolInput;
 +	const content = extractResultContent(update);
 +	const base = {
 +		toolCallId,
@@ -2109,10 +2145,10 @@ index 00000000..9f60e33f
 +}
 diff --git a/src/vs/platform/agentHost/node/icode/icodeMapEvents.ts b/src/vs/platform/agentHost/node/icode/icodeMapEvents.ts
 new file mode 100644
-index 00000000..0933ee4e
+index 00000000..2983ca49
 --- /dev/null
 +++ b/src/vs/platform/agentHost/node/icode/icodeMapEvents.ts
-@@ -0,0 +1,406 @@
+@@ -0,0 +1,432 @@
 +/*---------------------------------------------------------------------------------------------
 + *  Copyright (c) Microsoft Corporation. All rights reserved.
 + *  Licensed under the MIT License. See License.txt in the project root for license information.
@@ -2121,7 +2157,7 @@ index 00000000..0933ee4e
 +import { URI } from '../../../../base/common/uri.js';
 +import type { AgentSignal, IAgentToolPendingConfirmationSignal } from '../../common/agent.js';
 +import { ActionType } from '../../common/state/sessionActions.js';
-+import { ResponsePartKind, ToolCallConfirmationReason, ToolCallStatus, ToolResultContentType, type ToolCallPendingConfirmationState, type ToolResultContent } from '../../common/state/sessionState.js';
++import { ResponsePartKind, ToolCallConfirmationReason, ToolCallStatus, ToolResultContentType, type ToolCallPendingConfirmationState, type ToolCallResult, type ToolResultContent } from '../../common/state/sessionState.js';
 +
 +/**
 + * A single `session/update` notification payload from iCode's ACP server.
@@ -2413,7 +2449,8 @@ index 00000000..0933ee4e
 +		state.toolInputs.set(toolCallId, JSON.stringify(update.rawInput));
 +	}
 +
-+	const isFinished = update.status === 'completed' || update.status === 'failed';
++	const isCancelled = update.status === 'cancelled';
++	const isFinished = update.status === 'completed' || update.status === 'failed' || isCancelled;
 +
 +	// `ChatToolCallComplete` is dropped by the reducer unless the call is running,
 +	// so a completion that arrives without a matching `in_progress` update has to
@@ -2426,7 +2463,6 @@ index 00000000..0933ee4e
 +	}
 +
 +	if (isFinished) {
-+		const content = extractResultContent(update);
 +		signals.push({
 +			kind: 'action',
 +			resource: chat,
@@ -2434,16 +2470,42 @@ index 00000000..0933ee4e
 +				type: ActionType.ChatToolCallComplete,
 +				turnId: state.turnId,
 +				toolCallId,
-+				result: {
-+					success: update.status === 'completed',
-+					pastTenseMessage: displayName,
-+					...(content !== undefined ? { content } : {}),
-+				},
++				result: createCompletionResult(update, displayName),
 +			},
 +		});
 +	}
 +
 +	return signals;
++}
++
++/**
++ * The `ChatToolCallComplete` payload for a terminal ACP status.
++ *
++ * A cancelled call has no action of its own on this surface: there is no
++ * `chat/toolCallCancelled`, and `chat/toolCallConfirmed` only cancels a call
++ * that is still `pendingConfirmation`, so a running call can only be ended by a
++ * completion. Reporting it as a failed completion whose error code is
++ * `cancelled` is the closest honest signal — the workbench renders exactly that
++ * as a skipped call rather than a failure — and the past-tense message says so,
++ * instead of reading like a successful run. The restored transcript still says
++ * `ToolCallStatus.Cancelled`, so a reload can differ from what the live turn
++ * showed; the protocol offers no way to unify the two.
++ */
++function createCompletionResult(update: IcodeSessionUpdate, displayName: string): ToolCallResult {
++	const content = extractResultContent(update);
++	if (update.status === 'cancelled') {
++		return {
++			success: false,
++			pastTenseMessage: `${displayName} (cancelled)`,
++			error: { message: 'iCode cancelled this tool call', code: 'cancelled' },
++			...(content !== undefined ? { content } : {}),
++		};
++	}
++	return {
++		success: update.status === 'completed',
++		pastTenseMessage: displayName,
++		...(content !== undefined ? { content } : {}),
++	};
 +}
 +
 +/** Emits `ChatToolCallReady` once per call, carrying the input seen at `tool_call`. */
@@ -3423,10 +3485,10 @@ index 00000000..70b5683a
 +});
 diff --git a/src/vs/platform/agentHost/test/node/icode/icodeAgent.test.ts b/src/vs/platform/agentHost/test/node/icode/icodeAgent.test.ts
 new file mode 100644
-index 00000000..9b59c290
+index 00000000..cd391bea
 --- /dev/null
 +++ b/src/vs/platform/agentHost/test/node/icode/icodeAgent.test.ts
-@@ -0,0 +1,874 @@
+@@ -0,0 +1,1016 @@
 +/*---------------------------------------------------------------------------------------------
 + *  Copyright (c) Microsoft Corporation. All rights reserved.
 + *  Licensed under the MIT License. See License.txt in the project root for license information.
@@ -3463,6 +3525,8 @@ index 00000000..9b59c290
 +	respondToLoad: readonly any[] = [];
 +	/** When set, `session/load` rejects with it, mimicking a session iCode already dropped. */
 +	loadError: Error | undefined;
++	/** When set, `session/load` stays in flight until `finishLoad` settles it. */
++	deferLoads = false;
 +	/** The reply to `session/new`; tests swap it in to inject a model catalog. */
 +	newSessionResult: { readonly sessionId: string; readonly models?: { readonly availableModels?: readonly { readonly modelId: string; readonly name: string; readonly description?: string }[]; readonly currentModelId?: string } } = {
 +		sessionId: SESSION_ID,
@@ -3478,6 +3542,8 @@ index 00000000..9b59c290
 +	private readonly replies = new Map<string, Promise<unknown>>();
 +	/** In-flight `session/prompt` calls by session id; one process can run several. */
 +	private readonly pendingPrompts = new Map<string, { resolve: (value: any) => void; reject: (reason: Error) => void }>();
++	/** In-flight `session/load` calls by session id, so a test can overlap two replays. */
++	private readonly pendingLoads = new Map<string, { resolve: (value: any) => void; reject: (reason: Error) => void }>();
 +
 +	get pendingPromptCount(): number { return this.pendingPrompts.size; }
 +
@@ -3494,11 +3560,16 @@ index 00000000..9b59c290
 +			if (this.loadError) {
 +				return Promise.reject(this.loadError);
 +			}
-+			const sessionId = (params as { sessionId?: string } | undefined)?.sessionId;
++			const sessionId = (params as { sessionId?: string } | undefined)?.sessionId ?? '';
 +			for (const update of this.respondToLoad) {
 +				this.emitNotification('session/update', { sessionId, update });
 +			}
-+			return Promise.resolve({} as R);
++			if (!this.deferLoads) {
++				return Promise.resolve({} as R);
++			}
++			return new Promise<R>((resolve, reject) => {
++				this.pendingLoads.set(sessionId, { resolve: resolve as (value: any) => void, reject });
++			});
 +		}
 +		if (method === 'session/prompt') {
 +			const sessionId = (params as { sessionId?: string } | undefined)?.sessionId ?? '';
@@ -3540,6 +3611,13 @@ index 00000000..9b59c290
 +	}
 +	/** Settles the in-flight `session/prompt` with a bare stop reason. */
 +	completePrompt(stopReason: string): void { this.finishPrompt({ stopReason }); }
++	/** Settles the in-flight `session/load` of a session id, ending its replay. */
++	finishLoad(sessionId: string): void {
++		const load = this.pendingLoads.get(sessionId);
++		assert.ok(load, `no in-flight session/load for ${sessionId}`);
++		this.pendingLoads.delete(sessionId);
++		load.resolve({});
++	}
 +	/** Settles every in-flight turn, e.g. when two chats share one process. */
 +	completeAllPrompts(stopReason: string): void {
 +		const pending = [...this.pendingPrompts.values()];
@@ -3558,6 +3636,11 @@ index 00000000..9b59c290
 +		for (const turn of pending) {
 +			turn.reject(new Error('icode exited'));
 +		}
++		const loads = [...this.pendingLoads.values()];
++		this.pendingLoads.clear();
++		for (const load of loads) {
++			load.reject(new Error('icode exited'));
++		}
 +	}
 +	dispose(): void {
 +		this.disposed = true;
@@ -3571,8 +3654,8 @@ index 00000000..9b59c290
 +const restoredChat = URI.parse('file:///chat');
 +const RESTORED_CWD = '/repo';
 +
-+function providerData(sessionId: string): string {
-+	return encodeIcodeProviderData({ v: 1, sessionId, cwd: RESTORED_CWD, createdAt: 1 });
++function providerData(sessionId: string, cwd = RESTORED_CWD): string {
++	return encodeIcodeProviderData({ v: 1, sessionId, cwd, createdAt: 1 });
 +}
 +
 +suite('IcodeAgent', () => {
@@ -4068,6 +4151,127 @@ index 00000000..9b59c290
 +		client.emitNotification('session/update', { sessionId: 'sess-1', update: { sessionUpdate: 'user_message_chunk', content: { type: 'text', text: 'late' } } });
 +		assert.deepStrictEqual(await agent.chats.getMessages(restoredChat, chat), []);
 +		agent.dispose();
++	});
++
++	/** The replayed user messages of a chat, i.e. one entry per restored turn. */
++	async function replayedMessages(agent: IcodeAgent, chat: URI): Promise<string[]> {
++		return (await agent.chats.getMessages(chat, chat)).map(turn => turn.message.text);
++	}
++
++	const replayedUserMessage = (text: string) => ({ sessionUpdate: 'user_message_chunk', content: { type: 'text', text } });
++
++	test('two restores in flight keep their replayed updates in their own chat', async () => {
++		const client = new FakeIcodeClient();
++		client.deferLoads = true;
++		const agent = new IcodeAgent(new NullLogService(), () => client);
++		const chatA = URI.parse('ahp-chat://test/replay-a');
++		const chatB = URI.parse('ahp-chat://test/replay-b');
++
++		// Both loads stay in flight, so both replays are buffering at once.
++		const loadingA = agent.materializeChat(chatA, chatA, providerData('sess-a'));
++		const loadingB = agent.materializeChat(chatB, chatB, providerData('sess-b'));
++		await timeout(10);
++
++		client.emitNotification('session/update', { sessionId: 'sess-a', update: replayedUserMessage('from a') });
++		client.emitNotification('session/update', { sessionId: 'sess-b', update: replayedUserMessage('from b') });
++
++		// Finishing A must neither publish B's buffer nor drop B's later updates.
++		client.finishLoad('sess-a');
++		await loadingA;
++		client.emitNotification('session/update', { sessionId: 'sess-b', update: { sessionUpdate: 'agent_message_chunk', messageId: 'm1', content: { type: 'text', text: 'hi' } } });
++		client.finishLoad('sess-b');
++		await loadingB;
++
++		assert.deepStrictEqual(await replayedMessages(agent, chatA), ['from a']);
++		assert.deepStrictEqual(await replayedMessages(agent, chatB), ['from b']);
++		const chatBReply = (await agent.chats.getMessages(chatB, chatB))[0].responseParts;
++		assert.strictEqual(chatBReply.length, 1, 'B keeps the chunk that arrived after A finished');
++		agent.dispose();
++	});
++
++	test('two restores in different processes that reuse one session id stay apart', async () => {
++		const dirA = tempDirectory('icode-replay-a-');
++		const dirB = tempDirectory('icode-replay-b-');
++		const cwdA = URI.file(dirA).fsPath;
++		const cwdB = URI.file(dirB).fsPath;
++		const byCwd = new Map<string, FakeIcodeClient>();
++		const agent = disposables.add(new IcodeAgent(new NullLogService(), cwd => {
++			const client = new FakeIcodeClient();
++			client.deferLoads = true;
++			byCwd.set(cwd, client);
++			return client;
++		}));
++		const chatA = URI.parse('ahp-chat://test/reused-id-a');
++		const chatB = URI.parse('ahp-chat://test/reused-id-b');
++		// ACP only promises uniqueness inside one process, so both sessions are
++		// called `sess-shared`: the id alone cannot say which replay an update is for.
++		const loadingA = agent.materializeChat(chatA, chatA, providerData('sess-shared', cwdA));
++		const loadingB = agent.materializeChat(chatB, chatB, providerData('sess-shared', cwdB));
++		await timeout(10);
++
++		byCwd.get(cwdA)!.emitNotification('session/update', { sessionId: 'sess-shared', update: replayedUserMessage('from a') });
++		byCwd.get(cwdB)!.emitNotification('session/update', { sessionId: 'sess-shared', update: replayedUserMessage('from b') });
++		byCwd.get(cwdA)!.finishLoad('sess-shared');
++		byCwd.get(cwdB)!.finishLoad('sess-shared');
++		await Promise.all([loadingA, loadingB]);
++
++		assert.deepStrictEqual(await replayedMessages(agent, chatA), ['from a']);
++		assert.deepStrictEqual(await replayedMessages(agent, chatB), ['from b']);
++	});
++
++	test('disposing one chat leaves the other in-flight replay intact', async () => {
++		const client = new FakeIcodeClient();
++		client.deferLoads = true;
++		const agent = new IcodeAgent(new NullLogService(), () => client);
++		const chatA = URI.parse('ahp-chat://test/dispose-replay-a');
++		const chatB = URI.parse('ahp-chat://test/dispose-replay-b');
++
++		const loadingA = agent.materializeChat(chatA, chatA, providerData('sess-a'));
++		const loadingB = agent.materializeChat(chatB, chatB, providerData('sess-b'));
++		await timeout(10);
++
++		await agent.chats.disposeChat(chatB, chatB);
++		client.emitNotification('session/update', { sessionId: 'sess-a', update: replayedUserMessage('from a') });
++		client.finishLoad('sess-a');
++		await loadingA;
++		assert.deepStrictEqual(await replayedMessages(agent, chatA), ['from a'], 'A must keep collecting while B is gone');
++
++		client.finishLoad('sess-b');
++		await loadingB;
++		assert.deepStrictEqual(await replayedMessages(agent, chatB), [], 'a disposed chat publishes no transcript');
++		agent.dispose();
++	});
++
++	test('a process exit drops only the replays of its own process', async () => {
++		const dirA = tempDirectory('icode-exit-replay-a-');
++		const dirB = tempDirectory('icode-exit-replay-b-');
++		const cwdA = URI.file(dirA).fsPath;
++		const cwdB = URI.file(dirB).fsPath;
++		const byCwd = new Map<string, FakeIcodeClient>();
++		const agent = disposables.add(new IcodeAgent(new NullLogService(), cwd => {
++			const client = new FakeIcodeClient();
++			client.deferLoads = true;
++			byCwd.set(cwd, client);
++			return client;
++		}));
++		const chatA = URI.parse('ahp-chat://test/exit-replay-a');
++		const chatB = URI.parse('ahp-chat://test/exit-replay-b');
++
++		const loadingA = agent.materializeChat(chatA, chatA, providerData('sess-a', cwdA));
++		const loadingB = agent.materializeChat(chatB, chatB, providerData('sess-b', cwdB));
++		await timeout(10);
++
++		byCwd.get(cwdA)!.emitNotification('session/update', { sessionId: 'sess-a', update: replayedUserMessage('from a') });
++		byCwd.get(cwdB)!.emitNotification('session/update', { sessionId: 'sess-b', update: replayedUserMessage('from b') });
++		byCwd.get(cwdA)!.emitExit(1);
++		await loadingA;
++		assert.deepStrictEqual(await replayedMessages(agent, chatA), [], 'a dead process replays nothing');
++
++		const clientB = byCwd.get(cwdB)!;
++		clientB.emitNotification('session/update', { sessionId: 'sess-b', update: replayedUserMessage('from b again') });
++		clientB.finishLoad('sess-b');
++		await loadingB;
++		assert.deepStrictEqual(await replayedMessages(agent, chatB), ['from b', 'from b again'], 'B keeps its own replay');
 +	});
 +
 +	test('announces the new session id as chat data once per chat', async () => {
@@ -5097,10 +5301,10 @@ index 00000000..43d8f0f3
 +});
 diff --git a/src/vs/platform/agentHost/test/node/icode/icodeHistory.test.ts b/src/vs/platform/agentHost/test/node/icode/icodeHistory.test.ts
 new file mode 100644
-index 00000000..c8d07242
+index 00000000..fd7eb62a
 --- /dev/null
 +++ b/src/vs/platform/agentHost/test/node/icode/icodeHistory.test.ts
-@@ -0,0 +1,48 @@
+@@ -0,0 +1,59 @@
 +/*---------------------------------------------------------------------------------------------
 + *  Copyright (c) Microsoft Corporation. All rights reserved.
 + *  Licensed under the MIT License. See License.txt in the project root for license information.
@@ -5143,6 +5347,17 @@ index 00000000..c8d07242
 +		assert.strictEqual(tool.toolCall.success, true);
 +		assert.strictEqual(tool.toolCall.toolName, 'shell');
 +	assert.strictEqual(tool.toolCall.displayName, 'zsh');
++	});
++
++	test('keeps the tool input a follow-up update does not repeat', () => {
++		const turns = buildIcodeTurns([
++			{ sessionUpdate: 'user_message_chunk', content: { type: 'text', text: 'go' } },
++			{ sessionUpdate: 'tool_call', toolCallId: 't1', title: 'zsh', kind: 'execute', status: 'in_progress', rawInput: { command: 'ls' } },
++			{ sessionUpdate: 'tool_call_update', toolCallId: 't1', status: 'completed', rawOutput: 'ok' },
++		] as never);
++		const tool = turns[0].responseParts[0] as { toolCall: { status: string; toolInput?: string } };
++		assert.strictEqual(tool.toolCall.status, ToolCallStatus.Completed);
++		assert.strictEqual(tool.toolCall.toolInput, '{"command":"ls"}', 'the completion must not wipe the input the announcement carried');
 +	});
 +
 +	test('drops updates that arrive before any user message instead of inventing a turn', () => {
@@ -5443,10 +5658,10 @@ index 00000000..448debe9
 +});
 diff --git a/src/vs/platform/agentHost/test/node/icode/icodeMapEvents.test.ts b/src/vs/platform/agentHost/test/node/icode/icodeMapEvents.test.ts
 new file mode 100644
-index 00000000..21a60175
+index 00000000..492c794e
 --- /dev/null
 +++ b/src/vs/platform/agentHost/test/node/icode/icodeMapEvents.test.ts
-@@ -0,0 +1,162 @@
+@@ -0,0 +1,211 @@
 +/*---------------------------------------------------------------------------------------------
 + *  Copyright (c) Microsoft Corporation. All rights reserved.
 + *  Licensed under the MIT License. See License.txt in the project root for license information.
@@ -5553,6 +5768,55 @@ index 00000000..21a60175
 +				},
 +			],
 +		);
++	});
++
++	test('a cancelled update ends a running tool call without reading as a success', () => {
++		const state = createIcodeTurnState('turn-1');
++		mapAcpSessionUpdate(chat, state, { sessionUpdate: 'tool_call', toolCallId: 't3', title: 'Run tests', kind: 'execute', status: 'in_progress', rawInput: { command: 'npm test' } });
++		assert.deepStrictEqual(
++			mapAcpSessionUpdate(chat, state, { sessionUpdate: 'tool_call_update', toolCallId: 't3', status: 'cancelled' }),
++			[{
++				kind: 'action', resource: chat, action: {
++					type: ActionType.ChatToolCallComplete, turnId: 'turn-1', toolCallId: 't3',
++					result: {
++						success: false,
++						pastTenseMessage: 'Run tests (cancelled)',
++						error: { message: 'iCode cancelled this tool call', code: 'cancelled' },
++					},
++				},
++			}],
++		);
++	});
++
++	test('a cancelled update without a running update is preceded by ready', () => {
++		const state = createIcodeTurnState('turn-1');
++		mapAcpSessionUpdate(chat, state, { sessionUpdate: 'tool_call', toolCallId: 't4', title: 'Edit b.ts', kind: 'edit', status: 'pending', rawInput: { path: 'b.ts' } });
++		assert.deepStrictEqual(
++			mapAcpSessionUpdate(chat, state, { sessionUpdate: 'tool_call_update', toolCallId: 't4', status: 'cancelled' }),
++			[
++				{
++					kind: 'action', resource: chat, action: {
++						type: ActionType.ChatToolCallReady, turnId: 'turn-1', toolCallId: 't4',
++						invocationMessage: 'Edit b.ts', confirmed: ToolCallConfirmationReason.NotNeeded, toolInput: '{"path":"b.ts"}',
++					},
++				},
++				{
++					kind: 'action', resource: chat, action: {
++						type: ActionType.ChatToolCallComplete, turnId: 'turn-1', toolCallId: 't4',
++						result: {
++							success: false,
++							pastTenseMessage: 'Edit b.ts (cancelled)',
++							error: { message: 'iCode cancelled this tool call', code: 'cancelled' },
++						},
++					},
++				},
++			],
++		);
++	});
++
++	test('a cancelled update without a tool call id emits nothing', () => {
++		const state = createIcodeTurnState('turn-1');
++		assert.deepStrictEqual(mapAcpSessionUpdate(chat, state, { sessionUpdate: 'tool_call_update', status: 'cancelled' }), []);
 +	});
 +
 +	test('a permission request yields a pending confirmation on the existing tool call', () => {

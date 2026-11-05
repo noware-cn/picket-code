@@ -16,8 +16,24 @@ name: tests (UI)
 # rather than in its own workflow because it needs exactly the install path above —
 # clone + patches + transpile + preLaunch + the two smoke-harness packages + Xvfb +
 # the unprivileged-userns sysctl; a separate file would be a near-copy of those
-# twelve steps. It costs 10–15 minutes and, like `ui`, never runs on a PR.
+# twelve steps. It costs 10–15 minutes and runs on a PR only when the change touches
+# the extension, the WSL build inputs or this workflow (see the `pull_request` paths).
 on:
+  pull_request:
+    # The WSL acceptance matrix is the only automated layer that exercises this
+    # extension, so a PR that touches it must run it. The path filter keeps that
+    # cost (~10–15 minutes plus an 87 MB payload) off unrelated PRs; the `ui` job
+    # is skipped on pull requests by its own `if:`.
+    paths:
+      - "extensions/picket-remote-wsl/**"
+      - "build/wsl/**"
+      - "build/patches/67-*.patch"
+      - "build/patches/apply-list.txt"
+      - "test/wsl-harness/**"
+      - "test/smoke/src/areas/wsl/**"
+      - "test/automation/src/**"
+      - "docs/wsl-verification.md"
+      - ".github/workflows/tests-ui.yml"
   workflow_dispatch:
     inputs:
       vscode_version:
@@ -60,6 +76,9 @@ concurrency:
 jobs:
   ui:
     name: "UI smoke (L4: Agents Window, Electron + Xvfb)"
+    # 35–45 minutes and it says nothing about a WSL change, so pull requests run only
+    # the WSL job below; the schedule, a dispatch and the release gate still run both.
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     timeout-minutes: 90
     steps:

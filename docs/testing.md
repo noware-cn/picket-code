@@ -98,7 +98,7 @@
 | 工作流 | 触发 | 内容 | 阻断发布 |
 |---|---|---|---|
 | `tests.yml`（新） | `pull_request`、`push: main`、`workflow_call` | L1+L2+L3，ubuntu + windows 双平台（L1/L2 only，L3 只 ubuntu） | PR 必过 |
-| `tests-ui.yml`（新） | `workflow_dispatch`、`schedule`（每日）、`workflow_call` | 编译 + L4 单个 shard（`ui` job）；`wsl-acceptance` job 跑 `build/wsl/acceptance.sh --all`（WSL 远程窗口全矩阵，见 L4+） | 发布前必须绿（两个 job 任一失败即 `tests-ui` 红，人工触发或发布流水线调用） |
+| `tests-ui.yml`（新） | `workflow_dispatch`、`schedule`（每日）、`workflow_call`、`pull_request`（仅当改动命中 `extensions/picket-remote-wsl/**`、`build/wsl/**`、`build/patches/67-*`、`test/wsl-harness/**`、`test/smoke/src/areas/wsl/**`、`test/automation/src/**`、`docs/wsl-verification.md` 或本文件） | 编译 + L4 单个 shard（`ui` job，PR 上跳过）；`wsl-acceptance` job 跑 `build/wsl/acceptance.sh --all`（WSL 远程窗口全矩阵，见 L4+） | 发布前必须绿（两个 job 任一失败即 `tests-ui` 红）；WSL 相关 PR 的 `wsl-acceptance` 必过 |
 | `release.yml`（改） | `v*` tag | 先 `workflow_call: tests.yml` + `tests-ui.yml`，再编译/打包/发布 | ✅ 任一失败即不发布 |
 | `verify-release.yml`（已存在） | 发布完成后 | L5 | 不再改 |
 

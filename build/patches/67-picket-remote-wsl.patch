@@ -2160,10 +2160,10 @@ index 00000000..cf40b908
 +module.exports = { detectIcode };
 diff --git a/extensions/picket-remote-wsl/src/launch.js b/extensions/picket-remote-wsl/src/launch.js
 new file mode 100644
-index 00000000..6dadd19e
+index 00000000..5002f64d
 --- /dev/null
 +++ b/extensions/picket-remote-wsl/src/launch.js
-@@ -0,0 +1,385 @@
+@@ -0,0 +1,397 @@
 +'use strict';
 +
 +const { randomBytes } = require('node:crypto');
@@ -2373,7 +2373,12 @@ index 00000000..6dadd19e
 + */
 +async function writeRuntime(runner, runtimeFile, info, distro) {
 +	const json = JSON.stringify(info);
-+	await runner.exec(['-d', distro, '-e', 'sh', '-c', 'mkdir -p "$(dirname "$1")" && printf %s "$2" > "$1.tmp" && mv "$1.tmp" "$1"', 'sh', runtimeFile, json]);
++	const result = await runner.exec(['-d', distro, '-e', 'sh', '-c', 'mkdir -p "$(dirname "$1")" && printf %s "$2" > "$1.tmp" && mv "$1.tmp" "$1"', 'sh', runtimeFile, json]);
++	if (result.code !== 0) {
++		// `exec` resolves with the exit code; a shell that could not write must not
++		// look like a written record, or the next window starts a second server.
++		throw new Error(`exit ${result.code}${String(result.stderr ?? '').trim() ? `: ${String(result.stderr).trim()}` : ''}`);
++	}
 +}
 +
 +/**
@@ -2446,8 +2451,15 @@ index 00000000..6dadd19e
 +				clearTimeout(timer);
 +				/** @type {IRuntimeInfo} */
 +				const info = { port: parser.port, token, tag, pid: parser.pid ?? -1, startedAt: new Date().toISOString(), ...(options.extra ?? {}) };
-+				void persist(runner, runtimeFile, info, distro).catch((error) => log.error(`Could not write ${runtimeFile}: ${error.message}`));
-+				resolve(info);
++				// The record is the only way another window can find this server, so a
++				// start that cannot write it is a failed start, not a running one.
++				persist(runner, runtimeFile, info, distro).then(
++					() => resolve(info),
++					(error) => {
++						log.error(`Could not write ${runtimeFile}: ${error.message}`);
++						child.kill();
++						reject(new Error(`The server for ${distro} started on port ${info.port} but its record could not be written (${error.message}); the process was stopped.`));
++					});
 +			}
 +		};
 +		stdout?.on('data', onChunk);
@@ -3494,10 +3506,10 @@ index 00000000..f736d42b
 +module.exports = { AUTHORITY_PREFIX, parseAuthority, remoteUriFor, parseUncPath, toPosixPath, toWindowsPath };
 diff --git a/extensions/picket-remote-wsl/src/resolver.js b/extensions/picket-remote-wsl/src/resolver.js
 new file mode 100644
-index 00000000..0a6bcf5c
+index 00000000..2413b657
 --- /dev/null
 +++ b/extensions/picket-remote-wsl/src/resolver.js
-@@ -0,0 +1,324 @@
+@@ -0,0 +1,342 @@
 +'use strict';
 +
 +const { listDistros, defaultDistro, visibleDistros, distroHome } = require('./distro.js');
@@ -3797,20 +3809,38 @@ index 00000000..0a6bcf5c
 +			const distro = await resolveDistroName(requested ?? '');
 +			const home = await distroHome(runner, distro);
 +			const runtimeFile = runtimeFileFor(home, distro);
-+			const info = await lockAndRead(runner, distro, runtimeFile);
-+			if (!info) {
-+				log.info(`No server is recorded for ${distro}`);
-+				return;
++
++			// Start and stop take the same distro lock. Without it a stop that ran
++			// beside a start in another window would read a record that is about to
++			// be replaced and then kill the server that start had just brought up.
++			const acquired = await acquireLock(runner, distro, runtimeFile) || await takeOverStaleLock(distro, runtimeFile);
++			if (!acquired) {
++				throw new Error(`另一个窗口正在启动或停止 ${distro} 的服务器，请稍后再试`);
 +			}
-+			await stop({
-+				runner,
-+				distro,
-+				runtimeFile,
-+				info,
-+				log,
-+				probe: (target) => probe({ host: '127.0.0.1', port: target.port, token: target.token }),
-+				dataDir: serverPaths(home, serverVersion()).dataDir
-+			});
++			try {
++				const info = await readRuntime(runner, distro, runtimeFile);
++				if (!info) {
++					log.info(`No server is recorded for ${distro}`);
++					return;
++				}
++				try {
++					await stop({
++						runner,
++						distro,
++						runtimeFile,
++						info,
++						log,
++						probe: (target) => probe({ host: '127.0.0.1', port: target.port, token: target.token }),
++						dataDir: serverPaths(home, serverVersion()).dataDir
++					});
++				} finally {
++					// The tunnel listens on a local port for a server that is gone; leaving
++					// it behind would keep the port and the map entry for the next start.
++					await disposeTunnel(distro, info.port).catch(error => log.error(`Could not dispose the tunnel for ${distro}: ${error.message}`));
++				}
++			} finally {
++				await releaseLock(runner, distro, runtimeFile).catch(error => log.error(`Could not release ${runtimeFile}.lock: ${error.message}`));
++			}
 +		},
 +		async dispose() {
 +			inFlight.clear();
@@ -3824,10 +3854,10 @@ index 00000000..0a6bcf5c
 +module.exports = { createResolver };
 diff --git a/extensions/picket-remote-wsl/src/shim.js b/extensions/picket-remote-wsl/src/shim.js
 new file mode 100644
-index 00000000..abcd60ed
+index 00000000..4fda4b77
 --- /dev/null
 +++ b/extensions/picket-remote-wsl/src/shim.js
-@@ -0,0 +1,106 @@
+@@ -0,0 +1,123 @@
 +'use strict';
 +
 +// The in-distro `picket-code` shim: a small shell script that points the
@@ -3867,6 +3897,9 @@ index 00000000..abcd60ed
 +const INSPECT_SCRIPT = 'mkdir -p "$1" "$2"; if [ -L "$3" ]; then readlink -f "$3"; elif [ -e "$3" ]; then printf file; else printf none; fi';
 +const WRITE_SCRIPT = 'cat > "$1" && chmod 755 "$1"';
 +const LINK_SCRIPT = 'ln -sfn "$2" "$1"';
++// Prints `ok` only when the link resolves to our script and the script is
++// executable by the user who will run `picket-code`.
++const VERIFY_SCRIPT = 'if [ ! -x "$2" ]; then printf not-executable; elif [ "$(readlink -f "$1")" != "$(readlink -f "$2")" ]; then printf wrong-target; else printf ok; fi';
 +const PROBE_SCRIPT = '"$1" --version >/dev/null 2>&1';
 +const REMOVE_SCRIPT = 'rm -rf "$1" "$2"';
 +
@@ -3904,8 +3937,22 @@ index 00000000..abcd60ed
 +		authority: `${AUTHORITY_PREFIX}+${distro}`,
 +		remoteCliPath: paths.remoteCli
 +	});
-+	await runner.exec(['-d', distro, '-e', 'sh', '-c', WRITE_SCRIPT, 'sh', scriptPath], { input: script });
-+	await runner.exec(['-d', distro, '-e', 'sh', '-c', LINK_SCRIPT, 'sh', linkPath, scriptPath]);
++	const wrote = await runner.exec(['-d', distro, '-e', 'sh', '-c', WRITE_SCRIPT, 'sh', scriptPath], { input: script });
++	if (wrote.code !== 0) {
++		return { status: 'failed', scriptPath, linkPath, message: `无法写入 ${scriptPath}（exit ${wrote.code}）：${String(wrote.stderr ?? '').trim()}` };
++	}
++	const linked = await runner.exec(['-d', distro, '-e', 'sh', '-c', LINK_SCRIPT, 'sh', linkPath, scriptPath]);
++	if (linked.code !== 0) {
++		return { status: 'failed', scriptPath, linkPath, message: `无法创建 ${linkPath}（exit ${linked.code}）：${String(linked.stderr ?? '').trim()}` };
++	}
++	// A write that "succeeded" is not an install: the script has to be executable
++	// and the link has to point at it, or `picket-code .` silently runs something
++	// else (or nothing).
++	const verified = await runner.exec(['-d', distro, '-e', 'sh', '-c', VERIFY_SCRIPT, 'sh', linkPath, scriptPath]);
++	const verdict = String(verified.stdout).trim();
++	if (verdict !== 'ok') {
++		return { status: 'failed', scriptPath, linkPath, message: `${linkPath} 校验失败：${verdict || `exit ${verified.code}`}` };
++	}
 +
 +	const probe = await runner.exec(['-d', distro, '-e', 'sh', '-c', PROBE_SCRIPT, 'sh', clientPath]);
 +	if (probe.code === 126 || probe.code === 127) {
@@ -4294,10 +4341,10 @@ index 00000000..350ec874
 +});
 diff --git a/extensions/picket-remote-wsl/test/commands.test.js b/extensions/picket-remote-wsl/test/commands.test.js
 new file mode 100644
-index 00000000..e1a530a3
+index 00000000..e3b3ee01
 --- /dev/null
 +++ b/extensions/picket-remote-wsl/test/commands.test.js
-@@ -0,0 +1,293 @@
+@@ -0,0 +1,298 @@
 +// RED first: this file must fail until src/commands.js exists.
 +const test = require('node:test');
 +const assert = require('node:assert');
@@ -4352,6 +4399,11 @@ index 00000000..e1a530a3
 +			}
 +			if (key.includes('wslpath -u')) {
 +				return { code: 0, stdout: '/mnt/c/project\n', stderr: '' };
++			}
++			if (key.includes('! -x')) {
++				// The shim verify step asks whether the link and the script landed; a
++				// real distro answers `ok` after a good write.
++				return { code: 0, stdout: 'ok\n', stderr: '' };
 +			}
 +			if (key.includes('readlink -f')) {
 +				return { code: 0, stdout: 'none\n', stderr: '' };
@@ -5724,10 +5776,10 @@ index 00000000..5e31eaaa
 +});
 diff --git a/extensions/picket-remote-wsl/test/launch.test.js b/extensions/picket-remote-wsl/test/launch.test.js
 new file mode 100644
-index 00000000..af3f5ecd
+index 00000000..d49e1c93
 --- /dev/null
 +++ b/extensions/picket-remote-wsl/test/launch.test.js
-@@ -0,0 +1,221 @@
+@@ -0,0 +1,253 @@
 +// RED first: this file must fail until src/launch.js exists.
 +const test = require('node:test');
 +const assert = require('node:assert');
@@ -5814,7 +5866,7 @@ index 00000000..af3f5ecd
 +});
 +
 +const { EventEmitter } = require('node:events');
-+const { newConnectionToken, startServer, clearRuntime, stopServer } = require('../src/launch.js');
++const { newConnectionToken, startServer, clearRuntime, stopServer, writeRuntime } = require('../src/launch.js');
 +
 +function spawnEmitting(script) {
 +	return () => {
@@ -5850,6 +5902,30 @@ index 00000000..af3f5ecd
 +		distro: 'Ubuntu', args, runtimeFile: '/dev/null/runtime.json', timeoutMs: 500, writeRuntime: async () => { }
 +	});
 +	assert.strictEqual(info.pid, -1, 'child.pid is a Windows pid and must never reach kill');
++});
++
++test('a start whose record cannot be written fails and stops the server it started', async () => {
++	// Nothing can find a server with no record: a second window would start its
++	// own, so a start that cannot record itself must not be reported as running.
++	const paths = serverPaths('/home/u', 'T');
++	const args = buildServerArgs({ paths, connectionToken: 'tok', icodeBin: undefined, distro: 'Ubuntu' });
++	let killed = 0;
++	const spawnKill = () => {
++		const child = new EventEmitter();
++		child.stdout = new EventEmitter();
++		child.stderr = new EventEmitter();
++		child.stdin = { end() { } };
++		child.kill = () => { killed += 1; };
++		child.pid = 4242;
++		setImmediate(() => child.stdout.emit('data', Buffer.from('picket-server-pid 777\nExtension host agent listening on 51234\n')));
++		return { child, stdout: child.stdout, stderr: child.stderr };
++	};
++	await assert.rejects(() => startServer({
++		runner: { spawn: spawnKill },
++		distro: 'Ubuntu', args, runtimeFile: '/home/u/.picket-code-server/runtime/Ubuntu.json', timeoutMs: 500,
++		writeRuntime: async () => { throw new Error('exit 1: no space left on device'); }
++	}), (error) => /could not be written/.test(error.message) && /no space left/.test(error.message));
++	assert.strictEqual(killed, 1, 'the orphaned process must be stopped');
 +});
 +
 +test('a silent server fails with the timeout and keeps the last output line', async () => {
@@ -5918,6 +5994,14 @@ index 00000000..af3f5ecd
 +	assert.ok(age !== undefined && age >= 30000 && age < 33000, `unexpected age ${age}`);
 +	const gone = { exec: async () => ({ code: 0, stdout: '', stderr: '' }), spawn: () => { throw new Error('not used'); } };
 +	assert.strictEqual(await lockAgeMs(gone, 'Ubuntu', '/home/u/.picket-code-server/runtime/Ubuntu.json'), undefined);
++});
++
++test('a runtime write that exits non-zero is a failure, not a record', async () => {
++	const runner = { exec: async () => ({ code: 1, stdout: '', stderr: 'mv: cannot create regular file' }), spawn: () => { throw new Error('not used'); } };
++	await assert.rejects(() => writeRuntime(runner, '/home/u/runtime/Ubuntu.json', { port: 1, token: 't', tag: 'T', pid: 2, startedAt: 'now' }, 'Ubuntu'),
++		/mv: cannot create regular file/);
++	const ok = { exec: async () => ({ code: 0, stdout: '', stderr: '' }), spawn: () => { throw new Error('not used'); } };
++	await writeRuntime(ok, '/home/u/runtime/Ubuntu.json', { port: 1, token: 't', tag: 'T', pid: 2, startedAt: 'now' }, 'Ubuntu');
 +});
 +
 +test('clearing the runtime record leaves the start lock alone', async () => {
@@ -6715,10 +6799,10 @@ index 00000000..69414920
 +});
 diff --git a/extensions/picket-remote-wsl/test/resolver.test.js b/extensions/picket-remote-wsl/test/resolver.test.js
 new file mode 100644
-index 00000000..c1a5d499
+index 00000000..0b93d097
 --- /dev/null
 +++ b/extensions/picket-remote-wsl/test/resolver.test.js
-@@ -0,0 +1,469 @@
+@@ -0,0 +1,521 @@
 +// RED first: this file must fail until src/resolver.js exists.
 +const test = require('node:test');
 +const assert = require('node:assert');
@@ -7104,6 +7188,58 @@ index 00000000..c1a5d499
 +	assert.ok(runner.state.released >= 1, 'the stale lock is cleared before the new one is taken');
 +});
 +
++test('stop takes the distro lock, so it cannot run beside a start', async () => {
++	const runtime = { port: 41234, token: 'tok', tag: VERSION, pid: 7, startedAt: 'then' };
++	const runner = makeRunner({ runtime });
++	/** @type {any[]} */
++	const stopped = [];
++	const resolver = createResolver({
++		runner, catalog: catalog(), components: () => { throw new Error('must not install'); }, settings: {}, log: silentLog(),
++		stopServer: async (options) => {
++			stopped.push(options);
++			assert.strictEqual(runner.state.acquired - runner.state.released, 1, 'the lock must be held for the whole stop');
++		}
++	});
++
++	await resolver.stop('Ubuntu');
++	assert.strictEqual(runner.state.acquired, 1);
++	assert.strictEqual(runner.state.released, 1);
++	assert.strictEqual(stopped.length, 1);
++});
++
++test('stop refuses while another window holds the lock instead of killing its server', async () => {
++	const runtime = { port: 41234, token: 'tok', tag: VERSION, pid: 7, startedAt: 'then' };
++	const runner = makeRunner({ runtime, locked: true });
++	/** @type {any[]} */
++	const stopped = [];
++	const resolver = createResolver({
++		runner, catalog: catalog(), components: () => { throw new Error('must not install'); }, settings: {}, log: silentLog(),
++		stopServer: async (options) => { stopped.push(options); }
++	});
++
++	await assert.rejects(() => resolver.stop('Ubuntu'), /正在启动或停止/);
++	assert.strictEqual(stopped.length, 0, 'nothing may be stopped without the lock');
++	assert.strictEqual(runner.state.released, 0, 'a lock taken by another window must not be released');
++});
++
++test('stop disposes the stdio tunnel of the server it stopped', async () => {
++	const runtime = { port: 41234, token: 'tok', tag: VERSION, pid: 7, startedAt: 'then', tunnelMode: 'stdio' };
++	const runner = makeRunner({ runtime, runtimeSequence: [] });
++	let disposed = 0;
++	const resolver = createResolver({
++		runner, catalog: catalog(), settings: {}, log: silentLog(),
++		components: () => { throw new Error('must not install'); },
++		createTunnel: async () => ({ localPort: 6001, dispose: async () => { disposed += 1; } }),
++		probe: async () => 'alive',
++		stopServer: async () => { }
++	});
++
++	await resolver.resolve('picket-wsl+Ubuntu');
++	assert.strictEqual(disposed, 0);
++	await resolver.stop('Ubuntu');
++	assert.strictEqual(disposed, 1, 'the tunnel listens for a server that is gone');
++});
++
 +test('a recorded stdio server is reached through a tunnel, and the probe goes through it too', async () => {
 +	const runtime = { port: 41234, token: 'tok', tag: VERSION, pid: 7, startedAt: 'then', tunnelMode: 'stdio' };
 +	const runner = makeRunner({ runtime });
@@ -7190,10 +7326,10 @@ index 00000000..c1a5d499
 +});
 diff --git a/extensions/picket-remote-wsl/test/shim.test.js b/extensions/picket-remote-wsl/test/shim.test.js
 new file mode 100644
-index 00000000..45380ac8
+index 00000000..d984ab32
 --- /dev/null
 +++ b/extensions/picket-remote-wsl/test/shim.test.js
-@@ -0,0 +1,115 @@
+@@ -0,0 +1,141 @@
 +'use strict';
 +
 +// RED first: this file must fail until src/shim.js exists.
@@ -7240,15 +7376,15 @@ index 00000000..45380ac8
 +});
 +
 +test('installShim writes the script, links it and verifies interop', async () => {
-+	const r = recordingRunner([{ code: 0, stdout: 'none\n' }]);
++	const r = recordingRunner([{ code: 0, stdout: 'none\n' }, { code: 0 }, { code: 0 }, { code: 0, stdout: 'ok\n' }]);
 +	const result = await installShim({ runner: r, ...BASE });
 +	assert.strictEqual(result.status, 'installed');
 +	assert.strictEqual(result.scriptPath, `${HOME}/.picket-code-server/bin/${TAG}/bin/picket-code`);
 +	assert.strictEqual(result.linkPath, `${HOME}/.local/bin/picket-code`);
-+	assert.strictEqual(r.calls.length, 4);
++	assert.strictEqual(r.calls.length, 5);
 +
-+	const [inspect, write, link, probe] = r.calls;
-+	for (const call of [inspect, write, link, probe]) {
++	const [inspect, write, link, verify, probe] = r.calls;
++	for (const call of [inspect, write, link, verify, probe]) {
 +		assert.deepStrictEqual(call.args.slice(0, 4), ['-d', 'Ubuntu', '-e', 'sh']);
 +	}
 +	// inspect: one round trip that creates the directories and reads the link
@@ -7262,6 +7398,9 @@ index 00000000..45380ac8
 +	assert.match(String(write.input), new RegExp(`exec '${HOME.replace(/\./g, '\\.')}/\\.picket-code-server/payloads/server-${TAG}/bin/remote-cli/picket-code' "\\$@"`));
 +	// link: both paths as positional args
 +	assert.ok(link.args.includes(result.scriptPath) && link.args.includes(result.linkPath));
++	// verify: the link must resolve to the script and the script must be executable
++	assert.ok(verify.args.includes(result.linkPath) && verify.args.includes(result.scriptPath), 'verify reads both paths');
++	assert.match(verify.args[5], /-x/);
 +	// probe: the Windows client must be startable from inside the distro
 +	assert.ok(probe.args.includes('/mnt/c/Programs/Picket Code.exe'));
 +	assert.match(probe.args[5], /--version/);
@@ -7283,10 +7422,10 @@ index 00000000..45380ac8
 +});
 +
 +test('a link into our own shim root is upgraded in place', async () => {
-+	const r = recordingRunner([{ code: 0, stdout: `${HOME}/.picket-code-server/bin/older-tag/bin/picket-code\n` }]);
++	const r = recordingRunner([{ code: 0, stdout: `${HOME}/.picket-code-server/bin/older-tag/bin/picket-code\n` }, { code: 0 }, { code: 0 }, { code: 0, stdout: 'ok\n' }]);
 +	const result = await installShim({ runner: r, ...BASE });
 +	assert.strictEqual(result.status, 'installed');
-+	assert.strictEqual(r.calls.length, 4);
++	assert.strictEqual(r.calls.length, 5);
 +});
 +
 +test('a 126 from the interop probe reports failed with the wsl.conf hint', async () => {
@@ -7294,12 +7433,35 @@ index 00000000..45380ac8
 +		{ code: 0, stdout: 'none\n' },
 +		{ code: 0 },
 +		{ code: 0 },
++		{ code: 0, stdout: 'ok\n' },
 +		{ code: 126 }
 +	]);
 +	const result = await installShim({ runner: r, ...BASE });
 +	assert.strictEqual(result.status, 'failed');
 +	assert.match(result.message ?? '', /wsl\.conf/);
 +	assert.match(result.message ?? '', /interop/);
++});
++
++test('a write that fails is not reported as an installed shim', async () => {
++	const r = recordingRunner([{ code: 0, stdout: 'none\n' }, { code: 1, stderr: 'cat: write error: Permission denied' }]);
++	const result = await installShim({ runner: r, ...BASE });
++	assert.strictEqual(result.status, 'failed');
++	assert.match(result.message ?? '', /Desktop|Permission|exit 1/);
++	assert.strictEqual(r.calls.length, 2, 'nothing may be linked after a failed write');
++});
++
++test('a link that fails is not reported as an installed shim', async () => {
++	const r = recordingRunner([{ code: 0, stdout: 'none\n' }, { code: 0 }, { code: 1, stderr: 'ln: failed to create symbolic link' }]);
++	const result = await installShim({ runner: r, ...BASE });
++	assert.strictEqual(result.status, 'failed');
++	assert.match(result.message ?? '', /ln: failed|exit 1/);
++});
++
++test('a link that does not point at the script is caught by the verify step', async () => {
++	const r = recordingRunner([{ code: 0, stdout: 'none\n' }, { code: 0 }, { code: 0 }, { code: 0, stdout: 'wrong-target\n' }]);
++	const result = await installShim({ runner: r, ...BASE });
++	assert.strictEqual(result.status, 'failed');
++	assert.match(result.message ?? '', /wrong-target/);
 +});
 +
 +test('removeShim removes the shim root and the link', async () => {
