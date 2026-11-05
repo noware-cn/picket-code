@@ -19,7 +19,9 @@
 - 不新增运行时依赖（semver 比较自写）。
 - 发行版内路径一律 POSIX；只有 `.wslconfig` 与卸载命令涉及 Windows 侧。
 - 网络：`HTTPS_PROXY=http://127.0.0.1:7892 NODE_USE_ENV_PROXY=1`。
-- 补丁：任何 `vscode/` 改动都要重新导出 `build/patches/67-picket-remote-wsl.patch`，基准是 `vscode/` 内的基线提交，导出前先看 `git status --short`。
+- 补丁：任何 `vscode/` 改动都要重新导出 `build/patches/67-picket-remote-wsl.patch`，基准是 `vscode/` 内的 tag `wsl-baseline`，导出前先看 `git status --short`。
+  导出必须覆盖四组路径——`extensions/picket-remote-wsl`、`test/automation`、`test/smoke`、`test/wsl-harness`（后三组是 L4 冒烟用例与伪 `wsl.exe` 宿主，漏掉会让发行包丢测试）：
+  `cd vscode && git diff wsl-baseline -- extensions/picket-remote-wsl test/automation test/smoke test/wsl-harness > ../build/patches/67-picket-remote-wsl.patch`，反查用 `git apply -R --check <patch> --directory=vscode`（在仓库根执行）。
 - 每个 Task 结束：`bash build/wsl/gate.sh` 全绿 → 提交 → 导补丁 → `git apply -R --check` → 主仓提交。
 - 命令文案：现有 15 条为 5 英 10 中，新增命令用中文标题并补英文 `description`。
 
@@ -777,8 +779,8 @@ Expected: 全绿。
 
 ```bash
 cd vscode && git status --short          # 必须干净
-git diff wsl-baseline -- extensions/picket-remote-wsl > ../build/patches/67-picket-remote-wsl.patch
-cd .. && git apply -R --check build/patches/67-picket-remote-wsl.patch && echo "reverse-check ok"
+git diff wsl-baseline -- extensions/picket-remote-wsl test/automation test/smoke test/wsl-harness > ../build/patches/67-picket-remote-wsl.patch
+cd .. && git apply -R --check build/patches/67-picket-remote-wsl.patch --directory=vscode && echo "reverse-check ok"
 ```
 
 - [ ] **Step 3: 纯净上游验证**
