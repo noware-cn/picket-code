@@ -1,8 +1,8 @@
 diff --git a/test/automation/src/agentsWindow.ts b/test/automation/src/agentsWindow.ts
-index f3486874..a415183f 100644
+index f3486874..ab8805ac 100644
 --- a/test/automation/src/agentsWindow.ts
 +++ b/test/automation/src/agentsWindow.ts
-@@ -45,6 +45,20 @@ const CONTEXT_USAGE_DETAILS = '.chat-context-usage-details';
+@@ -45,6 +45,35 @@ const CONTEXT_USAGE_DETAILS = '.chat-context-usage-details';
  // sibling `span.quota-value` holds the percentage).
  const CONTEXT_USAGE_TOKEN_LABEL = `${CONTEXT_USAGE_DETAILS} .quota-label span:not(.quota-value)`;
  
@@ -20,10 +20,25 @@ index f3486874..a415183f 100644
 +// onto `aria-expanded` (see `ChatCollapsibleInputOutputContentPart`).
 +const ACTIVE_SESSION_TOOL_PART_HEADER = `${ACTIVE_SESSION} .interactive-item-container.interactive-response .chat-confirmation-widget-collapsible .chat-confirmation-widget-title`;
 +
++// Per-turn changes summary (`ChatTurnPillsContentPart`): a `<details>` whose
++// summary reports `N files changed +ins -del` and whose body lists the changed
++// files (`renderChangesSummaryFileList` → a `WorkbenchList`).
++const ACTIVE_SESSION_TURN_CHANGES = `${ACTIVE_SESSION} .chat-turn-pills-part`;
++const ACTIVE_SESSION_TURN_CHANGES_HEADER = `${ACTIVE_SESSION_TURN_CHANGES} .checkpoint-file-changes-summary-header`;
++// The `N files changed` label toggles the `<details>`; the sibling
++// `.chat-file-changes-counts` button opens the changes editor instead.
++const ACTIVE_SESSION_TURN_CHANGES_LABEL = `${ACTIVE_SESSION_TURN_CHANGES_HEADER} .chat-file-changes-label`;
++const ACTIVE_SESSION_TURN_CHANGES_DETAILS = `${ACTIVE_SESSION_TURN_CHANGES} details.checkpoint-file-changes-disclosure`;
++const ACTIVE_SESSION_TURN_CHANGES_ROW = `${ACTIVE_SESSION_TURN_CHANGES} .monaco-list-row`;
++// Modified side of an open diff editor. `data-uri` is stamped on the inner
++// editor's root by `CodeEditorWidget`, so this matches both a plain diff editor
++// and the per-file editors of a multi-diff editor.
++const DIFF_EDITOR_MODIFIED = '.monaco-editor.modified-in-monaco-diff-editor';
++
  export class AgentsWindow {
  
  	constructor(private code: Code, private quickaccess: QuickAccess) { }
-@@ -872,6 +886,133 @@ export class AgentsWindow {
+@@ -872,6 +901,174 @@ export class AgentsWindow {
  		}
  	}
  
@@ -154,6 +169,47 @@ index f3486874..a415183f 100644
 +		await page.locator(expandedHeader, { hasText: label }).first().waitFor({ state: 'visible', timeout: timeoutMs });
 +	}
 +
++	/**
++	 * Wait for the active turn's changes summary and return the file labels it
++	 * lists (each row also carries the `+added / -removed` counts).
++	 */
++	async getTurnChangedFiles(timeoutMs: number = 60_000): Promise<string[]> {
++		await this.expandTurnChanges(timeoutMs);
++		const rows = await this.code.driver.currentPage.locator(ACTIVE_SESSION_TURN_CHANGES_ROW).allTextContents();
++		return rows.map(text => text.replace(/\s+/g, ' ').trim()).filter(text => text.length > 0);
++	}
++
++	/**
++	 * Open the diff editor of one file listed in the active turn's changes
++	 * summary. Rows open the checkpoint diff, because
++	 * `chat.editing.openChangedFileInDiffEditor` defaults to true.
++	 */
++	async openTurnChangeDiff(file: string, timeoutMs: number = 60_000): Promise<void> {
++		await this.expandTurnChanges(timeoutMs);
++		const page = this.code.driver.currentPage;
++		const row = page.locator(ACTIVE_SESSION_TURN_CHANGES_ROW, { hasText: file }).first();
++		await row.waitFor({ state: 'visible', timeout: timeoutMs });
++		await row.click();
++		await page.locator(`${DIFF_EDITOR_MODIFIED}[data-uri$="${file}"]`).first().waitFor({ state: 'visible', timeout: timeoutMs });
++	}
++
++	/** Wait for the modified side of the open diff editor for `file` to satisfy `accept`. */
++	async waitForDiffEditorText(file: string, accept: (text: string) => boolean, timeoutMs: number = 60_000): Promise<string> {
++		const selector = `${DIFF_EDITOR_MODIFIED}[data-uri$="${file}"] .view-lines`;
++		return this.code.waitForTextContent(selector, undefined, text => accept(text.replace(/\u00a0/g, ' ')), Math.ceil(timeoutMs / 100));
++	}
++
++	private async expandTurnChanges(timeoutMs: number): Promise<void> {
++		const page = this.code.driver.currentPage;
++		await page.locator(ACTIVE_SESSION_TURN_CHANGES_HEADER).first().waitFor({ state: 'visible', timeout: timeoutMs });
++		const isOpen = await page.evaluate(selector => (document.querySelector(selector) as HTMLDetailsElement | null)?.open === true, ACTIVE_SESSION_TURN_CHANGES_DETAILS);
++		if (isOpen) {
++			return;
++		}
++		await page.locator(ACTIVE_SESSION_TURN_CHANGES_LABEL).first().click();
++		await page.waitForFunction(selector => (document.querySelector(selector) as HTMLDetailsElement | null)?.open === true, ACTIVE_SESSION_TURN_CHANGES_DETAILS, { timeout: timeoutMs });
++	}
++
  	/**
  	 * Open the model picker in the active session input and select the model
  	 * whose displayed name contains `modelName`. Clicks the model-picker name
@@ -188,10 +244,10 @@ index bf06aae8..7f542446 100644
  			const b = allowButtons.nth(i);
 diff --git a/test/smoke/src/areas/agentsWindow/icode.test.ts b/test/smoke/src/areas/agentsWindow/icode.test.ts
 new file mode 100644
-index 00000000..c986803d
+index 00000000..3acc84a0
 --- /dev/null
 +++ b/test/smoke/src/areas/agentsWindow/icode.test.ts
-@@ -0,0 +1,432 @@
+@@ -0,0 +1,434 @@
 +/*---------------------------------------------------------------------------------------------
 + *  Copyright (c) Microsoft Corporation. All rights reserved.
 + *  Licensed under the MIT License. See License.txt in the project root for license information.
@@ -251,8 +307,10 @@ index 00000000..c986803d
 +// `session/request_permission`, so the confirmation banner is the visible
 +// evidence that the call is waiting for approval.
 +const FAKE_PERMISSION_TOOL_CALL_ID = 'tc-p';
-+// `diff` names this file in its `edit` tool call title.
++// `diff` names this file in its `edit` tool call title, then appends a
++// `change-<n>` line to it inside the session folder.
 +const FAKE_DIFF_FILE = 'probe-diff.txt';
++const FAKE_DIFF_LINE_PATTERN = /change-\d+/;
 +
 +// Selector for the send button in the Agents Window new-session homepage.
 +// Kept in sync with `SEND_BUTTON_ENABLED` in `test/automation/src/agentsWindow.ts`
@@ -266,9 +324,9 @@ index 00000000..c986803d
 + * directory. The agent host passes the folder the Agents Window hands over to
 + * `session/new` as the chat's cwd, and its per-turn checkpoints only work
 + * inside a repository (`IcodeAgent._sendMessage`), so the diff scenario needs a
-+ * real repo — which is itself part of the behaviour under test. (The ACP
-+ * subprocess itself is spawned with the agent host's cwd, so the fake CLI's
-+ * relative writes land there; see the diff scenario's MANUAL STEP note.)
++ * real repo — which is itself part of the behaviour under test. The ACP
++ * subprocess is spawned with that same cwd, so the fake CLI's relative writes
++ * land in the session folder and the checkpoints capture them.
 + */
 +function createTempGitRepo(): string {
 +	const repoPath = fs.mkdtempSync(path.join(os.tmpdir(), 'vscode-icode-smoke-'));
@@ -491,9 +549,10 @@ index 00000000..c986803d
 +
 +		const context = setupIcodeSuite(logger, { label: 'Agents Window [icode] diff scenario', scenario: 'diff' });
 +
-+		it('reports the changed file of the turn', async function () {
++		it('reports the changed file of the turn and shows its diff', async function () {
 +			this.timeout(5 * 60 * 1000);
 +			const app = this.app as Application;
++			const agentsWindow = app.workbench.agentsWindow;
 +
 +			try {
 +				const repoPath = context.repoPath;
@@ -501,21 +560,20 @@ index 00000000..c986803d
 +
 +				await submitIcodePrompt(app, PROMPT);
 +
-+				// The turn must surface the file the `edit` tool call touched: the
-+				// tool call title (`edit probe-diff.txt`) names the file in the
-+				// response. There is no changeset/diff page object in
-+				// `test/automation/src`, so this is the deepest diff assertion the
-+				// driver can make today.
-+				//
-+				// MANUAL STEP for the visual half: the fake CLI appends to
-+				// `join(process.cwd(), 'probe-diff.txt')` and the ACP subprocess is
-+				// spawned with the agent host's cwd (the transport does not forward
-+				// the session cwd), so no file inside the temp repo actually changes
-+				// and the red/green diff view is empty on purpose. To verify the deep
-+				// diff, run the fixture from the session folder and open the turn's
-+				// changeset, which must list `probe-diff.txt` with `+change-N`.
-+				const response = await app.workbench.agentsWindow.waitForAssistantText(FAKE_DIFF_FILE, 120_000);
-+				assert.ok(response.includes(FAKE_DIFF_FILE), `Expected the response to name the changed file "${FAKE_DIFF_FILE}" (got "${response}")`);
++				// The turn's changes summary must list the file the `edit` tool call
++				// wrote. The ACP subprocess runs in the session folder, so the fake
++				// CLI's `appendFileSync(join(process.cwd(), 'probe-diff.txt'))` really
++				// touches the repo the checkpoints are taken against.
++				const files = await agentsWindow.getTurnChangedFiles(120_000);
++				assert.strictEqual(files.length, 1, `Expected the turn changes summary to list one file (got ${JSON.stringify(files)})`);
++				assert.ok(files[0].includes(FAKE_DIFF_FILE), `Expected the turn changes summary to list "${FAKE_DIFF_FILE}" (got ${JSON.stringify(files)})`);
++
++				// Selecting the row opens the checkpoint diff; its modified side must
++				// show the appended line, which only holds if the checkpoint captured
++				// the real file contents rather than an empty change.
++				await agentsWindow.openTurnChangeDiff(FAKE_DIFF_FILE, 120_000);
++				const diffText = await agentsWindow.waitForDiffEditorText(FAKE_DIFF_FILE, text => FAKE_DIFF_LINE_PATTERN.test(text), 120_000);
++				assert.ok(FAKE_DIFF_LINE_PATTERN.test(diffText), `Expected the diff of "${FAKE_DIFF_FILE}" to show the appended line (got "${diffText}")`);
 +			} catch (error) {
 +				await reportFailure(app, logger, 'Agents Window [icode] diff scenario', error);
 +			}
@@ -624,6 +682,7 @@ index 00000000..c986803d
 +		});
 +	});
 +}
+
 diff --git a/test/smoke/src/main.ts b/test/smoke/src/main.ts
 index 8c940f9c..02bee7c0 100644
 --- a/test/smoke/src/main.ts

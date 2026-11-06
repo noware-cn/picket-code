@@ -97,16 +97,23 @@ command -v git >/dev/null || { echo "FATAL: git is required to clone the upstrea
 command -v python3 >/dev/null || { echo "FATAL: python3 is required by build/apply-patches.sh" >&2; exit 1; }
 
 # ---- 1. clone + trim + patch: the first half of build/build.sh -------------------------
+# The marker names both the upstream tag and the digest of everything this side
+# changes: a tree prepared before a patch edit must not be reused, or the tests
+# would run against sources that no longer match the patches.
+PREPARE_STAMP="$TAG $PATCH_DIGEST"
 prepare_tree() {
-  if [ "$FORCE" != 1 ] && [ -f "$PREPARE_MARKER" ] && [ "$(cat "$PREPARE_MARKER")" = "$TAG" ]; then
-    echo "==> [picket-code] vscode/ is already prepared for $TAG (marker: $PREPARE_MARKER)"
+  if [ "$FORCE" != 1 ] && [ -f "$PREPARE_MARKER" ] && [ "$(cat "$PREPARE_MARKER")" = "$PREPARE_STAMP" ]; then
+    echo "==> [picket-code] vscode/ is already prepared for $TAG (patch digest $PATCH_DIGEST)"
     return 0
   fi
 
   if [ -d "$VSCODE_DIR" ]; then
     if [ "$FORCE" != 1 ]; then
-      echo "FATAL: $VSCODE_DIR already exists and was not prepared by this script." >&2
-      echo "       Refusing to delete it: remove it yourself, or re-run with --force." >&2
+      echo "FATAL: $VSCODE_DIR already exists and does not match $PREPARE_STAMP." >&2
+      echo "       It was prepared for: $(cat "$PREPARE_MARKER" 2>/dev/null || echo 'an unknown tree')." >&2
+      echo "       Patches or build/product.json changed since then, so testing this tree" >&2
+      echo "       would vouch for code that is no longer current." >&2
+      echo "       Remove the tree and re-run, or re-run with --force." >&2
       exit 1
     fi
     echo "==> [picket-code] rm -rf $VSCODE_DIR (--force)"
@@ -134,7 +141,7 @@ prepare_tree() {
   echo "==> [picket-code] bash build/apply-patches.sh $VSCODE_DIR"
   bash "$BUILD_DIR/apply-patches.sh" "$VSCODE_DIR"
 
-  printf '%s\n' "$TAG" > "$PREPARE_MARKER"
+  printf '%s\n' "$PREPARE_STAMP" > "$PREPARE_MARKER"
 }
 
 # ---- 2. npm ci -------------------------------------------------------------------------

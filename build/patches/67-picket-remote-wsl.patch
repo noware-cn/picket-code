@@ -9,10 +9,10 @@ index 00000000..96fab092
 +tsconfig.json
 diff --git a/extensions/picket-remote-wsl/extension.js b/extensions/picket-remote-wsl/extension.js
 new file mode 100644
-index 00000000..8d23bae8
+index 00000000..10108f82
 --- /dev/null
 +++ b/extensions/picket-remote-wsl/extension.js
-@@ -0,0 +1,311 @@
+@@ -0,0 +1,312 @@
 +'use strict';
 +
 +const { join } = require('node:path');
@@ -185,6 +185,7 @@ index 00000000..8d23bae8
 +
 +	const host = {
 +		showQuickPick: (items, options) => vscode.window.showQuickPick(items, options),
++		showInputBox: (options) => vscode.window.showInputBox(options),
 +		showOpenDialog: (options) => vscode.window.showOpenDialog(options),
 +		showInformationMessage: (message, ...actions) => vscode.window.showInformationMessage(message, ...actions),
 +		showWarningMessage: (message, ...actions) => vscode.window.showWarningMessage(message, ...actions),
@@ -1394,18 +1395,30 @@ index 00000000..5b2879fe
 +module.exports = { createCommands, registerCommands, downloadFromSettings, COMMANDS, RESIDENT_COMMANDS, LAST_DISTRO };
 diff --git a/extensions/picket-remote-wsl/src/components.js b/extensions/picket-remote-wsl/src/components.js
 new file mode 100644
-index 00000000..6a6d596c
+index 00000000..1f6cdea3
 --- /dev/null
 +++ b/extensions/picket-remote-wsl/src/components.js
-@@ -0,0 +1,254 @@
+@@ -0,0 +1,323 @@
 +'use strict';
 +
 +const { readFile, writeFile } = require('node:fs/promises');
++const { acquireLock, releaseLock, lockAgeMs, touchLock } = require('./launch.js');
 +const { chooseSource, installPayload } = require('./payload.js');
 +const { compareVersions, normalizeWant, selectComponent, describeSelectionError } = require('./version.js');
 +
 +/** @typedef {{ sha256: string, version: string, commit: string, source: string, installedAt: string }} IPayloadMarker */
 +/** @typedef {'absent' | 'installed' | 'outdated' | 'incompatible' | 'broken'} IPayloadState */
++
++/**
++ * Installs are serialised across windows: two of them would otherwise sweep each
++ * other's scratch directory and move files through the same `.old` path. The
++ * lock is separate from the start lock because a start installs while holding
++ * that one.
++ */
++const INSTALL_LOCK_NAME = '.picket-install';
++/** A crashed installer never releases its lock; half an hour without a refresh is enough to call it dead. */
++const INSTALL_LOCK_STALE_MS = 30 * 60 * 1000;
++const INSTALL_LOCK_POLL_MS = 2000;
 +
 +/**
 + * @param {string} payloadDir
@@ -1432,6 +1445,8 @@ index 00000000..6a6d596c
 +function createComponentManager(options) {
 +	const { catalog, runner, distro, home } = options;
 +	const payloadRoot = joinPath(home, '.vscode-server/bin');
++	/** `mkdir` of this path is the install lock; `launch.js` owns the convention. */
++	const installLock = joinPath(payloadRoot, INSTALL_LOCK_NAME);
 +
 +	/** @param {string} script @param {...string} params */
 +	function sh(script, ...params) {
@@ -1541,41 +1556,96 @@ index 00000000..6a6d596c
 +	async function ensure(id) {
 +		const current = await inspect(id);
 +		if (current.state === 'installed' && current.payloadDir) {
-+			return {
-+				payloadDir: current.payloadDir,
-+				version: current.version,
-+				source: sourceOfMarker(await readMarker(current.payloadDir))
-+			};
++			return await installedResult(current.payloadDir, current.version);
 +		}
 +		const component = componentOf(id);
-+		const source = await chooseSource(component, {
-+			explicitPath: options.env?.explicitPath,
-+			embeddedDir: options.env?.embeddedDir,
-+			baseUrl: options.env?.baseUrl,
-+			exists: options.env?.exists
++		return await withInstallLock(async () => {
++			// Another window may have finished this exact install while this one
++			// waited for the lock; installing again would only move its files.
++			const again = await inspect(id);
++			if (again.state === 'installed' && again.payloadDir) {
++				return await installedResult(again.payloadDir, again.version);
++			}
++			const source = await chooseSource(component, {
++				explicitPath: options.env?.explicitPath,
++				embeddedDir: options.env?.embeddedDir,
++				baseUrl: options.env?.baseUrl,
++				exists: options.env?.exists
++			});
++			const installed = await installPayload({
++				runner, distro, component, source, payloadRoot,
++				fetchImpl: options.fetchImpl,
++				onProgress: options.onProgress,
++				proxy: options.download?.proxy,
++				strictSSL: options.download?.strictSSL,
++				caFile: options.download?.caFile
++			});
++			/** @type {IPayloadMarker} */
++			const marker = {
++				version: component.version,
++				commit: component.commit,
++				sha256: component.sha256.toLowerCase(),
++				source: source.kind === 'url' ? source.url : source.path,
++				installedAt: new Date().toISOString()
++			};
++			const written = await sh('printf %s "$1" > "$2"', JSON.stringify(marker), markerPath(installed.payloadDir));
++			if (written.code !== 0) {
++				throw new Error(`Could not write the payload marker in ${installed.payloadDir}: ${written.stderr}`);
++			}
++			await remember(id, { version: component.version, payloadDir: installed.payloadDir });
++			return { payloadDir: installed.payloadDir, version: component.version, source };
 +		});
-+		const installed = await installPayload({
-+			runner, distro, component, source, payloadRoot,
-+			fetchImpl: options.fetchImpl,
-+			onProgress: options.onProgress,
-+			proxy: options.download?.proxy,
-+			strictSSL: options.download?.strictSSL,
-+			caFile: options.download?.caFile
-+		});
-+		/** @type {IPayloadMarker} */
-+		const marker = {
-+			version: component.version,
-+			commit: component.commit,
-+			sha256: component.sha256.toLowerCase(),
-+			source: source.kind === 'url' ? source.url : source.path,
-+			installedAt: new Date().toISOString()
++	}
++
++	/**
++	 * The answer `ensure` gives for a payload that is already on disk, read from
++	 * its marker so the caller learns where it came from.
++	 * @param {string} payloadDir
++	 * @param {string | undefined} version
++	 */
++	async function installedResult(payloadDir, version) {
++		return {
++			payloadDir,
++			version,
++			source: sourceOfMarker(await readMarker(payloadDir))
 +		};
-+		const written = await sh('printf %s "$1" > "$2"', JSON.stringify(marker), markerPath(installed.payloadDir));
-+		if (written.code !== 0) {
-+			throw new Error(`Could not write the payload marker in ${installed.payloadDir}: ${written.stderr}`);
++	}
++
++	/**
++	 * Runs `install` with the install lock held, refreshing it while a large
++	 * payload downloads: only an install nobody has touched for half an hour is
++	 * taken over. The lock is a directory, created by `mkdir`, exactly like the
++	 * start lock — `launch.js` owns that convention.
++	 * @template T
++	 * @param {() => Promise<T>} install
++	 * @returns {Promise<T>}
++	 */
++	async function withInstallLock(install) {
++		const deadline = Date.now() + INSTALL_LOCK_STALE_MS;
++		for (; ;) {
++			if (await acquireLock(runner, distro, installLock)) {
++				break;
++			}
++			const ageMs = await lockAgeMs(runner, distro, installLock);
++			if (ageMs !== undefined && ageMs > INSTALL_LOCK_STALE_MS) {
++				await releaseLock(runner, distro, installLock).catch(() => { /* mkdir decides who wins */ });
++				continue;
++			}
++			if (Date.now() >= deadline) {
++				throw new Error(`Another window is still installing the WSL components for ${distro}`);
++			}
++			await new Promise(resolve => setTimeout(resolve, INSTALL_LOCK_POLL_MS));
 +		}
-+		await remember(id, { version: component.version, payloadDir: installed.payloadDir });
-+		return { payloadDir: installed.payloadDir, version: component.version, source };
++		const refreshed = setInterval(() => {
++			void touchLock(runner, distro, installLock).catch(() => { /* the next refresh tries again */ });
++		}, Math.floor(INSTALL_LOCK_STALE_MS / 10));
++		refreshed.unref?.();
++		try {
++			return await install();
++		} finally {
++			clearInterval(refreshed);
++			await releaseLock(runner, distro, installLock).catch(() => { /* a lock left behind ages out */ });
++		}
 +	}
 +
 +	/** @param {any} marker */
@@ -1939,10 +2009,10 @@ index 00000000..965b4657
 +module.exports = { buildDiagnostics };
 diff --git a/extensions/picket-remote-wsl/src/distro.js b/extensions/picket-remote-wsl/src/distro.js
 new file mode 100644
-index 00000000..4b793ee5
+index 00000000..d0835120
 --- /dev/null
 +++ b/extensions/picket-remote-wsl/src/distro.js
-@@ -0,0 +1,228 @@
+@@ -0,0 +1,230 @@
 +'use strict';
 +
 +const { spawn: spawnChild } = require('node:child_process');
@@ -2055,7 +2125,9 @@ index 00000000..4b793ee5
 +	const distros = [];
 +	for (const line of stdout.split(/\r?\n/).map(l => l.trim())) {
 +		// Lines arrive trimmed, so the leading space of a non-default row is gone.
-+		const match = /^(\*)?\s*(.+?)\s+(\w+)\s+([12])$/.exec(line);
++		// The state column is localised (`Running`, `正在运行`, `Läuft`), so it is
++		// "one word of any script", not an ASCII word.
++		const match = /^(\*)?\s*(.+?)\s+(\S+)\s+([12])$/.exec(line);
 +		if (!match) {
 +			continue;
 +		}
@@ -2596,10 +2668,10 @@ index 00000000..cf40b908
 +module.exports = { detectIcode };
 diff --git a/extensions/picket-remote-wsl/src/launch.js b/extensions/picket-remote-wsl/src/launch.js
 new file mode 100644
-index 00000000..e1bcf09f
+index 00000000..817156af
 --- /dev/null
 +++ b/extensions/picket-remote-wsl/src/launch.js
-@@ -0,0 +1,418 @@
+@@ -0,0 +1,434 @@
 +'use strict';
 +
 +const { randomBytes } = require('node:crypto');
@@ -2811,6 +2883,21 @@ index 00000000..e1bcf09f
 +}
 +
 +/**
++ * Refreshes the lock's mtime. A start holds the lock across an install, which
++ * can outlast the server start timeout by a wide margin; the owner proves it is
++ * alive by touching the lock, and only an untouched lock is ever taken over.
++ * @param {any} runner
++ * @param {string} distro
++ * @param {string} runtimeFile
++ */
++async function touchLock(runner, distro, runtimeFile) {
++	const result = await runner.exec(['-d', distro, '-e', 'sh', '-c', 'touch "$1" 2>/dev/null || true', 'sh', `${runtimeFile}.lock`]);
++	if (result.code !== 0) {
++		throw new Error(`touch ${runtimeFile}.lock failed (${result.code})`);
++	}
++}
++
++/**
 + * @param {any} runner
 + * @param {string} distro
 + * @param {string} runtimeFile
@@ -3012,6 +3099,7 @@ index 00000000..e1bcf09f
 +	isStartLocked,
 +	lockAndRead,
 +	acquireLock,
++	touchLock,
 +	releaseLock,
 +	writeRuntime,
 +	clearRuntime,
@@ -3432,10 +3520,10 @@ index 00000000..d74358c5
 +module.exports = { OFFICIAL_EXTENSION_ID, createOfficialGate };
 diff --git a/extensions/picket-remote-wsl/src/offline.js b/extensions/picket-remote-wsl/src/offline.js
 new file mode 100644
-index 00000000..5a909a32
+index 00000000..28e328ac
 --- /dev/null
 +++ b/extensions/picket-remote-wsl/src/offline.js
-@@ -0,0 +1,134 @@
+@@ -0,0 +1,147 @@
 +'use strict';
 +
 +const { execFile } = require('node:child_process');
@@ -3512,7 +3600,7 @@ index 00000000..5a909a32
 +		}
 +
 +		const sums = parseSha256Sums(await readFile(sumsFile, 'utf8'));
-+		const name = payload.slice(payload.lastIndexOf('/') + 1).replace(/\\/g, '/');
++		const name = fileName(payload);
 +		const expected = sums.get(name);
 +		if (!expected) {
 +			throw new Error(`SHA256SUMS has no entry for ${name}`);
@@ -3549,6 +3637,19 @@ index 00000000..5a909a32
 +}
 +
 +/**
++ * SHA256SUMS names files by their bare name, so the payload has to be reduced
++ * to one. `walk` joins with the platform separator, which is a backslash on the
++ * Windows side this bundle is unpacked on, so both separators are handled here
++ * rather than by `path.basename` (which only knows the running platform's).
++ * @param {string} file
++ * @returns {string}
++ */
++function fileName(file) {
++	const normalized = String(file).replace(/\\/g, '/');
++	return normalized.slice(normalized.lastIndexOf('/') + 1);
++}
++
++/**
 + * @param {string} text
 + * @returns {Map<string, string>}
 + */
@@ -3569,13 +3670,13 @@ index 00000000..5a909a32
 +	await rm(dir, { recursive: true, force: true });
 +}
 +
-+module.exports = { unpackOfflineBundle, removeBundle, parseSha256Sums, defaultExpand };
++module.exports = { unpackOfflineBundle, removeBundle, parseSha256Sums, defaultExpand, fileName };
 diff --git a/extensions/picket-remote-wsl/src/payload.js b/extensions/picket-remote-wsl/src/payload.js
 new file mode 100644
-index 00000000..bfc4b865
+index 00000000..f130709b
 --- /dev/null
 +++ b/extensions/picket-remote-wsl/src/payload.js
-@@ -0,0 +1,245 @@
+@@ -0,0 +1,249 @@
 +'use strict';
 +
 +const { createHash, randomBytes } = require('node:crypto');
@@ -3794,7 +3895,11 @@ index 00000000..bfc4b865
 +	const finalDir = `${payloadRoot}/picket-${component.version}`;
 +	const tmpDir = `${payloadRoot}/.tmp-${randomBytes(4).toString('hex')}`;
 +
-+	const prepare = await runner.exec(['-d', distro, '-e', 'sh', '-c', 'mkdir -p "$1" && rm -rf "$1"/.tmp-* "$1"/picket-*.old', 'sh', payloadRoot]);
++	const prepare = await runner.exec(['-d', distro, '-e', 'sh', '-c',
++		// A crashed install leaves its scratch directory behind, but a live one
++		// must not lose it: only scratch idle for two hours belongs to nobody.
++		'mkdir -p "$1" && find "$1" -mindepth 1 -maxdepth 1 -name ".tmp-*" -mmin +120 -exec rm -rf {} + 2>/dev/null; rm -rf "$1"/picket-*.old',
++		'sh', payloadRoot]);
 +	if (prepare.code !== 0) {
 +		throw new Error(`Could not prepare ${payloadRoot} in ${distro}: ${prepare.stderr}`);
 +	}
@@ -4091,15 +4196,15 @@ index 00000000..286ab287
 +module.exports = { AUTHORITY_PREFIX, LEGACY_AUTHORITY_PREFIX, parseAuthority, canonicalAuthority, remoteUriFor, parseUncPath, toPosixPath, toWindowsPath };
 diff --git a/extensions/picket-remote-wsl/src/resolver.js b/extensions/picket-remote-wsl/src/resolver.js
 new file mode 100644
-index 00000000..97a53f86
+index 00000000..c60a4414
 --- /dev/null
 +++ b/extensions/picket-remote-wsl/src/resolver.js
-@@ -0,0 +1,443 @@
+@@ -0,0 +1,514 @@
 +'use strict';
 +
 +const { listDistros, defaultDistro, visibleDistros, distroHome } = require('./distro.js');
 +const { compareVersions, normalizeWant } = require('./version.js');
-+const { serverPaths, versionFromPayloadDir, runtimeFileFor, buildServerArgs, newConnectionToken, lockAndRead, readRuntime, lockAgeMs, isStartLocked, acquireLock, releaseLock, writeRuntime, clearRuntime, startServer, stopServer } = require('./launch.js');
++const { serverPaths, versionFromPayloadDir, runtimeFileFor, buildServerArgs, newConnectionToken, lockAndRead, readRuntime, lockAgeMs, isStartLocked, acquireLock, touchLock, releaseLock, writeRuntime, clearRuntime, startServer, stopServer } = require('./launch.js');
 +const { probeServer } = require('./probe.js');
 +const { parseAuthority } = require('./remoteUri.js');
 +const { detectIcode } = require('./icode.js');
@@ -4348,11 +4453,26 @@ index 00000000..97a53f86
 +		return { host: endpoint.host, port: endpoint.port, connectionToken: info.token };
 +	}
 +
++	/**
++	 * Two runtime records that describe the same server process: the fields a
++	 * probe and a stop depend on, not the whole object.
++	 * @param {IRuntimeInfo | undefined} a
++	 * @param {IRuntimeInfo | undefined} b
++	 */
++	function sameRecord(a, b) {
++		if (!a || !b) {
++			return false;
++		}
++		return a.port === b.port && a.token === b.token && a.pid === b.pid && a.version === b.version && a.commit === b.commit;
++	}
++
 +	/** @param {string} distro @returns {Promise<IResolverResult>} */
 +	async function adoptOrStart(distro) {
 +		const home = await distroHome(runner, distro);
 +		const runtimeFile = runtimeFileFor(home, distro);
 +
++		/** The record this window already judged unreachable, so the re-read after the lock does not pay for a second retry window. */
++		let rejected;
 +		const stored = await lockAndRead(runner, distro, runtimeFile);
 +		if (stored && reusable(stored)) {
 +			const paths = serverPaths(home, stored.version);
@@ -4362,6 +4482,7 @@ index 00000000..97a53f86
 +				return coordinates(stored, distro, paths);
 +			}
 +			log.info(`The recorded server for ${distro} answered "${verdict}"; starting a new one`);
++			rejected = stored;
 +			await disposeTunnel(distro, stored.port);
 +		}
 +
@@ -4376,11 +4497,80 @@ index 00000000..97a53f86
 +			throw new Error(`Another window is starting the server for ${distro}, but it did not appear within ${formatSeconds(timeoutMs())}`);
 +		}
 +
++		const stillAlive = heartbeat(distro, runtimeFile);
 +		try {
-+			await clearRuntime(runner, runtimeFile, distro).catch(error => log.error(`Could not clear ${runtimeFile}: ${error.message}`));
++			// What was read before the lock is only a hint: the lock may have been
++			// busy because another window was *finishing* a start, and clearing the
++			// record it just wrote would put two servers on one data directory.
++			const current = await readRuntime(runner, distro, runtimeFile);
++			if (current && reusable(current)) {
++				const currentPaths = serverPaths(home, current.version);
++				// A record this window already probed (and found unreachable) needs no
++				// second retry window; only a record that changed is worth probing.
++				const alive = !sameRecord(current, rejected) && await probeRecorded(current, distro, currentPaths) === 'alive';
++				if (alive) {
++					log.info(`Adopting ${currentPaths.binary} on port ${current.port} for ${distro} (recorded while this window waited for the lock)`);
++					return coordinates(current, distro, currentPaths);
++				}
++			}
++			if (current) {
++				// `clearRuntime` forgets a record; it does not stop what the record
++				// points at. An older server left running keeps the data directory
++				// and its pid disappears from every window that could stop it.
++				log.info(`Retiring the recorded server for ${distro} (version ${current.version}) before starting another`);
++				await retire(distro, home, runtimeFile, current);
++			} else {
++				await clearRuntime(runner, runtimeFile, distro).catch(error => log.error(`Could not clear ${runtimeFile}: ${error.message}`));
++			}
 +			return await startFresh(distro, home);
 +		} finally {
++			stillAlive();
 +			await releaseLock(runner, distro, runtimeFile).catch(error => log.error(`Could not release ${runtimeFile}.lock: ${error.message}`));
++		}
++	}
++
++	/**
++	 * A start holds the lock across installing a payload, which can take far
++	 * longer than the server's own start timeout. The owner refreshes the lock
++	 * while it works, so `takeOverStaleLock` only takes over a lock nothing has
++	 * touched for a full start window — a slow install no longer looks abandoned.
++	 * @param {string} distro
++	 * @param {string} runtimeFile
++	 * @returns {() => void} stops the refresh
++	 */
++	function heartbeat(distro, runtimeFile) {
++		const intervalMs = Math.max(5000, Math.floor(timeoutMs() / 4));
++		const timer = setInterval(() => {
++			void touchLock(runner, distro, runtimeFile).catch(() => { /* the next refresh tries again */ });
++		}, intervalMs);
++		timer.unref?.();
++		return () => clearInterval(timer);
++	}
++
++	/**
++	 * Ends the server a record points at, under the caller's lock, and clears
++	 * the record with it. `stopServer` walks TERM → probe → KILL → sweep, so a
++	 * process that is already gone costs one failed step and nothing else.
++	 * @param {string} distro
++	 * @param {string} home
++	 * @param {string} runtimeFile
++	 * @param {IRuntimeInfo} info
++	 */
++	async function retire(distro, home, runtimeFile, info) {
++		try {
++			await stop({
++				runner,
++				distro,
++				runtimeFile,
++				info,
++				log,
++				probe: (target) => probe({ host: '127.0.0.1', port: target.port, token: target.token }),
++				dataDir: serverPaths(home, info.version).dataDir
++			});
++		} finally {
++			// The tunnel listens on a local port for a server that is gone; leaving
++			// it behind would keep the port and the map entry for the next start.
++			await disposeTunnel(distro, info.port).catch(error => log.error(`Could not dispose the tunnel for ${distro}: ${error.message}`));
 +		}
 +	}
 +
@@ -4509,21 +4699,7 @@ index 00000000..97a53f86
 +					log.info(`No server is recorded for ${distro}`);
 +					return;
 +				}
-+				try {
-+					await stop({
-+						runner,
-+						distro,
-+						runtimeFile,
-+						info,
-+						log,
-+						probe: (target) => probe({ host: '127.0.0.1', port: target.port, token: target.token }),
-+						dataDir: serverPaths(home, info.version).dataDir
-+					});
-+				} finally {
-+					// The tunnel listens on a local port for a server that is gone; leaving
-+					// it behind would keep the port and the map entry for the next start.
-+					await disposeTunnel(distro, info.port).catch(error => log.error(`Could not dispose the tunnel for ${distro}: ${error.message}`));
-+				}
++				await retire(distro, home, runtimeFile, info);
 +			} finally {
 +				await releaseLock(runner, distro, runtimeFile).catch(error => log.error(`Could not release ${runtimeFile}.lock: ${error.message}`));
 +			}
@@ -5678,10 +5854,10 @@ index 00000000..cf931822
 +});
 diff --git a/extensions/picket-remote-wsl/test/components.test.js b/extensions/picket-remote-wsl/test/components.test.js
 new file mode 100644
-index 00000000..f1c40886
+index 00000000..606fbb15
 --- /dev/null
 +++ b/extensions/picket-remote-wsl/test/components.test.js
-@@ -0,0 +1,169 @@
+@@ -0,0 +1,198 @@
 +// RED first: this file must fail until src/components.js exists.
 +const test = require('node:test');
 +const assert = require('node:assert');
@@ -5850,6 +6026,35 @@ index 00000000..f1c40886
 +		catalog: catalogOf(['1.4.0']), product: PRODUCT, runner, distro: 'D', home: HOME, env: {}, statePath
 +	});
 +	assert.strictEqual((await manager.inspect('wsl-server')).state, 'absent');
++});
++
++test('ensure installs under the shared install lock and releases it', async () => {
++	const { mkdtempSync, writeFileSync } = require('node:fs');
++	const { tmpdir } = require('node:os');
++	const { join } = require('node:path');
++	const { createHash } = require('node:crypto');
++	const dir = mkdtempSync(join(tmpdir(), 'picket-install-lock-'));
++	const payload = join(dir, 'picket-code-server-1.4.0-linux-x64.tar.gz');
++	writeFileSync(payload, 'abc');
++	const catalog = catalogOf(['1.4.0']);
++	catalog.components[0].sha256 = createHash('sha256').update('abc').digest('hex');
++
++	const { runner, calls } = fakeDistro({});
++	const manager = createComponentManager({
++		catalog, product: PRODUCT, runner, distro: 'D', home: HOME,
++		env: { explicitPath: payload }, statePath: join(dir, 'state.json')
++	});
++
++	const installed = await manager.ensure('wsl-server');
++	assert.strictEqual(installed.payloadDir, `${ROOT}/picket-1.4.0`);
++
++	const lockIndex = (verdict) => calls.findIndex(call => call.includes('.picket-install.lock') && call.includes(verdict));
++	const acquireIndex = lockIndex('mkdir "$1"');
++	const prepareIndex = calls.findIndex(call => call.includes('-name ".tmp-*" -mmin +120'));
++	const releaseIndex = lockIndex('rmdir "$1"');
++	assert.ok(acquireIndex >= 0, `the install lock is acquired first (${calls.join('\n')})`);
++	assert.ok(prepareIndex > acquireIndex, 'the payload is prepared while the lock is held');
++	assert.ok(releaseIndex > prepareIndex, 'the lock is released after the install');
 +});
 diff --git a/extensions/picket-remote-wsl/test/diagnose.test.js b/extensions/picket-remote-wsl/test/diagnose.test.js
 new file mode 100644
@@ -6045,10 +6250,10 @@ index 00000000..1f3f3966
 +});
 diff --git a/extensions/picket-remote-wsl/test/distro.test.js b/extensions/picket-remote-wsl/test/distro.test.js
 new file mode 100644
-index 00000000..7d568b2c
+index 00000000..f9fd9e83
 --- /dev/null
 +++ b/extensions/picket-remote-wsl/test/distro.test.js
-@@ -0,0 +1,98 @@
+@@ -0,0 +1,112 @@
 +// RED first: this file must fail until src/distro.js exists.
 +const test = require('node:test');
 +const assert = require('node:assert');
@@ -6085,6 +6290,20 @@ index 00000000..7d568b2c
 +
 +test('decodes UTF-8 output without NUL bytes', () => {
 +	assert.strictEqual(decodeWslOutput(Buffer.from('Ubuntu 22.04 LTS\r\n')), 'Ubuntu 22.04 LTS');
++});
++
++test('parses a localised table whose state column is not an ASCII word', () => {
++	// Chinese Windows: `wsl --list --verbose` prints localised states.
++	const table = [
++		'  NAME            STATE      VERSION',
++		'* Ubuntu-24.04    正在运行   2',
++		'  Ubuntu 22.04 LTS 已停止    1',
++		''
++	].join('\r\n');
++	assert.deepStrictEqual(parseDistroTable(table), [
++		{ name: 'Ubuntu-24.04', isDefault: true, version: '2', state: '正在运行' },
++		{ name: 'Ubuntu 22.04 LTS', isDefault: false, version: '1', state: '已停止' }
++	]);
 +});
 +
 +test('hides docker-managed distros unless they are the default', () => {
@@ -7702,10 +7921,10 @@ index 00000000..96f2dca3
 +});
 diff --git a/extensions/picket-remote-wsl/test/offline.test.js b/extensions/picket-remote-wsl/test/offline.test.js
 new file mode 100644
-index 00000000..988d5738
+index 00000000..81d2272e
 --- /dev/null
 +++ b/extensions/picket-remote-wsl/test/offline.test.js
-@@ -0,0 +1,107 @@
+@@ -0,0 +1,115 @@
 +'use strict';
 +
 +const test = require('node:test');
@@ -7718,7 +7937,7 @@ index 00000000..988d5738
 +const { promisify } = require('node:util');
 +const run = promisify(execFile);
 +
-+const { unpackOfflineBundle, removeBundle } = require('../src/offline.js');
++const { unpackOfflineBundle, removeBundle, fileName } = require('../src/offline.js');
 +
 +const VERSION = '1.0.0';
 +const COMMIT = 'a'.repeat(40);
@@ -7813,12 +8032,20 @@ index 00000000..988d5738
 +	await removeBundle(dir);
 +	await assert.rejects(() => readFile(join(dir, 'x')), /ENOENT/);
 +});
++
++test('fileName takes the last segment of a Windows path', () => {
++	// `walk` builds paths with `join`, so on Windows the payload path uses
++	// backslashes and the SHA256SUMS lookup must still key on the bare file name.
++	assert.equal(fileName('C:\\Temp\\picket-wsl-bundle-1\\nested\\picket-code-server-1.0.0-linux-x64.tar.gz'), 'picket-code-server-1.0.0-linux-x64.tar.gz');
++	assert.equal(fileName('/tmp/picket-wsl-bundle-1/nested/picket-code-server-1.0.0-linux-x64.tar.gz'), 'picket-code-server-1.0.0-linux-x64.tar.gz');
++	assert.equal(fileName('C:\\Temp\\SHA256SUMS'), 'SHA256SUMS');
++});
 diff --git a/extensions/picket-remote-wsl/test/payload.test.js b/extensions/picket-remote-wsl/test/payload.test.js
 new file mode 100644
-index 00000000..4cfa80ca
+index 00000000..3950b148
 --- /dev/null
 +++ b/extensions/picket-remote-wsl/test/payload.test.js
-@@ -0,0 +1,163 @@
+@@ -0,0 +1,166 @@
 +// RED first: this file must fail until src/payload.js exists.
 +const test = require('node:test');
 +const assert = require('node:assert');
@@ -7886,6 +8113,9 @@ index 00000000..4cfa80ca
 +	assert.strictEqual(result.payloadDir, '/home/u/.vscode-server/bin/picket-v1.143.1-picket.1-rc.4');
 +	assert.strictEqual(calls.length, 2);
 +	assert.match(calls[0].args.join(' '), /mkdir -p/);
++	// Another window may be installing into the same root right now: only scratch
++	// directories idle past the two-hour guard belong to nobody.
++	assert.match(calls[0].args.join(' '), /-name "\.tmp-\*" -mmin \+120/);
 +	assert.ok(calls[1].hasInput, 'tar receives the archive on stdin');
 +	assert.deepStrictEqual(readdirSync(dir), ['ok.tar.gz']);
 +});
@@ -8159,10 +8389,10 @@ index 00000000..1d83cdef
 +});
 diff --git a/extensions/picket-remote-wsl/test/resolver.test.js b/extensions/picket-remote-wsl/test/resolver.test.js
 new file mode 100644
-index 00000000..eb343ded
+index 00000000..9964c0c9
 --- /dev/null
 +++ b/extensions/picket-remote-wsl/test/resolver.test.js
-@@ -0,0 +1,723 @@
+@@ -0,0 +1,786 @@
 +// RED first: this file must fail until src/resolver.js exists.
 +const test = require('node:test');
 +const assert = require('node:assert');
@@ -8208,8 +8438,12 @@ index 00000000..eb343ded
 +	const calls = [];
 +	const state = { spawns: 0, cleared: 0, removed: [], markers: [], acquired: 0, released: 0 };
 +	const sequence = (options.runtimeSequence ?? []).slice();
-+	/** @type {any} */
-+	let lockHeld = options.locked === true;
++	// Locks are per path: a start holds `<runtime>.lock` while its install holds
++	// `<payloadRoot>/.picket-install.lock`, and one must not block the other.
++	/** @type {Set<string>} */
++	const locks = new Set(options.locked === true ? ['/home/u/.picket-code-server/runtime/Ubuntu.json.lock'] : []);
++	/** @param {string[]} args */
++	const lockPath = args => String(args[args.length - 1]);
 +	const runner = {
 +		calls,
 +		state,
@@ -8230,16 +8464,16 @@ index 00000000..eb343ded
 +				return { code: 0, stdout: '', stderr: '' };
 +			}
 +			if (script.includes('rmdir "$1"')) {
-+				lockHeld = false;
++				locks.delete(lockPath(args));
 +				state.released += 1;
 +				return { code: 0, stdout: '', stderr: '' };
 +			}
 +			if (script.includes('stat -c %Y')) {
-+				return { code: 0, stdout: lockHeld ? `${Math.floor(Date.now() / 1000) - (options.lockAgeSeconds ?? 0)}\n` : '', stderr: '' };
++				return { code: 0, stdout: locks.has(lockPath(args)) ? `${Math.floor(Date.now() / 1000) - (options.lockAgeSeconds ?? 0)}\n` : '', stderr: '' };
 +			}
 +			if (script.includes('"$1.lock"')) {
 +				state.cleared += 1;
-+				lockHeld = false;
++				locks.clear();
 +				return { code: 0, stdout: '', stderr: '' };
 +			}
 +			if (script.includes('rm -rf')) {
@@ -8256,13 +8490,13 @@ index 00000000..eb343ded
 +				return { code: 1, stdout: '', stderr: '' };
 +			}
 +			if (script.includes('if [ -e')) {
-+				return { code: 0, stdout: lockHeld ? '1' : '0', stderr: '' };
++				return { code: 0, stdout: locks.has(lockPath(args)) ? '1' : '0', stderr: '' };
 +			}
 +			if (script.includes('mkdir "$1"')) {
-+				if (lockHeld) {
++				if (locks.has(lockPath(args))) {
 +					return { code: 1, stdout: '', stderr: '' };
 +				}
-+				lockHeld = true;
++				locks.add(lockPath(args));
 +				state.acquired += 1;
 +				return { code: 0, stdout: '', stderr: '' };
 +			}
@@ -8352,23 +8586,8 @@ index 00000000..eb343ded
 +test('a running server below the minimum is replaced', async () => {
 +	const runner = makeRunner({ runtime: recorded({ version: '0.9.0' }) });
 +	const { starts, startServer } = startsRecording();
-+	const resolver = createResolver({
-+		runner,
-+		product: PRODUCT,
-+		components: components(),
-+		settings: {},
-+		log: silentLog(),
-+		startServer
-+	});
-+
-+	assert.strictEqual((await resolver.resolve('picket-wsl+Ubuntu')).port, 5555);
-+	assert.strictEqual(starts.length, 1);
-+});
-+
-+test('a runtime file from another commit is not trusted', async () => {
-+	const runner = makeRunner({ runtime: recorded({ token: 'old', commit: 'f'.repeat(40) }) });
-+	const { starts, startServer } = startsRecording();
-+	let probed = 0;
++	/** @type {any[]} */
++	const stopped = [];
 +	const resolver = createResolver({
 +		runner,
 +		product: PRODUCT,
@@ -8376,6 +8595,29 @@ index 00000000..eb343ded
 +		settings: {},
 +		log: silentLog(),
 +		startServer,
++		stopServer: async (/** @type {any} */ options) => { stopped.push(options); }
++	});
++
++	assert.strictEqual((await resolver.resolve('picket-wsl+Ubuntu')).port, 5555);
++	assert.strictEqual(starts.length, 1);
++	assert.strictEqual(stopped.length, 1, 'the server below the minimum is ended before its replacement starts');
++	assert.strictEqual(stopped[0].info.version, '0.9.0');
++});
++
++test('a runtime file from another commit is not trusted', async () => {
++	const runner = makeRunner({ runtime: recorded({ token: 'old', commit: 'f'.repeat(40) }) });
++	const { starts, startServer } = startsRecording();
++	let probed = 0;
++	/** @type {any[]} */
++	const stopped = [];
++	const resolver = createResolver({
++		runner,
++		product: PRODUCT,
++		components: components(),
++		settings: {},
++		log: silentLog(),
++		startServer,
++		stopServer: async (/** @type {any} */ options) => { stopped.push(options); },
 +		probe: async () => { probed += 1; return 'alive'; }
 +	});
 +
@@ -8383,6 +8625,8 @@ index 00000000..eb343ded
 +	assert.deepStrictEqual(result, { host: '127.0.0.1', port: 5555, connectionToken: 'fresh-token' });
 +	assert.strictEqual(starts.length, 1);
 +	assert.strictEqual(probed, 0, 'a stale commit is enough to restart; the port may already belong to another server');
++	assert.strictEqual(stopped.length, 1, 'the recorded server is stopped instead of left behind on its data directory');
++	assert.strictEqual(stopped[0].info.commit, 'f'.repeat(40));
 +	const args = starts[0].args;
 +	assert.ok(args.some(a => /^--connection-token=.{32,}$/.test(a)), 'a fresh token is minted for the new server');
 +	assert.ok(args.includes(`--user-data-dir=/home/u/.vscode-server/data`));
@@ -8409,6 +8653,8 @@ index 00000000..eb343ded
 +test('a dead probe restarts the server and clears the stale runtime file', async () => {
 +	const runner = makeRunner({ runtime: recorded() });
 +	const { starts, startServer } = startsRecording();
++	/** @type {any[]} */
++	const stopped = [];
 +	const resolver = createResolver({
 +		runner,
 +		product: PRODUCT,
@@ -8416,12 +8662,14 @@ index 00000000..eb343ded
 +		settings: {},
 +		log: silentLog(),
 +		startServer,
++		stopServer: async (/** @type {any} */ options) => { stopped.push(options); },
 +		probe: async () => 'dead'
 +	});
 +
 +	assert.strictEqual((await resolver.resolve('picket-wsl+Ubuntu')).port, 5555);
 +	assert.strictEqual(starts.length, 1);
-+	assert.ok(runner.state.cleared >= 1, 'the stale record must be removed before a new server takes its place');
++	assert.strictEqual(stopped.length, 1, 'a record nobody can reach is still retired instead of dropped');
++	assert.strictEqual(stopped[0].info.port, 41234, 'the record handed to the stop ladder is the one that was dropped');
 +});
 +
 +test('an unknown distro rejects and names the ones that exist', async () => {
@@ -8645,6 +8893,47 @@ index 00000000..eb343ded
 +	assert.strictEqual(runner.state.released, 0, 'a lock taken by another window must not be released');
 +});
 +
++test('a record written while this window waited for the lock is adopted, not cleared', async () => {
++	// The hint read before the lock is empty, but another window finished its
++	// start in between; clearing that record would leave two servers on one
++	// data directory.
++	const runtime = recorded();
++	const runner = makeRunner({ runtimeSequence: [undefined, runtime] });
++	const { starts, startServer } = startsRecording();
++	const resolver = createResolver({
++		runner, product: PRODUCT, settings: {}, log: silentLog(), startServer,
++		components: () => { throw new Error('must not install while adopting'); },
++		probe: async () => 'alive'
++	});
++
++	assert.deepStrictEqual(await resolver.resolve('picket-wsl+Ubuntu'), { host: '127.0.0.1', port: 41234, connectionToken: 'tok' });
++	assert.strictEqual(starts.length, 0);
++	assert.strictEqual(runner.state.cleared, 0, 'the record of the server that just started must survive');
++});
++
++test('a record this build cannot reuse is stopped before another server starts', async () => {
++	// Closing a window leaves its server running, so replacing the record
++	// without stopping the process would leave the old version on the same data
++	// directory with a pid no window remembers.
++	const runtime = recorded({ version: '0.9.0' });
++	const runner = makeRunner({ runtime });
++	const { starts, startServer } = startsRecording();
++	/** @type {any[]} */
++	const stopped = [];
++	const resolver = createResolver({
++		runner, product: PRODUCT, settings: {}, log: silentLog(), startServer,
++		components: components(),
++		probe: async () => 'alive',
++		stopServer: async (/** @type {any} */ options) => { stopped.push(options); }
++	});
++
++	assert.strictEqual((await resolver.resolve('picket-wsl+Ubuntu')).port, 5555);
++	assert.strictEqual(stopped.length, 1);
++	assert.strictEqual(stopped[0].distro, 'Ubuntu');
++	assert.strictEqual(stopped[0].info.version, '0.9.0', 'the recorded server is the one stopped');
++	assert.strictEqual(starts.length, 1);
++});
++
 +test('stop disposes the stdio tunnel of the server it stopped', async () => {
 +	const runtime = recorded({ tunnelMode: 'stdio' });
 +	const runner = makeRunner({ runtime, runtimeSequence: [] });
@@ -8731,6 +9020,8 @@ index 00000000..eb343ded
 +	const runtime = recorded({ tunnelMode: 'stdio' });
 +	const runner = makeRunner({ runtime });
 +	const { starts, startServer } = startsRecording();
++	/** @type {any[]} */
++	const stopped = [];
 +	let attempts = 0;
 +	const resolver = createResolver({
 +		runner, product: PRODUCT, settings: {}, log: silentLog(), startServer,
@@ -8740,13 +9031,15 @@ index 00000000..eb343ded
 +			attempts += 1;
 +			throw new Error('tunnel preamble timeout');
 +		},
-+		probe: async () => 'alive'
++		probe: async () => 'alive',
++		stopServer: async (/** @type {any} */ options) => { stopped.push(options); }
 +	});
 +
 +	const result = await resolver.resolve('picket-wsl+Ubuntu');
 +	assert.strictEqual(result.port, 5555);
-+	assert.strictEqual(attempts, 1);
-+	assert.strictEqual(starts.length, 1, 'an unreachable tunnel means the recorded server is gone');
++	assert.strictEqual(attempts, 1, 'the record is probed once; the re-read under the lock knows it is the same record');
++	assert.strictEqual(stopped.length, 1, 'an unreachable tunnel means the recorded server is retired');
++	assert.strictEqual(starts.length, 1);
 +});
 +
 +test('a cached server that is briefly unreachable is probed again instead of being replaced', async () => {
@@ -8774,7 +9067,7 @@ index 00000000..eb343ded
 +	let probed = 0;
 +	const resolver = createResolver({
 +		runner, product: PRODUCT, settings: { probeRetryTimeoutMs: 30000, probeRetrySeconds: 0.01 }, log: silentLog(), startServer,
-+		components: components(),
++		components: components(), stopServer: async () => { },
 +		probe: async () => { probed += 1; return 'dead'; }
 +	});
 +
@@ -8791,7 +9084,7 @@ index 00000000..eb343ded
 +	let probed = 0;
 +	const resolver = createResolver({
 +		runner, product: PRODUCT, settings: { probeRetryTimeoutMs: 30000, probeRetrySeconds: 0.01 }, log: silentLog(), startServer,
-+		components: components(),
++		components: components(), stopServer: async () => { },
 +		probe: async () => { probed += 1; return 'bad-token'; }
 +	});
 +
@@ -8806,7 +9099,7 @@ index 00000000..eb343ded
 +	let probed = 0;
 +	const resolver = createResolver({
 +		runner, product: PRODUCT, settings: { probeRetryTimeoutMs: 0, probeRetrySeconds: 0.01 }, log: silentLog(), startServer,
-+		components: components(),
++		components: components(), stopServer: async () => { },
 +		probe: async () => { probed += 1; return 'dead'; }
 +	});
 +

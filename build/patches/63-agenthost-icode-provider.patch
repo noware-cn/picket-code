@@ -455,10 +455,10 @@ index 00000000..7febc833
 +}
 diff --git a/src/vs/platform/agentHost/node/icode/icodeAgent.ts b/src/vs/platform/agentHost/node/icode/icodeAgent.ts
 new file mode 100644
-index 00000000..e2b1355b
+index 00000000..f430b007
 --- /dev/null
 +++ b/src/vs/platform/agentHost/node/icode/icodeAgent.ts
-@@ -0,0 +1,999 @@
+@@ -0,0 +1,1040 @@
 +/*---------------------------------------------------------------------------------------------
 + *  Copyright (c) Microsoft Corporation. All rights reserved.
 + *  Licensed under the MIT License. See License.txt in the project root for license information.
@@ -505,7 +505,7 @@ index 00000000..e2b1355b
 +import { buildIcodeTurns } from './icodeHistory.js';
 +import { CANCELLED_INPUT_REPLY, toChatInputRequest, toIcodeInputReply, type IIcodeInputReply, type IIcodeInputRequest, type IIcodeQuestion } from './icodeInputRequests.js';
 +import { createIcodeTransport, resolveIcodeCommand } from './icodeLaunchConfig.js';
-+import { createIcodeTurnState, mapAcpNotification, mapAcpPermissionRequest, mapAcpSessionUpdate, type IcodePermissionRequest, type IcodeSessionUpdate, type IIcodeTurnState } from './icodeMapEvents.js';
++import { createIcodeTurnState, hostToolCallId, mapAcpNotification, mapAcpPermissionRequest, mapAcpSessionUpdate, type IcodePermissionRequest, type IcodeSessionUpdate, type IIcodeTurnState } from './icodeMapEvents.js';
 +import { decodeIcodeProviderData, encodeIcodeProviderData } from './icodeProviderData.js';
 +
 +/**
@@ -533,6 +533,11 @@ index 00000000..e2b1355b
 +/** The subset of `session/new`'s result this agent reads. */
 +interface IIcodeSessionNewResult {
 +	readonly sessionId?: unknown;
++	readonly models?: IIcodeModelsCatalog;
++}
++
++/** The subset of `session/load`'s result this agent reads. */
++interface IIcodeSessionLoadResult {
 +	readonly models?: IIcodeModelsCatalog;
 +}
 +
@@ -591,6 +596,8 @@ index 00000000..e2b1355b
 +/** An `ask_user` request waiting for the host's answer. */
 +interface IIcodePendingInput {
 +	readonly chatKey: string;
++	/** The id iCode gave the request, so a repeat from the same chat can supersede it. */
++	readonly sourceId: string;
 +	/** The ACP questions, kept so the positional reply can be built once answered. */
 +	readonly questions: readonly IIcodeQuestion[];
 +	readonly resolve: (reply: IIcodeInputReply) => void;
@@ -666,16 +673,22 @@ index 00000000..e2b1355b
 +	private readonly _turns = new Map<string, IIcodeTurnState>();
 +	/** Transcript rebuilt from the last `session/load`, keyed by chat. */
 +	private readonly _history = new Map<string, readonly Turn[]>();
-+	/** Chats whose `providerData` was already published; one blob per ACP session. */
-+	private readonly _announcedChats = new Set<string>();
++	/** The session each chat already published, by chat key; one blob per session. */
++	private readonly _announcedSessions = new Map<string, string>();
 +	/** One in-flight turn per chat; the value is the running `sendMessage`. */
 +	private readonly _activePrompts = new Map<string, Promise<void>>();
 +	/** Live turns by turn id, so a process exit can report each one with its duration. */
 +	private readonly _liveTurns = new Map<string, { readonly chat: URI; readonly startedAt: number }>();
-+	/** Permission requests waiting for the host's answer, keyed by ACP tool call id. */
++	/** Permission requests waiting for the host's answer, keyed by host tool call id. */
 +	private readonly _pendingPermissions = new Map<string, IIcodePendingPermission>();
-+	/** `ask_user` requests waiting for the host's answer, keyed by iCode request id. */
++	/** `ask_user` requests waiting for the host's answer, keyed by a host-wide id. */
 +	private readonly _pendingInputs = new Map<string, IIcodePendingInput>();
++	/**
++	 * Source of the ids this agent hands the host. iCode's own ids are unique
++	 * only inside one process, and several processes serve several chats, so
++	 * every interaction the host can answer gets an id from here instead.
++	 */
++	private _nextInteractionId = 0;
 +
 +	private readonly _clientStore = this._register(new DisposableStore());
 +	private readonly _clientFactory: IcodeClientFactory;
@@ -729,6 +742,7 @@ index 00000000..e2b1355b
 +			const chatKey = chat.toString();
 +			this._turns.delete(chatKey);
 +			this._chats.delete(chatKey);
++			this._announcedSessions.delete(chatKey);
 +			// A pending approval can never be answered once its chat is gone.
 +			this._cancelPendingPermissions(key => key === chatKey);
 +			this._cancelPendingInputs(key => key === chatKey);
@@ -826,7 +840,7 @@ index 00000000..e2b1355b
 +		// Seed the session before loading: iCode replays the session's updates
 +		// while `session/load` is still in flight, and they have to be routed.
 +		this._sessions.set(chatKey, { sessionId: data.sessionId, cwd: data.cwd });
-+		this._announcedChats.add(chatKey);
++		this._announcedSessions.set(chatKey, data.sessionId);
 +
 +		const replay: IIcodeReplay = { sessionId: data.sessionId, chatKey, updates: [] };
 +		let entry: IIcodeClientEntry | undefined;
@@ -837,7 +851,11 @@ index 00000000..e2b1355b
 +			// Register before asking: the replayed updates arrive while the request
 +			// is still in flight, and each chat buffers its own.
 +			entry.replays.set(data.sessionId, replay);
-+			await entry.client.request('session/load', { sessionId: data.sessionId, cwd: data.cwd, mcpServers: [] });
++			const loaded = await entry.client.request<IIcodeSessionLoadResult>('session/load', { sessionId: data.sessionId, cwd: data.cwd, mcpServers: [] });
++			// A restored session carries the catalog just as a new one does. Skipped,
++			// a host that restarted into existing chats would keep the placeholder
++			// list, and `_catalogModelIds` would stay empty for the life of the chat.
++			this._publishModels(loaded?.models);
 +			// A replay dropped mid-flight (chat disposed, process gone) must not
 +			// publish a half-collected transcript.
 +			if (entry.replays.get(data.sessionId) === replay) {
@@ -848,6 +866,11 @@ index 00000000..e2b1355b
 +			// the next `sendMessage` starts a fresh session instead.
 +			this._logService.warn(`[icode] failed to reload session ${data.sessionId}: ${error instanceof Error ? error.message : String(error)}`);
 +			this._sessions.delete(chatKey);
++			// The announced session is gone; keep it announced only if the load
++			// worked, or the next session would never reach the host.
++			if (this._announcedSessions.get(chatKey) === data.sessionId) {
++				this._announcedSessions.delete(chatKey);
++			}
 +			this._clients.get(data.cwd)?.chatsBySessionId.delete(data.sessionId);
 +			this._history.delete(chatKey);
 +		} finally {
@@ -1018,7 +1041,7 @@ index 00000000..e2b1355b
 +		const client = entry.client;
 +		const sessionId = await this._ensureSession(entry, chat, chatKey, cwd);
 +		this._announceSession(chat, chatKey, sessionId, cwd);
-+		const state = createIcodeTurnState(turnId);
++		const state = createIcodeTurnState(turnId, `${++this._nextInteractionId}:`);
 +		this._turns.set(chatKey, state);
 +
 +		const startedAt = Date.now();
@@ -1071,14 +1094,16 @@ index 00000000..e2b1355b
 +
 +	/**
 +	 * Publishes the ACP session backing a chat so the host can restore it after
-+	 * a restart. One blob per chat: a re-announce would only rewrite the same
-+	 * session, and a replaced session is handled by the load-failure path.
++	 * a restart. One blob per session: re-announcing the same one would rewrite
++	 * what the host already has, while a session that replaced an earlier one
++	 * (the load failed, the process died) has to reach the host, or a restart
++	 * would restore the session that no longer carries this chat's context.
 +	 */
 +	private _announceSession(chat: URI, chatKey: string, sessionId: string, cwd: string): void {
-+		if (this._announcedChats.has(chatKey)) {
++		if (this._announcedSessions.get(chatKey) === sessionId) {
 +			return;
 +		}
-+		this._announcedChats.add(chatKey);
++		this._announcedSessions.set(chatKey, sessionId);
 +		this._onDidChangeChatData.fire({
 +			chat,
 +			providerData: encodeIcodeProviderData({ v: 1, sessionId, cwd, createdAt: Date.now() }),
@@ -1210,16 +1235,18 @@ index 00000000..e2b1355b
 +			return Promise.resolve(CANCELLED_PERMISSION);
 +		}
 +
++		// The host answers by this id alone, so it is the turn-qualified one — and
 +		// iCode rarely repeats a request, but a second one for the same tool call
 +		// supersedes the first: exactly one answer must reach the subprocess.
-+		this._settlePermission(toolCallId, CANCELLED_PERMISSION);
++		const hostId = hostToolCallId(state, toolCallId);
++		this._settlePermission(hostId, CANCELLED_PERMISSION);
 +
 +		for (const signal of mapAcpPermissionRequest(chat, state, request as IcodePermissionRequest)) {
 +			this._onDidChatProgress.fire(signal);
 +		}
 +
 +		return new Promise<IcodePermissionResponse>(resolve => {
-+			this._pendingPermissions.set(toolCallId, { chatKey: chat.toString(), options: request?.options ?? [], resolve });
++			this._pendingPermissions.set(hostId, { chatKey: chat.toString(), options: request?.options ?? [], resolve });
 +		});
 +	}
 +
@@ -1268,15 +1295,29 @@ index 00000000..e2b1355b
 +			return Promise.resolve(CANCELLED_INPUT_REPLY);
 +		}
 +
++		const chatKey = chat.toString();
 +		// A repeated request id supersedes the earlier one: exactly one answer
-+		// must reach the subprocess.
-+		this._cancelInput(requestId);
++		// must reach the subprocess. The host, however, sees an id of our own:
++		// iCode's ids are only unique inside its process, and two chats can be in
++		// different processes, where the same id would answer the wrong chat.
++		this._cancelInputFrom(chatKey, requestId);
++		const hostRequestId = `icode-req-${++this._nextInteractionId}`;
 +
-+		this._fireAction(chat, { type: ActionType.ChatInputRequested, request: toChatInputRequest(requestId, questions) });
++		this._fireAction(chat, { type: ActionType.ChatInputRequested, request: toChatInputRequest(hostRequestId, questions) });
 +
 +		return new Promise<IIcodeInputReply>(resolve => {
-+			this._pendingInputs.set(requestId, { chatKey: chat.toString(), questions, resolve });
++			this._pendingInputs.set(hostRequestId, { chatKey, sourceId: requestId, questions, resolve });
 +		});
++	}
++
++	/** Cancels whatever this chat is still waiting to answer for that iCode request. */
++	private _cancelInputFrom(chatKey: string, sourceId: string): void {
++		for (const requestId of [...this._pendingInputs.keys()]) {
++			const pending = this._pendingInputs.get(requestId);
++			if (pending && pending.chatKey === chatKey && pending.sourceId === sourceId) {
++				this._cancelInput(requestId);
++			}
++		}
 +	}
 +
 +	/**
@@ -2145,10 +2186,10 @@ index 00000000..9f60e33f
 +}
 diff --git a/src/vs/platform/agentHost/node/icode/icodeMapEvents.ts b/src/vs/platform/agentHost/node/icode/icodeMapEvents.ts
 new file mode 100644
-index 00000000..2983ca49
+index 00000000..86275544
 --- /dev/null
 +++ b/src/vs/platform/agentHost/node/icode/icodeMapEvents.ts
-@@ -0,0 +1,432 @@
+@@ -0,0 +1,450 @@
 +/*---------------------------------------------------------------------------------------------
 + *  Copyright (c) Microsoft Corporation. All rights reserved.
 + *  Licensed under the MIT License. See License.txt in the project root for license information.
@@ -2209,10 +2250,20 @@ index 00000000..2983ca49
 + */
 +export interface IIcodeTurnState {
 +	readonly turnId: string;
++	/**
++	 * Prefix every host-facing tool call id carries.
++	 *
++	 * ACP tool call ids are unique inside one process, and two chats can run in
++	 * different processes. The host correlates an approval by tool call id alone
++	 * (`respondToPermissionRequest` gets nothing else), so an id two processes
++	 * both use would let one chat's answer settle the other chat's request.
++	 */
++	readonly toolCallIdPrefix: string;
++	/** Stream key to the transcript part id it was assigned; see the type doc. */
 +	readonly partIds: Map<string, string>;
-+	/** Tool call id to the display title used for the past-tense completion message. */
++	/** Host tool call id to the display title used for the past-tense completion message. */
 +	readonly toolTitles: Map<string, string>;
-+	/** Tool call id to its serialized `rawInput`; ACP usually reports it only on `tool_call`. */
++	/** Host tool call id to its serialized `rawInput`; ACP usually reports it only on `tool_call`. */
 +	readonly toolInputs: Map<string, string>;
 +	/** Tool calls that already emitted `ChatToolCallReady`. */
 +	readonly readyToolCalls: Set<string>;
@@ -2230,9 +2281,10 @@ index 00000000..2983ca49
 +const ANONYMOUS_TEXT_PART_KEY = '__message__';
 +const PART_ID_PREFIX = 'icode-part-';
 +
-+export function createIcodeTurnState(turnId: string): IIcodeTurnState {
++export function createIcodeTurnState(turnId: string, toolCallIdPrefix = ''): IIcodeTurnState {
 +	return {
 +		turnId,
++		toolCallIdPrefix,
 +		partIds: new Map(),
 +		toolTitles: new Map(),
 +		toolInputs: new Map(),
@@ -2240,6 +2292,11 @@ index 00000000..2983ca49
 +		nextPartSequence: 0,
 +		activityCleared: false,
 +	};
++}
++
++/** The id the host sees for an ACP tool call; see {@link IIcodeTurnState.toolCallIdPrefix}. */
++export function hostToolCallId(state: IIcodeTurnState, toolCallId: string): string {
++	return `${state.toolCallIdPrefix}${toolCallId}`;
 +}
 +
 +/**
@@ -2309,8 +2366,8 @@ index 00000000..2983ca49
 + */
 +export function mapAcpPermissionRequest(chat: URI, state: IIcodeTurnState, request: IcodePermissionRequest): AgentSignal[] {
 +	const { toolCall } = request;
-+	const toolCallId = toolCall.toolCallId;
-+	const displayName = toolCall.title ?? toolCallId;
++	const toolCallId = hostToolCallId(state, toolCall.toolCallId);
++	const displayName = toolCall.title ?? toolCall.toolCallId;
 +	const toolName = acpToolName(toolCall.kind);
 +	const signals: AgentSignal[] = [];
 +
@@ -2401,12 +2458,13 @@ index 00000000..2983ca49
 +}
 +
 +function mapToolCallStart(chat: URI, state: IIcodeTurnState, update: IcodeSessionUpdate): AgentSignal[] {
-+	const toolCallId = update.toolCallId;
-+	if (toolCallId === undefined) {
++	const acpToolCallId = update.toolCallId;
++	if (acpToolCallId === undefined) {
 +		return [];
 +	}
 +
-+	const displayName = update.title ?? toolCallId;
++	const toolCallId = hostToolCallId(state, acpToolCallId);
++	const displayName = update.title ?? acpToolCallId;
 +	state.toolTitles.set(toolCallId, displayName);
 +	if (update.rawInput !== undefined) {
 +		state.toolInputs.set(toolCallId, JSON.stringify(update.rawInput));
@@ -2437,13 +2495,14 @@ index 00000000..2983ca49
 +}
 +
 +function mapToolCallUpdate(chat: URI, state: IIcodeTurnState, update: IcodeSessionUpdate): AgentSignal[] {
-+	const toolCallId = update.toolCallId;
-+	if (toolCallId === undefined) {
++	const acpToolCallId = update.toolCallId;
++	if (acpToolCallId === undefined) {
 +		return [];
 +	}
 +
++	const toolCallId = hostToolCallId(state, acpToolCallId);
 +	const signals: AgentSignal[] = [];
-+	const displayName = update.title ?? state.toolTitles.get(toolCallId) ?? toolCallId;
++	const displayName = update.title ?? state.toolTitles.get(toolCallId) ?? acpToolCallId;
 +	state.toolTitles.set(toolCallId, displayName);
 +	if (update.rawInput !== undefined) {
 +		state.toolInputs.set(toolCallId, JSON.stringify(update.rawInput));
@@ -3485,10 +3544,10 @@ index 00000000..70b5683a
 +});
 diff --git a/src/vs/platform/agentHost/test/node/icode/icodeAgent.test.ts b/src/vs/platform/agentHost/test/node/icode/icodeAgent.test.ts
 new file mode 100644
-index 00000000..cd391bea
+index 00000000..928084af
 --- /dev/null
 +++ b/src/vs/platform/agentHost/test/node/icode/icodeAgent.test.ts
-@@ -0,0 +1,1016 @@
+@@ -0,0 +1,1071 @@
 +/*---------------------------------------------------------------------------------------------
 + *  Copyright (c) Microsoft Corporation. All rights reserved.
 + *  Licensed under the MIT License. See License.txt in the project root for license information.
@@ -3780,17 +3839,19 @@ index 00000000..cd391bea
 +			kind: 'pending_confirmation',
 +			chat,
 +			state: {
-+				status: ToolCallStatus.PendingConfirmation, toolCallId: 't1', toolName: 'shell', displayName: 'Run ls',
++				status: ToolCallStatus.PendingConfirmation, toolCallId: '1:t1', toolName: 'shell', displayName: 'Run ls',
 +				invocationMessage: 'Run ls', toolInput: '{"command":"ls"}', confirmationTitle: 'Run ls',
 +			},
 +			permissionKind: 'shell',
 +		});
 +
-+		agent.respondToPermissionRequest('t1', false, { decisionSource: 'human_response' });
++		// The host sees an id of our own making: iCode's ids are only unique
++		// inside one subprocess, and two chats can run in two subprocesses.
++		agent.respondToPermissionRequest('1:t1', false, { decisionSource: 'human_response' });
 +		assert.deepStrictEqual(await pending, { outcome: { outcome: 'selected', optionId: 'reject' } });
 +
 +		// Late and duplicate answers (unattended fallbacks, stale clicks) are ignored.
-+		agent.respondToPermissionRequest('t1', true, { decisionSource: 'unattended_fallback' });
++		agent.respondToPermissionRequest('1:t1', true, { decisionSource: 'unattended_fallback' });
 +		agent.respondToPermissionRequest('unknown', true);
 +
 +		client.finishPrompt({ stopReason: 'cancelled' });
@@ -3929,6 +3990,57 @@ index 00000000..cd391bea
 +
 +		byCwd.get(cwdA)!.completePrompt('end_turn');
 +		byCwd.get(cwdB)!.completePrompt('end_turn');
++		await Promise.all([a, b]);
++	});
++
++	test('two processes that report the same tool call id get apart ids the host can answer', async () => {
++		const dirA = tempDirectory('icode-collide-a-');
++		const dirB = tempDirectory('icode-collide-b-');
++		const cwdA = URI.file(dirA).fsPath;
++		const cwdB = URI.file(dirB).fsPath;
++		const { agent, clientsFor } = createPerCwdAgent();
++		const chatA = URI.parse('ahp-chat://test/collide-a');
++		const chatB = URI.parse('ahp-chat://test/collide-b');
++		const asked = new Map<string, string>();
++		disposables.add(agent.onDidChatProgress(signal => {
++			if (signal.kind === 'pending_confirmation') {
++				asked.set(signal.chat.toString(), signal.state.toolCallId);
++			}
++		}));
++
++		const a = agent.chats.sendMessage(chatA, 'hello', [URI.file(dirA)], [], 'turn-a');
++		const b = agent.chats.sendMessage(chatB, 'hello', [URI.file(dirB)], [], 'turn-b');
++		await timeout(10);
++
++		// Both CLIs number their own tool calls from one: the same id twice.
++		const permission = (sessionId: string) => ({
++			sessionId,
++			toolCall: { toolCallId: 'tc-1', title: 'Run ls', kind: 'execute', status: 'pending' },
++			options: [{ optionId: 'allow', name: 'Allow once', kind: 'allow_once' }, { optionId: 'reject', name: 'Reject once', kind: 'reject_once' }],
++		});
++		const sessionOf = (client: FakeIcodeClient) => {
++			const prompt = client.requests.find(request => request.method === 'session/prompt');
++			assert.ok(prompt, 'the chat must have started a prompt');
++			return String((prompt.params as { sessionId?: string } | undefined)?.sessionId);
++		};
++		const pendingA = clientsFor(cwdA)[0].emitRequest('session/request_permission', permission(sessionOf(clientsFor(cwdA)[0])));
++		const pendingB = clientsFor(cwdB)[0].emitRequest('session/request_permission', permission(sessionOf(clientsFor(cwdB)[0])));
++		await timeout(10);
++
++		const idA = asked.get(chatA.toString());
++		const idB = asked.get(chatB.toString());
++		assert.ok(idA && idB, 'both chats must ask for confirmation');
++		assert.notStrictEqual(idA, idB, 'an id two processes both use cannot address one of them');
++		assert.ok(idA.endsWith(':tc-1') && idB.endsWith(':tc-1'), 'the ACP id stays readable inside the host id');
++
++		// Answering one must not settle the other.
++		agent.respondToPermissionRequest(idA, false, { decisionSource: 'human_response' });
++		assert.deepStrictEqual(await pendingA, { outcome: { outcome: 'selected', optionId: 'reject' } });
++		agent.respondToPermissionRequest(idB, true, { decisionSource: 'human_response' });
++		assert.deepStrictEqual(await pendingB, { outcome: { outcome: 'selected', optionId: 'allow' } });
++
++		clientsFor(cwdA)[0].completePrompt('end_turn');
++		clientsFor(cwdB)[0].completePrompt('end_turn');
 +		await Promise.all([a, b]);
 +	});
 +
@@ -4121,7 +4233,7 @@ index 00000000..cd391bea
 +		});
 +		await timeout(10);
 +		// The host sends its own ids; iCode only knows `allow`/`reject`.
-+		agent.respondToPermissionRequest('tc-host', true, { decisionSource: 'human_response', selectedOptionId: 'allow-once' });
++		agent.respondToPermissionRequest('1:tc-host', true, { decisionSource: 'human_response', selectedOptionId: 'allow-once' });
 +		assert.deepStrictEqual(await reply, { outcome: { outcome: 'selected', optionId: 'allow' } });
 +
 +		client.completePrompt('end_turn');
@@ -4364,18 +4476,20 @@ index 00000000..cd391bea
 +		if (requested.kind !== 'action' || requested.action.type !== ActionType.ChatInputRequested) {
 +			assert.fail('expected a ChatInputRequested action');
 +		}
-+		assert.strictEqual(requested.action.request.id, 'req-1');
++		// iCode's request id is scoped to its subprocess; the host sees ours.
++		const hostRequestId = requested.action.request.id;
++		assert.match(hostRequestId, /^icode-req-\d+$/);
 +		assert.deepStrictEqual(requested.action.request.questions?.map(q => ({ id: q.id, kind: q.kind })), [
-+			{ id: 'req-1:0', kind: ChatInputQuestionKind.SingleSelect },
++			{ id: `${hostRequestId}:0`, kind: ChatInputQuestionKind.SingleSelect },
 +		]);
 +
-+		agent.respondToUserInputRequest('req-1', ChatInputResponseKind.Accept, {
-+			'req-1:0': { state: ChatInputAnswerState.Submitted, value: { kind: ChatInputAnswerValueKind.Selected, value: 'b' } },
++		agent.respondToUserInputRequest(hostRequestId, ChatInputResponseKind.Accept, {
++			[`${hostRequestId}:0`]: { state: ChatInputAnswerState.Submitted, value: { kind: ChatInputAnswerValueKind.Selected, value: 'b' } },
 +		});
 +		assert.deepStrictEqual(await client.lastReplyFor('_chrys/request_input'), { answers: [{ values: ['b'], note: '' }], cancelled: false });
 +
 +		// Stale and duplicate answers are ignored: iCode only ever gets one reply.
-+		agent.respondToUserInputRequest('req-1', ChatInputResponseKind.Cancel, undefined);
++		agent.respondToUserInputRequest(hostRequestId, ChatInputResponseKind.Cancel, undefined);
 +		agent.respondToUserInputRequest('unknown', ChatInputResponseKind.Accept, undefined);
 +		assert.deepStrictEqual(await client.lastReplyFor('_chrys/request_input'), { answers: [{ values: ['b'], note: '' }], cancelled: false });
 +
@@ -4507,10 +4621,10 @@ index 00000000..cd391bea
 +});
 diff --git a/src/vs/platform/agentHost/test/node/icode/icodeAgentHostE2E.test.ts b/src/vs/platform/agentHost/test/node/icode/icodeAgentHostE2E.test.ts
 new file mode 100644
-index 00000000..43d8f0f3
+index 00000000..7ec9efcb
 --- /dev/null
 +++ b/src/vs/platform/agentHost/test/node/icode/icodeAgentHostE2E.test.ts
-@@ -0,0 +1,788 @@
+@@ -0,0 +1,791 @@
 +/*---------------------------------------------------------------------------------------------
 + *  Copyright (c) Microsoft Corporation. All rights reserved.
 + *  Licensed under the MIT License. See License.txt in the project root for license information.
@@ -5072,13 +5186,15 @@ index 00000000..43d8f0f3
 +			assert.strictEqual(host.client.actionsOfType(ActionType.ChatDelta).filter(action => action.turnId === 'turn-text').length, 3);
 +
 +			// The ACP `execute` tool call is mapped through start → ready → complete.
-+			const start = host.client.actionsOfType(ActionType.ChatToolCallStart).find(action => action.toolCallId === 'tc-1');
++			// The host sees an id scoped to this host, not iCode's subprocess-local one.
++			const start = host.client.actionsOfType(ActionType.ChatToolCallStart).find(action => /^\d+:tc-1$/.test(action.toolCallId));
 +			assert.ok(start, 'chat/toolCallStart for tc-1');
++			const toolCallId = start.toolCallId;
 +			assert.strictEqual(start.toolName, 'shell');
-+			const ready = host.client.actionsOfType(ActionType.ChatToolCallReady).find(action => action.toolCallId === 'tc-1');
++			const ready = host.client.actionsOfType(ActionType.ChatToolCallReady).find(action => action.toolCallId === toolCallId);
 +			assert.ok(ready, 'chat/toolCallReady for tc-1');
 +			assert.strictEqual(ready.confirmed, ToolCallConfirmationReason.NotNeeded);
-+			const complete = host.client.actionsOfType(ActionType.ChatToolCallComplete).find(action => action.toolCallId === 'tc-1');
++			const complete = host.client.actionsOfType(ActionType.ChatToolCallComplete).find(action => action.toolCallId === toolCallId);
 +			assert.ok(complete, 'chat/toolCallComplete for tc-1');
 +			assert.strictEqual(complete.result.success, true);
 +
@@ -5104,7 +5220,7 @@ index 00000000..43d8f0f3
 +			// A pending confirmation is a `chat/toolCallReady` with no `confirmed`.
 +			const pending = await host.client.waitForAction(
 +				ActionType.ChatToolCallReady,
-+				action => action.toolCallId === 'tc-p' && action.confirmed === undefined,
++				action => /^\d+:tc-p$/.test(action.toolCallId) && action.confirmed === undefined,
 +				'chat/toolCallReady asking for tc-p',
 +				30_000,
 +			);
@@ -5113,12 +5229,12 @@ index 00000000..43d8f0f3
 +			host.client.dispatch(handle.chat, {
 +				type: ActionType.ChatToolCallConfirmed,
 +				turnId: 'turn-permission',
-+				toolCallId: 'tc-p',
++				toolCallId: pending.toolCallId,
 +				approved: true,
 +				confirmed: ToolCallConfirmationReason.UserAction,
 +			});
 +
-+			const complete = await host.client.waitForAction(ActionType.ChatToolCallComplete, action => action.toolCallId === 'tc-p', 'chat/toolCallComplete for tc-p');
++			const complete = await host.client.waitForAction(ActionType.ChatToolCallComplete, action => action.toolCallId === pending.toolCallId, 'chat/toolCallComplete for tc-p');
 +			assert.strictEqual(complete.result.success, true, 'allowing the call must let it run to completion');
 +			await host.client.waitForAction(ActionType.ChatTurnComplete, action => action.turnId === 'turn-permission', 'chat/turnComplete');
 +		} finally {
@@ -5135,20 +5251,21 @@ index 00000000..43d8f0f3
 +
 +			const requested = await host.client.waitForAction(ActionType.ChatInputRequested, () => true, 'chat/inputRequested');
 +			const request = requested.request;
-+			assert.strictEqual(request.id, 'req-1');
++			// iCode's request id is scoped to its subprocess; the host sees ours.
++			assert.match(request.id, /^icode-req-\d+$/);
 +			const question = request.questions?.[0];
 +			assert.ok(question, 'the request must carry one question');
-+			assert.strictEqual(question.id, 'req-1:0');
++			assert.strictEqual(question.id, `${request.id}:0`);
 +			assert.strictEqual(question.message, 'Q?');
 +			assert.strictEqual(question.title, 'H');
 +			assert.deepStrictEqual((question.options ?? []).map((option: any) => option.id), ['A', 'B']);
 +
 +			host.client.dispatch(handle.chat, {
 +				type: ActionType.ChatInputCompleted,
-+				requestId: 'req-1',
++				requestId: request.id,
 +				response: ChatInputResponseKind.Accept,
 +				answers: {
-+					'req-1:0': {
++					[`${request.id}:0`]: {
 +						state: ChatInputAnswerState.Submitted,
 +						value: { kind: ChatInputAnswerValueKind.Selected, value: 'A' },
 +					},

@@ -54,6 +54,11 @@ DOWNLOAD="$SCRIPT_DIR/download"
 mkdir -p "$DOWNLOAD"
 
 TOKEN="${PICKET_SERVER_TOKEN:-${GH_TOKEN:-}}"
+# `gh` reads its credential from GH_TOKEN/GITHUB_TOKEN, not from the picket-side
+# name, so a private mirror would be queried anonymously without this.
+if [ -n "$TOKEN" ]; then
+	export GH_TOKEN="$TOKEN"
+fi
 
 # One downloader for both paths, so the public path cannot drift from the
 # private one: same files, same destinations, same failure behaviour.
