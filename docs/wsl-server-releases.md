@@ -45,15 +45,22 @@ WSL 窗口连的服务器是 `picket-code-server`，它在独立仓库
 `catalog.json`；本地已有的 tar.gz 可以用 `--from-file <path>` 直接落盘（离线、内网），
 校验和与大小都从该文件现算。
 
-## 四、当前状态（2026-11-05）
+## 四、当前状态（2026-11-06）
 
-- 客户端侧全部就位：最低版本语义、schema 2 catalog、`--from-file`、诊断里的
-  `Server minimum` 段。
-- **服务端仓库的发行工作流尚未对齐**：`noware-cn/picket-code-server` 现有 release 仍是
-  旧的 `v1.143.1-picket.1-rc.4` 形式（tag 带 `v` 前缀、资产名为 `picket-code-server-v1.143.1-…`），
-  `fetch-payload.sh` 按新约定去取会取不到。对齐这一步（`release-server.yml` 加版本输入、
-  tag `server-v<版本>`、资产按版本命名）随"服务端独立发版"任务一起落地；在此之前，本地
-  构建用 `--from-file` 指向已有载荷。
+- **服务端仓库已对齐新约定**：`noware-cn/picket-code-server` 的 `release-server.yml` 改为手工
+  dispatch，三个输入 `version`（裸 semver）、`source_ref`（客户端分支或 tag）、`vscode_version`
+  （上游 tag）；发布为 tag `server-v<版本>`、资产 `picket-code-server-<版本>-…`，不再由 tag push 触发。
+- 首个新约定 release：**`server-v1.143.1`**（载荷 `picket-code-server-1.143.1-linux-x64.tar.gz`，
+  87.8 MB，`commit e6468682…`，从客户端 `feat/picket-wsl` 构建）。
+- 客户端仓库变量：`PICKET_SERVER_MIN_VERSION=1.143.1`、`PICKET_SERVER_VERSION=1.143.1`；
+  旧变量 `PICKET_SERVER_TAG` 已删除。
+- PR 上的 `WSL acceptance`（L4+）已用这个载荷跑通全部阶段：`remote / tunnel / ui / lifecycle /
+  icode / conflict / hook / takeover / legacy / legacy-uri`。
+- **已知缺口**：服务端仓库的 R2 镜像步骤仍失败（`NoSuchBucket`，`r2:picket-releases` 在现有
+  secrets 对应的账号里不存在）。载荷的权威来源暂时只有 GitHub Release；镜像修好前
+  `https://download.noware.cn` 不能用作 `picket.wsl.serverPayloadBaseUrl`。
+- 载荷的 `product.json.version` 恒为上游版本（`1.143.1`）——扩展加载校验它；服务端自己的版本
+  只出现在 release tag、资产名与 catalog 里。
 
 ## 五、相关
 
