@@ -22,11 +22,9 @@
     "itemUrl": "https://open-vsx.org/vscode/item"
   },
   "extensionEnabledApiProposals": {
-    "ms-vscode-remote.remote-wsl": [
+    "noware.picket-remote-wsl": [
       "resolvers",
-      "contribRemoteHelp",
-      "contribViewsRemote",
-      "telemetry"
+      "contribViewsRemote"
     ]
   },
   "quality": "stable",
@@ -83,7 +81,7 @@
   "linuxIconName": "picket-code",
   "linuxDesktopName": "io.picket-code.desktop",
   "serverApplicationName": "picket-code-server",
-  "serverDataFolderName": ".picket-code-server",
+  "serverDataFolderName": ".vscode-server",
   "sharedDataFolderName": ".picket-code-shared",
   "tunnelApplicationName": "picket-code-tunnel",
   "win32TunnelMutex": "picketcodetunnel",

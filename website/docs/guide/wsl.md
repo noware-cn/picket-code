@@ -1,4 +1,13 @@
-# 在 WSL 中使用
+# 在 WSL 中使用（旧方法，已不再需要）
+
+::: tip 本发行版已内置 WSL 支持
+从 v1.143.1 起，Picket Code 自带 WSL 支持（内置扩展 + 自有服务器载荷），**不需要**
+侧载微软 Remote-WSL、也不需要手工预置 VS Code Server。用法见
+[`docs/wsl.md`](https://github.com/dantesun/picket-code/blob/main/docs/wsl.md)。
+
+下面这份文档保留作为历史方案与合规分析的对照：它是内置方案出现之前，"个人自用、
+自备微软组件"的走法，以及为什么当时只能这么做（Remote Development 许可的限制）。
+:::
 
 用 Picket Code 打开 WSL 发行版里的工程，靠的是**微软的 Remote-WSL 扩展 + 微软的 VS Code Server**。这两样都不随本发行版分发，需要自己在机器上补。它在本发行版上能跑通，前提是三个条件同时成立，缺一个就会卡在扩展激活、会话创建或握手校验上。
 

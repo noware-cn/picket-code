@@ -1,0 +1,423 @@
+name: tests
+
+# The automated layers of docs/testing.md §3.1 that fit a PR budget:
+#   contract      build/check-contract.sh (tag/archive/downloader contract)
+#   unit          L1 — the seven iCode suites + the agentHostChangeset suites
+#   acp-process   L2 — the real `icode acp` protocol boundary against a fake CLI
+#   host-e2e      L3 — the whole agent host over AHP/WebSocket with the fake CLI
+#
+# This repository does not vendor the VS Code tree: `vscode/` is cloned at build time
+# (build/build.sh, and `.gitignore` only tracks the folder name). Every job therefore
+# reproduces the tree with build/test/prepare-vscode.sh — the clone + trim + patch +
+# npm ci + transpile half of build/build.sh — and the expensive halves are shared
+# through actions/cache instead of being repeated per job.
+#
+# L4 (Electron UI smoke) is tests-ui.yml because a single run costs ~40 minutes.
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_call:
+    inputs:
+      vscode_version:
+        description: "Upstream VS Code tag to test (e.g. 1.143.1). Defaults to the newest picket-code release tag."
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+# One run per ref: a PR push supersedes the run before it. Tag pushes and the calls from
+# release.yml never cancel, or a release could delete the run it is waiting on.
+concurrency:
+  group: tests-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  # The pinned upstream tag. Release tags carry it (v1.143.1, v1.143.1-p5), so a tag
+  # build tests exactly its own upstream tree; PR and main runs take the upstream version
+  # from the newest release tag this repository has, which is the tree the last release
+  # was built from.
+  resolve:
+    name: Resolve the upstream tag
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      vscode: ${{ steps.resolve.outputs.vscode }}
+      node: ${{ steps.resolve.outputs.node }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # git tag --list needs the tags; the default single-commit checkout has none.
+          fetch-depth: 0
+      - name: Resolve tag (input → release tag → newest release tag → upstream latest)
+        id: resolve
+        shell: bash
+        env:
+          INPUT_TAG: ${{ inputs.vscode_version }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          tag="$INPUT_TAG"
+          if [ -z "$tag" ] && [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            tag="${GITHUB_REF_NAME#v}"
+            tag="${tag%%-p*}"
+          fi
+          if [ -z "$tag" ]; then
+            newest="$(git tag --list 'v[0-9]*' --sort=-v:refname | head -1 || true)"
+            echo "newest release tag in this repository: ${newest:-<none>}"
+            tag="$(printf '%s' "$newest" | sed -e 's/^v//' -e 's/-p.*$//')"
+          fi
+          if ! [[ "$tag" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "no usable tag found; falling back to the latest stable microsoft/vscode release"
+            tag="$(curl -fsSL -H "Authorization: Bearer $GITHUB_TOKEN" \
+              https://api.github.com/repos/microsoft/vscode/releases/latest \
+              | python3 -c 'import sys,json;print(json.load(sys.stdin)["tag_name"])')"
+          fi
+          tag="$(printf '%s' "$tag" | tr -d '[:space:]')"
+          node_version="$(curl -fsSL "https://raw.githubusercontent.com/microsoft/vscode/$tag/.nvmrc" | tr -d '[:space:]')"
+          echo "testing upstream VS Code $tag with node $node_version"
+          echo "vscode=$tag" >> "$GITHUB_OUTPUT"
+          echo "node=$node_version" >> "$GITHUB_OUTPUT"
+
+  # The contract checks read nothing but the repository, so they fail in 30 seconds
+  # instead of after the five-minute compile below.
+  contract:
+    name: Contract (build/check-contract.sh)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+      - name: Run the release contract checks
+        shell: bash
+        run: |
+          echo "==> bash build/check-contract.sh"
+          bash build/check-contract.sh
+
+  # One npm ci and one transpile for every layer. Cache key: upstream tag + hash of the
+  # patched package-lock.json + digest of build/patches and build/product.json, so a
+  # patch or lockfile edit invalidates it and an unchanged tree restores in a minute.
+  build:
+    name: Prepare vscode/ (clone, patch, npm ci, transpile)
+    needs: resolve
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      VSCODE_TAG: ${{ needs.resolve.outputs.vscode }}
+    outputs:
+      cache-key: ${{ steps.cache-key.outputs.key }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: ${{ needs.resolve.outputs.node }}
+
+      - name: Install Linux build dependencies (node-gyp headers)
+        shell: bash
+        run: |
+          echo "==> sudo apt-get install -y libkrb5-dev libx11-dev libxkbfile-dev libsecret-1-dev libxext-dev libxrender-dev libxrandr-dev"
+          sudo apt-get update
+          sudo apt-get install -y libkrb5-dev libx11-dev libxkbfile-dev \
+            libsecret-1-dev libxext-dev libxrender-dev libxrandr-dev
+
+      - name: Clone the pinned tree and apply the patches
+        shell: bash
+        run: |
+          echo "==> bash build/test/prepare-vscode.sh $VSCODE_TAG --no-install --no-transpile"
+          bash build/test/prepare-vscode.sh "$VSCODE_TAG" --no-install --no-transpile
+
+      - name: Compute the cache key (patched lockfile + patch digest)
+        id: cache-key
+        shell: bash
+        run: |
+          key="$(bash build/test/prepare-vscode.sh "$VSCODE_TAG" --cache-key)"
+          echo "cache key: $key"
+          echo "key=$key" >> "$GITHUB_OUTPUT"
+
+      - name: Restore node_modules + out
+        id: cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            vscode/node_modules
+            vscode/out
+          key: ${{ steps.cache-key.outputs.key }}
+
+      - name: npm ci and transpile (cache miss only)
+        if: steps.cache.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          echo "==> bash build/test/prepare-vscode.sh $VSCODE_TAG"
+          bash build/test/prepare-vscode.sh "$VSCODE_TAG"
+
+  unit:
+    name: "Unit (L1: iCode + agentHostChangeset)"
+    needs: [resolve, build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      VSCODE_TAG: ${{ needs.resolve.outputs.vscode }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: ${{ needs.resolve.outputs.node }}
+
+      - name: Clone the pinned tree and apply the patches
+        shell: bash
+        run: |
+          echo "==> bash build/test/prepare-vscode.sh $VSCODE_TAG --no-install --no-transpile"
+          bash build/test/prepare-vscode.sh "$VSCODE_TAG" --no-install --no-transpile
+
+      - name: Restore node_modules + out from the build job
+        id: cache
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            vscode/node_modules
+            vscode/out
+          key: ${{ needs.build.outputs.cache-key }}
+
+      - name: Install Linux build dependencies (cache miss only)
+        if: steps.cache.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          echo "==> sudo apt-get install -y libkrb5-dev libx11-dev libxkbfile-dev libsecret-1-dev libxext-dev libxrender-dev libxrandr-dev"
+          sudo apt-get update
+          sudo apt-get install -y libkrb5-dev libx11-dev libxkbfile-dev \
+            libsecret-1-dev libxext-dev libxrender-dev libxrandr-dev
+
+      - name: npm ci and transpile (cache miss only)
+        if: steps.cache.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          echo "==> bash build/test/prepare-vscode.sh $VSCODE_TAG"
+          bash build/test/prepare-vscode.sh "$VSCODE_TAG"
+
+      # The seven iCode suites. icodeAcpProcess is the L2 suite and icodeAgentHostE2E is
+      # the L3 suite: each runs in its own job, so both are excluded here — one suite must
+      # not appear twice in the report.
+      - name: iCode unit suites (L1)
+        shell: bash
+        run: |
+          echo "==> node build/test/run-unit-junit.mjs --name icode --glob 'out/vs/platform/agentHost/test/node/icode/*.test.js' --exclude '**/icodeAcpProcess.test.js' --exclude '**/icodeAgentHostE2E.test.js'"
+          node build/test/run-unit-junit.mjs \
+            --name icode \
+            --glob 'out/vs/platform/agentHost/test/node/icode/*.test.js' \
+            --exclude '**/icodeAcpProcess.test.js' \
+            --exclude '**/icodeAgentHostE2E.test.js'
+
+      - name: agentHostChangeset suites (L1)
+        shell: bash
+        run: |
+          echo "==> node build/test/run-unit-junit.mjs --name changeset --glob 'out/vs/platform/agentHost/test/node/*agentHostChangeset*.test.js'"
+          node build/test/run-unit-junit.mjs \
+            --name changeset \
+            --glob 'out/vs/platform/agentHost/test/node/*agentHostChangeset*.test.js'
+
+      - name: Summarize the JUnit reports
+        if: always()
+        shell: bash
+        run: |
+          echo "==> node build/test/summarize.mjs --dir test-results"
+          node build/test/summarize.mjs --dir test-results
+
+      - name: Upload the JUnit reports
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: test-results-unit
+          path: test-results
+          if-no-files-found: warn
+          retention-days: 30
+
+  acp-process:
+    name: "ACP process (L2: fake CLI over real stdio)"
+    needs: [resolve, build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      VSCODE_TAG: ${{ needs.resolve.outputs.vscode }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: ${{ needs.resolve.outputs.node }}
+
+      - name: Clone the pinned tree and apply the patches
+        shell: bash
+        run: |
+          echo "==> bash build/test/prepare-vscode.sh $VSCODE_TAG --no-install --no-transpile"
+          bash build/test/prepare-vscode.sh "$VSCODE_TAG" --no-install --no-transpile
+
+      # The suite and the fake CLI are our test assets and arrive with the patches; if
+      # they do not, this job would match zero files and must not look green.
+      - name: Assert the L2 assets are in the patched tree
+        shell: bash
+        run: |
+          missing=0
+          for f in \
+            vscode/src/vs/platform/agentHost/test/node/icode/icodeAcpProcess.test.ts \
+            vscode/test/fixtures/fake-icode-acp.mjs; do
+            if [ -f "$f" ]; then
+              echo "ok: $f"
+            else
+              echo "MISSING: $f"
+              missing=1
+            fi
+          done
+          if [ "$missing" -ne 0 ]; then
+            echo "FAIL: the L2 suite and its fake ACP CLI must ship with the patches in"
+            echo "      build/patches/apply-list.txt; without them there is nothing to test."
+            exit 1
+          fi
+
+      - name: Restore node_modules + out from the build job
+        id: cache
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            vscode/node_modules
+            vscode/out
+          key: ${{ needs.build.outputs.cache-key }}
+
+      - name: Install Linux build dependencies (cache miss only)
+        if: steps.cache.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          echo "==> sudo apt-get install -y libkrb5-dev libx11-dev libxkbfile-dev libsecret-1-dev libxext-dev libxrender-dev libxrandr-dev"
+          sudo apt-get update
+          sudo apt-get install -y libkrb5-dev libx11-dev libxkbfile-dev \
+            libsecret-1-dev libxext-dev libxrender-dev libxrandr-dev
+
+      - name: npm ci and transpile (cache miss only)
+        if: steps.cache.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          echo "==> bash build/test/prepare-vscode.sh $VSCODE_TAG"
+          bash build/test/prepare-vscode.sh "$VSCODE_TAG"
+
+      - name: ACP process suite (L2)
+        shell: bash
+        run: |
+          echo "==> node build/test/run-unit-junit.mjs --name acp-process --glob 'out/vs/platform/agentHost/test/node/icode/icodeAcpProcess.test.js'"
+          node build/test/run-unit-junit.mjs \
+            --name acp-process \
+            --glob 'out/vs/platform/agentHost/test/node/icode/icodeAcpProcess.test.js'
+
+      - name: Summarize the JUnit reports
+        if: always()
+        shell: bash
+        run: |
+          echo "==> node build/test/summarize.mjs --dir test-results"
+          node build/test/summarize.mjs --dir test-results
+
+      - name: Upload the JUnit reports
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: test-results-acp-process
+          path: test-results
+          if-no-files-found: warn
+          retention-days: 30
+
+  # L3 needs no display and no Electron: the suite spawns the compiled agent host
+  # (out/vs/platform/agentHost/node/agentHostServerMain.js) as a plain Node child and
+  # speaks AHP to it over a WebSocket. It costs ~15s of test time, so the timeout only
+  # covers a stuck host process.
+  host-e2e:
+    name: "Host e2e (L3: agent host over AHP/WebSocket)"
+    needs: [resolve, build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      VSCODE_TAG: ${{ needs.resolve.outputs.vscode }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: ${{ needs.resolve.outputs.node }}
+
+      - name: Clone the pinned tree and apply the patches
+        shell: bash
+        run: |
+          echo "==> bash build/test/prepare-vscode.sh $VSCODE_TAG --no-install --no-transpile"
+          bash build/test/prepare-vscode.sh "$VSCODE_TAG" --no-install --no-transpile
+
+      # The suite and the fake CLI are our test assets and arrive with the patches; if
+      # they do not, this job would match zero files and must not look green.
+      - name: Assert the L3 assets are in the patched tree
+        shell: bash
+        run: |
+          missing=0
+          for f in \
+            vscode/src/vs/platform/agentHost/test/node/icode/icodeAgentHostE2E.test.ts \
+            vscode/test/fixtures/fake-icode-acp.mjs; do
+            if [ -f "$f" ]; then
+              echo "ok: $f"
+            else
+              echo "MISSING: $f"
+              missing=1
+            fi
+          done
+          if [ "$missing" -ne 0 ]; then
+            echo "FAIL: the L3 suite and its fake ACP CLI must ship with the patches in"
+            echo "      build/patches/apply-list.txt; without them there is nothing to test."
+            exit 1
+          fi
+
+      - name: Restore node_modules + out from the build job
+        id: cache
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            vscode/node_modules
+            vscode/out
+          key: ${{ needs.build.outputs.cache-key }}
+
+      - name: Install Linux build dependencies (cache miss only)
+        if: steps.cache.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          echo "==> sudo apt-get install -y libkrb5-dev libx11-dev libxkbfile-dev libsecret-1-dev libxext-dev libxrender-dev libxrandr-dev"
+          sudo apt-get update
+          sudo apt-get install -y libkrb5-dev libx11-dev libxkbfile-dev \
+            libsecret-1-dev libxext-dev libxrender-dev libxrandr-dev
+
+      - name: npm ci and transpile (cache miss only)
+        if: steps.cache.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          echo "==> bash build/test/prepare-vscode.sh $VSCODE_TAG"
+          bash build/test/prepare-vscode.sh "$VSCODE_TAG"
+
+      - name: Agent host e2e suite (L3)
+        shell: bash
+        run: |
+          echo "==> node build/test/run-unit-junit.mjs --name host-e2e --glob 'out/vs/platform/agentHost/test/node/icode/icodeAgentHostE2E.test.js'"
+          node build/test/run-unit-junit.mjs \
+            --name host-e2e \
+            --glob 'out/vs/platform/agentHost/test/node/icode/icodeAgentHostE2E.test.js'
+
+      - name: Summarize the JUnit reports
+        if: always()
+        shell: bash
+        run: |
+          echo "==> node build/test/summarize.mjs --dir test-results"
+          node build/test/summarize.mjs --dir test-results
+
+      - name: Upload the JUnit reports
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: test-results-host-e2e
+          path: test-results
+          if-no-files-found: warn
+          retention-days: 30

@@ -94,6 +94,45 @@ if [ ! -d "$ROOT_DIR/VSCode-$PLATFORM-$ARCH" ]; then
   exit 1
 fi
 
+echo "==> [picket-code] Assembling the WSL server component (flavor: ${PICKET_WSL_PAYLOAD:-ondemand})"
+FLAVOR="${PICKET_WSL_PAYLOAD:-ondemand}"
+case "$FLAVOR" in
+  embedded|ondemand) ;;
+  *) echo "PICKET_WSL_PAYLOAD must be embedded or ondemand (got: $FLAVOR)" >&2; exit 1 ;;
+esac
+# The server is versioned on its own, so the client states a floor instead of an
+# exact tag: PICKET_SERVER_MIN_VERSION is what this build refuses to go below,
+# PICKET_SERVER_VERSION is the payload it actually ships (default: the floor).
+SERVER_MIN_VERSION="${PICKET_SERVER_MIN_VERSION:-}"
+if [ -z "$SERVER_MIN_VERSION" ]; then
+  echo "PICKET_SERVER_MIN_VERSION is required: set it to the oldest noware-cn/picket-code-server version this build accepts (e.g. 1.0.0)" >&2
+  exit 1
+fi
+SERVER_VERSION="${PICKET_SERVER_VERSION:-$SERVER_MIN_VERSION}"
+DOWNLOAD="$SCRIPT_DIR/wsl/download"
+mkdir -p "$DOWNLOAD"
+APP_DIR="$ROOT_DIR/VSCode-$PLATFORM-$ARCH/resources/app"
+# The commit is the payload's identity: the client only adopts a component
+# built from the same commit, and the upstream build wrote it into product.json.
+SERVER_COMMIT="$(node -e 'process.stdout.write(JSON.parse(require("fs").readFileSync(process.argv[1], "utf8")).commit ?? "")' "$APP_DIR/product.json")"
+if [ -z "$SERVER_COMMIT" ]; then
+  echo "the built product.json carries no commit, so no catalog component can be matched to it" >&2
+  exit 1
+fi
+export PICKET_SERVER_MIN_VERSION="$SERVER_MIN_VERSION"
+export PICKET_SERVER_COMMIT="$SERVER_COMMIT"
+if [ "$FLAVOR" = "embedded" ]; then
+  bash "$SCRIPT_DIR/wsl/fetch-payload.sh" "$SERVER_VERSION"
+  node "$SCRIPT_DIR/wsl/assemble.mjs" --app "$APP_DIR" --min-version "$SERVER_MIN_VERSION" --version "$SERVER_VERSION" \
+    --flavor embedded --payload "$DOWNLOAD/picket-code-server-$SERVER_VERSION-linux-x64.tar.gz" \
+    --sums "$DOWNLOAD/SHA256SUMS"
+else
+  bash "$SCRIPT_DIR/wsl/fetch-payload.sh" "$SERVER_VERSION" --metadata-only
+  node "$SCRIPT_DIR/wsl/assemble.mjs" --app "$APP_DIR" --min-version "$SERVER_MIN_VERSION" --version "$SERVER_VERSION" \
+    --flavor ondemand --sums "$DOWNLOAD/SHA256SUMS" --size "$(cat "$DOWNLOAD/payload-size.txt")"
+fi
+node "$SCRIPT_DIR/wsl/check.mjs" --app "$APP_DIR" --flavor "$FLAVOR"
+
 echo "==> [picket-code] Compressing vscode/ + VSCode-$PLATFORM-$ARCH for the package stage"
 cd "$ROOT_DIR"
 tar -czf vscode.tar.gz \

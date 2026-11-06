@@ -77,8 +77,8 @@ hero:
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="m5 8 4-3.5L13 8l4-3.5L21 8v11a1.5 1.5 0 0 1-1.5 1.5h-15A1.5 1.5 0 0 1 3 19Z"/><path d="M3 13h18"/><path d="M8 16.5h4"/></svg>
   </div>
   <h3>Agent 宿主就绪</h3>
-  <p>AgentHost 在完全不装 Copilot 包的情况下启动并说协议（57 号补丁），保留 IAgent、registerProvider、providerConfigurations 与协议客户端等扩展点；iCode 适配器尚未实现，当前发行版没有可用的 agent 后端。</p>
-  <span class="pc-tag">宿主可用 · 后端待接</span>
+  <p>AgentHost 在完全不装 Copilot 包的情况下启动并说协议（57 号补丁），保留 IAgent、registerProvider、providerConfigurations 与协议客户端等扩展点；iCode 经 ACP 接入（P3 注册、P4 会话恢复与 diff 预览，63/64 号补丁），<code>icode</code> 可解析时自动注册为唯一 provider。</p>
+  <span class="pc-tag">宿主可用 · iCode 已接入</span>
 </div>
 
 </div>
@@ -87,7 +87,7 @@ hero:
 <div class="pc-section">
 
 <h2 class="pc-title">分层架构 <span>To Be</span></h2>
-<p class="pc-sub">复用上游、减法优先：沿 VSCodium 验证过的构建路径做减法，先删后补。六层架构中，发行层与扩展层已落地，AgentHost 平台层裁剪为"零 provider + 编排核心"且已在无 Copilot 包的情况下启动，iCode 经适配层接入（适配层待落地，当前发行版无可用 agent 后端）。</p>
+<p class="pc-sub">复用上游、减法优先：沿 VSCodium 验证过的构建路径做减法，先删后补。六层架构中，发行层与扩展层已落地，AgentHost 平台层裁剪为"零 provider + 编排核心"且已在无 Copilot 包的情况下启动，iCode 经适配层接入（P3 已通过：注册、单轮往返与打断在 Agents Window 实测可用；P4 已通过：会话恢复、审批与输入往返、模型目录、per-turn diff 预览）。</p>
 
 <div class="pc-stack">
   <div class="pc-stack-head">

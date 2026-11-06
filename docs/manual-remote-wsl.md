@@ -1,5 +1,12 @@
 # 手工安装 Remote-WSL 与 VS Code Server
 
+> **已退役，不要照着做。** 本文描述的是在本产品内置 WSL 支持之前，用微软官方
+> `ms-vscode-remote.remote-wsl` 侧载跑通 WSL 的历史做法。现在两者**互斥**：官方扩展
+> 装着时本产品的 WSL 功能整体关闭（见 [`docs/wsl.md`](wsl.md) 与
+> [`docs/uninstall-official-remote-wsl.md`](uninstall-official-remote-wsl.md)）。
+> 保留本文只为解释当时的取舍、以及排障时对照旧现场（例如发行版版本号必须是裸 `X.Y.Z`
+> 这条约束对 `.vsix` 依然成立）。
+
 目标是**不依赖任何在线解析**把 `ms-vscode-remote.remote-wsl` 跑起来：`.vsix` 离线安装，服务端产物手工预置。适用于 Picket Code 1.143.1（上游 commit `e646868227c`）＋ Remote-WSL 1.104.7。
 
 两条前置事实决定了流程形状：
@@ -21,9 +28,13 @@ const VERSION_REGEXP = /^(\^|>=)?((\d+)|x)\.((\d+)|x)\.((\d+)|x)(\-.*)?$/;
 |---|---|---|
 | `1.143.1` | 成功 | 正常 |
 | `1.143.1+p4` | 返回 null | `isValidVersion()` 恒 false → **所有带 `main` 的扩展**都报 `not compatible with Code 1.143.1+p4` |
-| `1.143.1` | 成功 | VS Code 侧能过，但它在 semver 里是 prerelease，画廊侧 `semver.satisfies()` 匹配 `^1.x` 会失败 |
+| `1.143.1-rc.4` | 成功 | VS Code 侧能过，但它在 semver 里是 prerelease，画廊侧 `semver.satisfies()` 匹配 `^1.x` 会失败 |
 
-所以 `build/build.sh` 已去掉版本戳，打包产物保持上游原值。构建后自检：
+所以 `build/build.sh` 已去掉版本戳（见该文件第 77–85 行的注释），打包产物保持上游原值；发布流水线里由 `verify-release.yml` 的 "Assert the packaged product.json shapes" 兜底，版本不是裸 `X.Y.Z` 就直接失败。
+
+**picket 版本号只出现在两处**：git tag（如 `v1.143.1-picket.1-rc.4`）与产物文件名。`product.json` 的 `version` 永远是上游的 `1.143.1`，`--version` 的期望值也一样。
+
+构建后自检：
 
 ```powershell
 & "D:\Downloads\picket-code-win32-x64\Picket Code.exe" --version
