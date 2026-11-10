@@ -455,10 +455,10 @@ index 00000000..7febc833
 +}
 diff --git a/src/vs/platform/agentHost/node/icode/icodeAgent.ts b/src/vs/platform/agentHost/node/icode/icodeAgent.ts
 new file mode 100644
-index 00000000..f430b007
+index 00000000..89f63e70
 --- /dev/null
 +++ b/src/vs/platform/agentHost/node/icode/icodeAgent.ts
-@@ -0,0 +1,1040 @@
+@@ -0,0 +1,1043 @@
 +/*---------------------------------------------------------------------------------------------
 + *  Copyright (c) Microsoft Corporation. All rights reserved.
 + *  Licensed under the MIT License. See License.txt in the project root for license information.
@@ -783,9 +783,12 @@ index 00000000..f430b007
 +		},
 +		abort: (chat: URI, _context: AgentChatOperationContext): Promise<void> => {
 +			const chatKey = chat.toString();
-+			// iCode waits on an `ask_user` request until it is answered, so a
-+			// cancelled turn has to settle them before the session is stopped.
++			// iCode waits on an `ask_user` request and on `session/request_permission`
++			// until each is answered, so a cancelled turn has to settle both before it
++			// asks the agent to stop. A permission left pending keeps the prompt — and
++			// the host's approval card — alive even after the session is cancelled.
 +			this._cancelPendingInputs(key => key === chatKey);
++			this._cancelPendingPermissions(key => key === chatKey);
 +			const session = this._sessions.get(chatKey);
 +			const entry = session && this._clients.get(session.cwd);
 +			if (!session || !entry) {
@@ -3544,10 +3547,10 @@ index 00000000..70b5683a
 +});
 diff --git a/src/vs/platform/agentHost/test/node/icode/icodeAgent.test.ts b/src/vs/platform/agentHost/test/node/icode/icodeAgent.test.ts
 new file mode 100644
-index 00000000..928084af
+index 00000000..9edb64d6
 --- /dev/null
 +++ b/src/vs/platform/agentHost/test/node/icode/icodeAgent.test.ts
-@@ -0,0 +1,1071 @@
+@@ -0,0 +1,1095 @@
 +/*---------------------------------------------------------------------------------------------
 + *  Copyright (c) Microsoft Corporation. All rights reserved.
 + *  Licensed under the MIT License. See License.txt in the project root for license information.
@@ -3818,6 +3821,30 @@ index 00000000..928084af
 +		client.finishPrompt({ stopReason: 'cancelled' });
 +		await sending;
 +		assert.strictEqual((signals[signals.length - 1] as IAgentActionSignal).action.type, ActionType.ChatTurnCancelled);
++		agent.dispose();
++	});
++
++	test('abort settles a pending approval so the turn can be cancelled', async () => {
++		const client = new FakeIcodeClient();
++		const agent = new IcodeAgent(new NullLogService(), () => client);
++
++		const sending = agent.chats.sendMessage(chat, 'hello', [workspace], undefined, 'turn-1');
++		await timeout(10);
++		const pending = client.emitRequest('session/request_permission', {
++			sessionId: SESSION_ID,
++			toolCall: { toolCallId: 't1', title: 'Run ls', kind: 'execute', status: 'pending', rawInput: { command: 'ls' } },
++			options: [{ optionId: 'allow', name: 'Allow once', kind: 'allow_once' }],
++		});
++		await timeout(1);
++
++		await agent.chats.abort(chat, chat);
++		// iCode blocks the turn until every outstanding request is answered, so a
++		// cancellation that skips the approval leaves the agent — and the host's
++		// approval card — waiting forever.
++		assert.deepStrictEqual(await pending, { outcome: { outcome: 'cancelled' } });
++
++		client.finishPrompt({ stopReason: 'cancelled' });
++		await sending;
 +		agent.dispose();
 +	});
 +
