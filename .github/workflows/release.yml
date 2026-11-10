@@ -26,15 +26,16 @@ permissions:
 # The server is versioned separately from the client, so a build states a floor
 # and a version rather than an exact tag: PICKET_SERVER_MIN_VERSION is the oldest
 # picket-code-server this client accepts, PICKET_SERVER_VERSION is the payload it
-# ships (defaults to the floor). Both live in repo variables; an unset variable
-# fails the build in the first step instead of producing an app nobody can connect
-# to. That repository is public, so the payload is fetched over plain HTTPS and
+# ships and defaults to the floor, exactly as build.sh does. Only the floor is
+# required: a repository that never set the optional version must not fail — the
+# empty value would otherwise reach fetch-payload.sh and the offline bundle.
+# That repository is public, so the payload is fetched over plain HTTPS and
 # no token is involved. (Setting PICKET_SERVER_TOKEN still switches
 # fetch-payload.sh to `gh`, for a private mirror via PICKET_SERVER_REPO.)
 env:
   PICKET_WSL_PAYLOAD: ondemand
   PICKET_SERVER_MIN_VERSION: ${{ vars.PICKET_SERVER_MIN_VERSION }}
-  PICKET_SERVER_VERSION: ${{ vars.PICKET_SERVER_VERSION }}
+  PICKET_SERVER_VERSION: ${{ vars.PICKET_SERVER_VERSION || vars.PICKET_SERVER_MIN_VERSION }}
 
 # Gate order (docs/testing.md §3.1): the automated test layers run before anything is
 # compiled, packaged or published, so a red layer means no artifacts and no release.

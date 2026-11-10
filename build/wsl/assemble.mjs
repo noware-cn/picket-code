@@ -69,7 +69,13 @@ async function main() {
 		const size = (await stat(args.payload)).size;
 		if (args.sums) {
 			const expected = (await readSha256Sums(args.sums)).get(file);
-			if (expected && expected !== sha256) {
+			// The sums file is the cross-check against the release, so a missing
+			// entry is a mismatch too: a renamed payload would otherwise be
+			// stamped with a hash nobody else can reproduce.
+			if (!expected) {
+				throw new Error(`SHA256SUMS has no entry for ${file}`);
+			}
+			if (expected !== sha256) {
 				throw new Error(`sha256 mismatch for ${file}: SHA256SUMS says ${expected}, payload hashes to ${sha256}`);
 			}
 		}

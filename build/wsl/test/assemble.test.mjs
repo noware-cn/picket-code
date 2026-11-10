@@ -169,6 +169,22 @@ test('a payload whose name does not carry the version is refused', async () => {
 	}
 });
 
+test('a payload the checksum file does not name is refused instead of being stamped with another hash', async () => {
+	const work = await mkdtemp(join(tmpdir(), 'picket-assemble-src-'));
+	const app = await fixtureApp();
+	try {
+		const { payload } = await fixturePayload(work);
+		await writeFile(join(work, 'SHA256SUMS'), `${SHA}  picket-code-server-1.3.0-linux-x64.tar.gz\n`);
+		const result = await assemble(['--app', app, '--min-version', MIN, '--version', VERSION, '--commit', COMMIT, '--flavor', 'embedded', '--payload', payload, '--sums', join(work, 'SHA256SUMS')]);
+		assert.match(result.stderr, new RegExp(`SHA256SUMS has no entry for ${NAME}`));
+		const shipped = await readdir(join(app, 'extensions', 'picket-remote-wsl'), { recursive: true });
+		assert.ok(!shipped.some(entry => entry.endsWith('.tar.gz')), 'a refused payload must not be copied into the app');
+	} finally {
+		await rm(work, { recursive: true, force: true });
+		await rm(app, { recursive: true, force: true });
+	}
+});
+
 test('a version below the minimum is a configuration error', async () => {
 	const work = await mkdtemp(join(tmpdir(), 'picket-assemble-src-'));
 	const app = await fixtureApp();

@@ -45,7 +45,7 @@ WSL 窗口连的服务器是 `picket-code-server`，它在独立仓库
 `catalog.json`；本地已有的 tar.gz 可以用 `--from-file <path>` 直接落盘（离线、内网），
 校验和与大小都从该文件现算。
 
-## 四、当前状态（2026-11-06）
+## 四、当前状态（2026-11-10）
 
 - **服务端仓库已对齐新约定**：`noware-cn/picket-code-server` 的 `release-server.yml` 改为手工
   dispatch，三个输入 `version`（裸 semver）、`source_ref`（客户端分支或 tag）、`vscode_version`
@@ -56,9 +56,17 @@ WSL 窗口连的服务器是 `picket-code-server`，它在独立仓库
   旧变量 `PICKET_SERVER_TAG` 已删除。
 - PR 上的 `WSL acceptance`（L4+）已用这个载荷跑通全部阶段：`remote / tunnel / ui / lifecycle /
   icode / conflict / hook / takeover / legacy / legacy-uri`。
-- **已知缺口**：服务端仓库的 R2 镜像步骤仍失败（`NoSuchBucket`，`r2:picket-releases` 在现有
-  secrets 对应的账号里不存在）。载荷的权威来源暂时只有 GitHub Release；镜像修好前
-  `https://download.noware.cn` 不能用作 `picket.wsl.serverPayloadBaseUrl`。
+- **R2 镜像已修复（2026-11-10）**：根因不是权限，而是 `noware-cn/picket-code-server` 一个 secret
+  都没有——镜像步骤拿到空 `R2_ENDPOINT` / `R2_ACCESS_KEY_ID`，rclone 于是回落到 AWS S3 并报
+  `NoSuchBucket`（错误体里的 `RequestID` / `HostID` 是 AWS 的形状，容易误判成桶不存在或权限不足）。
+  补齐 `R2_ACCESS_KEY_ID`、`R2_SECRET_ACCESS_KEY`、`R2_ENDPOINT`
+  （`https://4ec79765444b0bde47257aad6c10d261.r2.cloudflarestorage.com`），重跑镜像步即通过。
+- 镜像需要的 secret 是**两个仓库各一套**（客户端仓库与服务端仓库分开）。R2 API token 的权限用
+  **Object Read & Write**、作用域限定桶 `picket-releases` 即可，覆盖 rclone 的 List / Put / Copy /
+  Delete；不需要账户级 `Workers R2 Storage: Edit`，也不需要动自定义域名。
+- `https://download.noware.cn/picket-code-server-1.143.1-linux-x64.tar.gz` 现在可下载
+  （87,769,335 B，实拉哈希与 `SHA256SUMS` 一致），可作为 `picket.wsl.serverPayloadBaseUrl`
+  的基址使用；下载域名默认 `cf-cache-status: DYNAMIC`，每次回源 R2。
 - 载荷的 `product.json.version` 恒为上游版本（`1.143.1`）——扩展加载校验它；服务端自己的版本
   只出现在 release tag、资产名与 catalog 里。
 

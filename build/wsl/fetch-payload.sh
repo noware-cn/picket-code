@@ -138,18 +138,30 @@ if [ -z "$FROM_FILE" ] && [ "$MODE" != "--metadata-only" ]; then
 fi
 
 # The commit is the payload's identity: a client only adopts a component built
-# from its own commit. Ask the payload itself when the caller did not say, so a
-# hand-run fetch cannot pair a payload with the wrong commit.
-if [ -z "$COMMIT" ] && [ -f "$DOWNLOAD/$NAME" ]; then
+# from its own commit. Read it out of the payload itself and require it to agree
+# with what the caller said — PICKET_SERVER_COMMIT must not be a way to stamp the
+# client's commit onto a payload built from another one, because the catalog then
+# carries it and check.mjs only compares the catalog against itself.
+if [ -f "$DOWNLOAD/$NAME" ]; then
 	MEMBER="$(tar -tzf "$DOWNLOAD/$NAME" | awk -F/ '/product\.json$/ && NF <= 2 { print NF" "$0 }' | sort -n | head -1 | cut -d' ' -f2-)"
+	PAYLOAD_COMMIT=""
 	if [ -n "$MEMBER" ]; then
-		COMMIT="$(tar -xzOf "$DOWNLOAD/$NAME" "$MEMBER" | node -e '
+		PAYLOAD_COMMIT="$(tar -xzOf "$DOWNLOAD/$NAME" "$MEMBER" | node -e '
 let text = "";
 process.stdin.on("data", chunk => text += chunk).on("end", () => {
   try { process.stdout.write(JSON.parse(text).commit ?? ""); } catch { }
 });
 ')"
 	fi
+	if ! printf '%s' "$PAYLOAD_COMMIT" | grep -Eqx '[0-9a-f]{40}'; then
+		echo "cannot read the build commit from $NAME: its product.json is missing or carries no commit" >&2
+		exit 1
+	fi
+	if [ -n "$COMMIT" ] && [ "$COMMIT" != "$PAYLOAD_COMMIT" ]; then
+		echo "commit mismatch for $NAME: the payload was built from $PAYLOAD_COMMIT, this build expects $COMMIT" >&2
+		exit 1
+	fi
+	COMMIT="$PAYLOAD_COMMIT"
 fi
 if ! printf '%s' "$COMMIT" | grep -Eqx '[0-9a-f]{40}'; then
 	echo "no commit for $NAME: pass PICKET_SERVER_COMMIT (it must be the commit the payload was built from)" >&2

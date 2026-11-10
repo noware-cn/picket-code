@@ -375,10 +375,12 @@ jobs:
       PICKET_WSL_ACCEPT_HOME: /tmp/picket-wsl-accept
       # Version of noware-cn/picket-code-server whose payload is installed into the
       # scratch distro. Repository variable — release.yml states its floor with the
-      # same one; the dispatch input overrides it for an unreleased payload.
+      # same one; the dispatch input overrides it for an unreleased payload, and an
+      # unset PICKET_SERVER_VERSION falls back to the floor exactly as build.sh and
+      # release.yml do, so the documented "optional" variable stays optional.
       # The acceptance window is an unpackaged tree with no product stamp, so it
       # accepts any commit; fetch-payload.sh reads the real one out of the payload.
-      PICKET_SERVER_VERSION: ${{ inputs.server_version || vars.PICKET_SERVER_VERSION }}
+      PICKET_SERVER_VERSION: ${{ inputs.server_version || vars.PICKET_SERVER_VERSION || vars.PICKET_SERVER_MIN_VERSION }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -396,11 +398,12 @@ jobs:
           set -euo pipefail
           missing=0
           if [ -z "${PICKET_SERVER_VERSION:-}" ]; then
-            echo "FAIL: PICKET_SERVER_VERSION is empty."
-            echo "      Set the repository variable PICKET_SERVER_VERSION (Settings -> Secrets and"
-            echo "      variables -> Actions -> Variables) to the noware-cn/picket-code-server"
-            echo "      version whose payload this branch installs, or dispatch this"
-            echo "      workflow with the 'server_version' input."
+            echo "FAIL: PICKET_SERVER_VERSION is empty (and PICKET_SERVER_MIN_VERSION is too)."
+            echo "      Set the repository variable PICKET_SERVER_MIN_VERSION (Settings -> Secrets"
+            echo "      and variables -> Actions -> Variables) to the oldest noware-cn/picket-code-server"
+            echo "      version this branch accepts; PICKET_SERVER_VERSION is optional and defaults"
+            echo "      to it. Dispatch this workflow with the 'server_version' input to install"
+            echo "      another payload."
             missing=1
           fi
           if [ -n "${SERVER_TOKEN:-}" ] && ! command -v gh >/dev/null 2>&1; then
