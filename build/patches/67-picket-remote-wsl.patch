@@ -837,10 +837,10 @@ index 00000000..45983e00
 +module.exports = { loadCatalog };
 diff --git a/extensions/picket-remote-wsl/src/commands.js b/extensions/picket-remote-wsl/src/commands.js
 new file mode 100644
-index 00000000..5b2879fe
+index 00000000..82a32073
 --- /dev/null
 +++ b/extensions/picket-remote-wsl/src/commands.js
-@@ -0,0 +1,552 @@
+@@ -0,0 +1,553 @@
 +'use strict';
 +
 +const { listDistros, distroHome, visibleDistros } = require('./distro.js');
@@ -850,7 +850,6 @@ index 00000000..5b2879fe
 +const { selectGallery, installVsix } = require('./marketplace.js');
 +const { unpackOfflineBundle, removeBundle } = require('./offline.js');
 +const { installShim, removeShim } = require('./shim.js');
-+const { selectComponent, describeSelectionError } = require('./version.js');
 +const { uninstallOfficialExtension } = require('./uninstall.js');
 +
 +const LAST_DISTRO = 'picket.wsl.lastDistro';
@@ -943,14 +942,17 @@ index 00000000..5b2879fe
 +		return name;
 +	}
 +
-+	/** @param {any} manager */
++	/**
++	 * @param {any} manager
++	 * @returns {Promise<string | undefined>} the version now on disk, undefined when the install failed
++	 */
 +	async function install(manager) {
 +		try {
-+			await host.withProgress({ title: '正在准备 WSL 服务器组件…' }, () => manager.ensure(SERVER_COMPONENT));
-+			return true;
++			const installed = await host.withProgress({ title: '正在准备 WSL 服务器组件…' }, () => manager.ensure(SERVER_COMPONENT));
++			return installed?.version;
 +		} catch (error) {
 +			await host.showErrorMessage(`安装 WSL 服务器组件失败：${error.message}`);
-+			return false;
++			return undefined;
 +		}
 +	}
 +
@@ -960,18 +962,21 @@ index 00000000..5b2879fe
 +	 * build carries only a catalog, so it asks — and "cancel" must leave the
 +	 * window untouched.
 +	 * @param {{ distro: string, home: string }} target
-+	 * @returns {Promise<boolean>}
++	 * @returns {Promise<string | undefined>} the payload version in place, undefined when nothing was installed
 +	 */
 +	async function ensureComponentInteractive(target) {
 +		const component = (catalog?.components ?? []).find((/** @type {any} */ c) => c.id === SERVER_COMPONENT);
 +		if (!component) {
 +			await host.showErrorMessage('这个构建没有 WSL 服务器组件，无法在 WSL 中打开文件夹。');
-+			return false;
++			return undefined;
 +		}
 +		const manager = createComponents({ distro: target.distro, home: target.home, download: downloadOptions() });
++		// The version it returns is the one on disk, which is not necessarily the
++		// catalog's: a payload this build already installed keeps serving as long as
++		// it was built from our commit and is not below the minimum.
 +		const current = await manager.inspect(SERVER_COMPONENT);
 +		if (current.state === 'installed') {
-+			return true;
++			return current.version;
 +		}
 +
 +		if (catalog.flavor === 'embedded') {
@@ -997,7 +1002,7 @@ index 00000000..5b2879fe
 +			const file = Array.isArray(picked) ? picked[0] : picked;
 +			const path = file?.fsPath ?? file?.path ?? (typeof file === 'string' ? file : '');
 +			if (!path) {
-+				return false;
++				return undefined;
 +			}
 +			if (/\.zip$/i.test(path)) {
 +				let bundle;
@@ -1005,7 +1010,7 @@ index 00000000..5b2879fe
 +					bundle = await unpackOfflineBundle({ bundlePath: path });
 +				} catch (error) {
 +					await host.showErrorMessage(`离线组件包无法使用：${error.message}`);
-+					return false;
++					return undefined;
 +				}
 +				try {
 +					return await install(createComponents({ distro: target.distro, home: target.home, explicitPath: bundle.payloadPath, download: downloadOptions() }));
@@ -1015,7 +1020,7 @@ index 00000000..5b2879fe
 +			}
 +			return install(createComponents({ distro: target.distro, home: target.home, explicitPath: path, download: downloadOptions() }));
 +		}
-+		return false;
++		return undefined;
 +	}
 +
 +	/**
@@ -1254,7 +1259,9 @@ index 00000000..5b2879fe
 +	/**
 +	 * `picket-code .` inside the distro. The shim needs the installed server's
 +	 * remote CLI plus this Windows client's POSIX path, so the component must
-+	 * be in place first — `ensureComponentInteractive` is a no-op when it is.
++	 * be in place first — `ensureComponentInteractive` is a no-op when it is, and
++	 * returns the version that is actually on disk (which may be older than the
++	 * catalog's, when a working payload is already installed).
 +	 */
 +	async function installCli() {
 +		const distro = await targetDistro('选择要安装 picket-code 命令行的发行版');
@@ -1268,16 +1275,10 @@ index 00000000..5b2879fe
 +			await host.showErrorMessage(`无法进入 ${distro}：${error.message}`);
 +			return;
 +		}
-+		if (!await ensureComponentInteractive({ distro, home })) {
++		const version = await ensureComponentInteractive({ distro, home });
++		if (!version) {
 +			return;
 +		}
-+		const want = { commit: product?.commit ?? '', minVersion: product?.picketServerMinVersion ?? '' };
-+		const selection = selectComponent(catalog, want);
-+		if ('error' in selection) {
-+			await host.showErrorMessage(`无法安装命令行：${describeSelectionError(selection, want)}。`);
-+			return;
-+		}
-+		const version = selection.component.version;
 +		let clientPath;
 +		try {
 +			clientPath = await toPosixPath(runner, distro, options.clientPath ?? process.execPath);
@@ -2668,10 +2669,10 @@ index 00000000..cf40b908
 +module.exports = { detectIcode };
 diff --git a/extensions/picket-remote-wsl/src/launch.js b/extensions/picket-remote-wsl/src/launch.js
 new file mode 100644
-index 00000000..817156af
+index 00000000..77c0e005
 --- /dev/null
 +++ b/extensions/picket-remote-wsl/src/launch.js
-@@ -0,0 +1,434 @@
+@@ -0,0 +1,446 @@
 +'use strict';
 +
 +const { randomBytes } = require('node:crypto');
@@ -3058,13 +3059,25 @@ index 00000000..817156af
 +		}
 +	};
 +
-+	// A pid of 0 or below means "unknown" (-1 is the recorded fallback). Passing it
-+	// to kill would be catastrophic: `kill -TERM -1` signals every process this
-+	// user may signal, and `kill -9 0` the whole process group. The sweep below
-+	// still stops the server by its --user-data-dir.
-+	const killable = Number.isInteger(info.pid) && info.pid > 0;
++	// A pid is only meaningful inside the boot that recorded it: `wsl --shutdown`,
++	// a distro restart or a crash lets the number be handed to another process, and
++	// `kill -0` cannot tell whose pid it is. So both signals first check that the
++	// process's own command line carries this record's connection token, which is
++	// random per server and passed in by buildServerArgs. A record with no token,
++	// or a pid whose owner cannot be proven, is left to the sweep — a stale server
++	// is annoying, killing a stranger loses their work.
++	const token = typeof info.token === 'string' && info.token.length > 0 ? `--connection-token=${info.token}` : '';
++	const killable = Number.isInteger(info.pid) && info.pid > 0 && token.length > 0;
++	/** @param {string} signal */
++	const signal = (signal) => runner.exec([
++		'-d', distro, '-e', 'sh', '-c',
++		// `-r` first: a pid whose /proc entry is gone has no owner to prove, and the
++		// redirect would otherwise print its own "cannot open" into the log.
++		'[ -r "/proc/$1/cmdline" ] || exit 0; c=$(tr "\\0" " " < "/proc/$1/cmdline"); case "$c" in *"$2"*) kill ' + signal + ' "$1" ;; esac',
++		'sh', String(info.pid), token
++	]);
 +	if (killable) {
-+		await step('SIGTERM', () => runner.exec(['-d', distro, '-e', 'kill', '-TERM', String(info.pid)]));
++		await step('SIGTERM', () => signal('-TERM'));
 +		await step('wait', () => new Promise(resolve => setTimeout(resolve, waitMs)));
 +	}
 +	if (probe) {
@@ -3077,7 +3090,7 @@ index 00000000..817156af
 +		});
 +	}
 +	if (killable) {
-+		await step('SIGKILL', () => runner.exec(['-d', distro, '-e', 'sh', '-c', 'kill -9 "$1" 2>/dev/null || true', 'sh', String(info.pid)]));
++		await step('SIGKILL', () => signal('-9'));
 +	}
 +	if (options.dataDir) {
 +		await step('sweep', () => runner.exec(['-d', distro, '-e', 'sh', '-c', 'pkill -f "picket-code-server.*--user-data-dir=$1" 2>/dev/null || true', 'sh', options.dataDir]));
@@ -4807,10 +4820,10 @@ index 00000000..c8ba4972
 +module.exports = { resolveSettings, describeOfficialSettings };
 diff --git a/extensions/picket-remote-wsl/src/shim.js b/extensions/picket-remote-wsl/src/shim.js
 new file mode 100644
-index 00000000..4d185119
+index 00000000..d4923d45
 --- /dev/null
 +++ b/extensions/picket-remote-wsl/src/shim.js
-@@ -0,0 +1,152 @@
+@@ -0,0 +1,156 @@
 +'use strict';
 +
 +// The in-distro `picket-code` shim: a small shell script that points the
@@ -4854,13 +4867,15 @@ index 00000000..4d185119
 +// executable by the user who will run `picket-code`.
 +const VERIFY_SCRIPT = 'if [ ! -x "$2" ]; then printf not-executable; elif [ "$(readlink -f "$1")" != "$(readlink -f "$2")" ]; then printf wrong-target; else printf ok; fi';
 +const PROBE_SCRIPT = '"$1" --version >/dev/null 2>&1';
-+// Only the payload directories we created are ours to delete: the same `bin/`
-+// also holds the official extension's `bin/<commit>/` server after a takeover.
-+const REMOVE_SCRIPT = 'for d in "$1"/picket-*; do [ -e "$d" ] && rm -rf "$d"; done; rm -f "$2"';
++// Only the shim script we generated is ours to delete. The payload directory it
++// lives in holds a real server (`node`, `out`, `bin/remote-cli`) that a connected
++// window is still using, and the same `bin/` also holds the official extension's
++// `<commit>/` server after a takeover — so the walk must not remove a directory.
++const REMOVE_SCRIPT = 'rm -f "$1"/picket-*/bin/picket-code; rm -f "$2"';
 +// The `code` alias is only ours when we created it, so removal has to check
 +// where it points instead of listing the path.
 +const INSPECT_LINK_SCRIPT = 'if [ -L "$1" ]; then readlink -f "$1"; elif [ -e "$1" ]; then printf file; else printf none; fi';
-+const REMOVE_OWNED_LINK_SCRIPT = 'case "$(readlink -f "$2" 2>/dev/null)" in "$1"/*) rm -f "$2" ;; esac';
++const REMOVE_OWNED_LINK_SCRIPT = 'case "$(readlink -f "$2" 2>/dev/null)" in "$1"/picket-*/*) rm -f "$2" ;; esac';
 +
 +/**
 + * Installs `<home>/.vscode-server/bin/picket-<version>/bin/picket-code` and links it
@@ -4944,12 +4959,14 @@ index 00000000..4d185119
 +}
 +
 +/**
-+ * Removes the link and every shim script we ever wrote (all tags) — but only
-+ * the `picket-*` payload directories inside `~/.vscode-server/bin`, because that
-+ * root is shared with the official extension's `<commit>/` server.
-+ * The `code` alias is removed only when it still resolves into that root: after
-+ * a takeover it may be someone else's link, and deleting those would break the
-+ * user's other tooling.
++ * Removes the link and the shim script we wrote (all tags) — never the payload
++ * directories those scripts live in: they hold the server a connected window is
++ * running, and reinstalling one costs a download. That root is also shared with
++ * the official extension's `<commit>/` server, so the walk stays inside
++ * `picket-*`.
++ * The `code` alias is removed only when it still resolves into one of our
++ * payload directories: after a takeover it may be someone else's link, and
++ * deleting those would break the user's other tooling.
 + * @param {{
 + *   runner: { exec(args: string[], opts?: { input?: string | Buffer }): Promise<IWslResult> },
 + *   distro: string, home: string
@@ -5549,10 +5566,10 @@ index 00000000..1d666a4e
 +});
 diff --git a/extensions/picket-remote-wsl/test/commands.test.js b/extensions/picket-remote-wsl/test/commands.test.js
 new file mode 100644
-index 00000000..cf931822
+index 00000000..50f9abe8
 --- /dev/null
 +++ b/extensions/picket-remote-wsl/test/commands.test.js
-@@ -0,0 +1,299 @@
+@@ -0,0 +1,325 @@
 +// RED first: this file must fail until src/commands.js exists.
 +const test = require('node:test');
 +const assert = require('node:assert');
@@ -5571,7 +5588,7 @@ index 00000000..cf931822
 +
 +/**
 + * Everything the command layer touches, minus VS Code itself.
-+ * @param {{ flavor?: 'embedded' | 'ondemand', state?: 'installed' | 'absent', host?: any, fail?: string, http?: { proxy?: string, proxyStrictSSL?: boolean }, settings?: any }} [options]
++ * @param {{ flavor?: 'embedded' | 'ondemand', state?: 'installed' | 'absent', host?: any, fail?: string, http?: { proxy?: string, proxyStrictSSL?: boolean }, settings?: any, catalogVersion?: string, installedVersion?: string }} [options]
 + */
 +function harness(options = {}) {
 +	const host = createFakeHost(options.host);
@@ -5586,7 +5603,7 @@ index 00000000..cf931822
 +
 +	const createComponents = (config) => {
 +		configs.push(config);
-+		const components = createFakeComponents({ state: options.state ?? 'absent', fail: options.fail });
++		const components = createFakeComponents({ state: options.state ?? 'absent', fail: options.fail, version: options.installedVersion });
 +		const ensure = components.ensure.bind(components);
 +		components.ensure = async (id) => {
 +			ensured.push({ id, config });
@@ -5642,7 +5659,7 @@ index 00000000..cf931822
 +		runner,
 +		settings,
 +		memento,
-+		catalog: createCatalog({ flavor: options.flavor ?? 'ondemand' }),
++		catalog: createCatalog({ flavor: options.flavor ?? 'ondemand', version: options.catalogVersion }),
 +		product: { commit: 'e646868227c3e3a9e3f24277c8c7220be42c0be7', version: '1.143.1', picketServerMinVersion: '1.143.1' },
 +		createComponents,
 +		resolver: { async stop(distro) { stopped.push(distro); } },
@@ -5816,13 +5833,39 @@ index 00000000..cf931822
 +	assert.ok(write, 'the shim script write never happened');
 +});
 +
-+test('removeCli removes the shim and tells the user', async () => {
++test('installCli points the shim at the installed payload, not the catalog version', async () => {
++	// A payload that is already on disk keeps serving while it matches our commit
++	// and clears the minimum, so the catalog's newer version may never be
++	// installed. Pointing the shim at the catalog's would exec a remote CLI that
++	// is not there, and the final probe (Windows client only) would still pass.
++	const ctx = harness({
++		flavor: 'ondemand',
++		state: 'installed',
++		catalogVersion: '1.4.0',
++		installedVersion: '1.1.0',
++		host: { quickPick: 'Ubuntu-24.04' }
++	});
++	await ctx.commands.installCli();
++
++	const write = ctx.calls.find(args => args.join(' ').includes('chmod 755'));
++	assert.ok(write, 'the shim script write never happened');
++	assert.ok(write.join(' ').includes('/.vscode-server/bin/picket-1.1.0/bin/picket-code'), write.join(' '));
++	assert.ok(!write.join(' ').includes('picket-1.4.0'), 'the shim must not name a payload that was never installed');
++});
++
++test('removeCli deletes the shim script and the link, never the server directory', async () => {
++	// The shim lives inside the payload directory, which also holds the running
++	// server (node, out, remote-cli). Removing the CLI must not remove those:
++	// the window connected through it would lose its remote host mid-flight.
 +	const ctx = harness({ flavor: 'ondemand', host: { quickPick: 'Ubuntu-24.04' } });
 +	await ctx.commands.removeCli();
 +
 +	assert.ok(ctx.host.messages.some(message => /已移除 picket-code 命令行/.test(String(message))), `messages: ${ctx.host.messages.join(' | ')}`);
-+	const removed = ctx.calls.find(args => args.join(' ').includes('rm -rf'));
-+	assert.ok(removed && removed.join(' ').includes('/home/u/.local/bin/picket-code'));
++	const removal = ctx.calls.find(args => args.join(' ').includes('/home/u/.local/bin/picket-code'));
++	assert.ok(removal, 'the shim removal never happened');
++	const script = removal[5];
++	assert.match(script, /rm -f "\$1"\/picket-\*\/bin\/picket-code/);
++	assert.doesNotMatch(script, /rm -rf/, 'a payload directory must survive a CLI removal');
 +});
 +
 +test('the install carries VS Code proxy strictness and the CA path', async () => {
@@ -6809,10 +6852,10 @@ index 00000000..eab68457
 +});
 diff --git a/extensions/picket-remote-wsl/test/fixtures/fake-host.js b/extensions/picket-remote-wsl/test/fixtures/fake-host.js
 new file mode 100644
-index 00000000..b5f57597
+index 00000000..48630e64
 --- /dev/null
 +++ b/extensions/picket-remote-wsl/test/fixtures/fake-host.js
-@@ -0,0 +1,178 @@
+@@ -0,0 +1,180 @@
 +'use strict';
 +
 +/**
@@ -6933,7 +6976,9 @@ index 00000000..b5f57597
 +				throw new Error(options.fail);
 +			}
 +			state.installed += 1;
-+			return { payloadDir };
++			// The real manager answers with what it put on disk, version included:
++			// callers use that instead of the catalog's, which may be newer.
++			return { payloadDir, version: options.installedVersion ?? version };
 +		},
 +		async list() {
 +			return options.entries ?? [{ id: 'wsl-server', state: options.state ?? 'installed', version, payloadDir }];
@@ -7173,10 +7218,10 @@ index 00000000..5e31eaaa
 +});
 diff --git a/extensions/picket-remote-wsl/test/launch.test.js b/extensions/picket-remote-wsl/test/launch.test.js
 new file mode 100644
-index 00000000..15ee9c64
+index 00000000..e1ba3e93
 --- /dev/null
 +++ b/extensions/picket-remote-wsl/test/launch.test.js
-@@ -0,0 +1,272 @@
+@@ -0,0 +1,291 @@
 +// RED first: this file must fail until src/launch.js exists.
 +const test = require('node:test');
 +const assert = require('node:assert');
@@ -7429,15 +7474,34 @@ index 00000000..15ee9c64
 +	assert.deepStrictEqual(calls, ['-d Ubuntu -e sh -c rm -f "$1" sh /home/u/.picket-code-server/runtime/Ubuntu.json']);
 +});
 +
-+test('stop signals the in-distro pid it was given', async () => {
++test('stop signals the in-distro pid it was given, after proving the pid is ours', async () => {
 +	const calls = [];
 +	const runner = { exec: async (args) => { calls.push(args.join(' ').replace(/-d Ubuntu -e /, '')); return { code: 0, stdout: '', stderr: '' }; }, spawn: () => { throw new Error('not used'); } };
-+	await stopServer({ runner, distro: 'Ubuntu', runtimeFile: '/home/u/runtime/Ubuntu.json', info: { port: 1, token: 't', version: 'T', commit: 'C', pid: 4321, startedAt: 'now' }, waitMs: 0 });
-+	assert.deepStrictEqual(calls, [
-+		'kill -TERM 4321',
-+		'sh -c kill -9 "$1" 2>/dev/null || true sh 4321',
-+		'sh -c rm -f "$1" sh /home/u/runtime/Ubuntu.json'
-+	]);
++	const info = { port: 1, token: 'tok-9f3', version: 'T', commit: 'C', pid: 4321, startedAt: 'now' };
++	await stopServer({ runner, distro: 'Ubuntu', runtimeFile: '/home/u/runtime/Ubuntu.json', info, waitMs: 0 });
++	assert.strictEqual(calls.length, 3);
++	assert.match(calls[0], /^sh -c \[ -r "\/proc\/\$1\/cmdline" \]/);
++	assert.match(calls[1], /^sh -c \[ -r "\/proc\/\$1\/cmdline" \]/);
++	assert.strictEqual(calls[2], 'sh -c rm -f "$1" sh /home/u/runtime/Ubuntu.json');
++	// A pid is only meaningful inside the boot that recorded it: `wsl --shutdown`
++	// and distro restarts hand the number to an unrelated process, and killing a
++	// stranger loses their work. The record's random token has to appear in the
++	// target's own command line, so the check cannot be `kill -0`.
++	const term = calls[0].split(' ');
++	assert.deepStrictEqual(term.slice(-2), ['4321', '--connection-token=tok-9f3']);
++	assert.match(calls[0], /kill -TERM "\$1"/);
++	assert.match(calls[1], /kill -9 "\$1"/);
++	assert.match(calls[0], /\/proc\/\$1\/cmdline/);
++});
++
++test('a record without a token never signals its pid', async () => {
++	// Old records, or one written before a token existed: unprovable, so the sweep
++	// (which matches on --user-data-dir) is what stops the server.
++	const calls = [];
++	const runner = { exec: async (args) => { calls.push(args.join(' ')); return { code: 0, stdout: '', stderr: '' }; }, spawn: () => { throw new Error('not used'); } };
++	await stopServer({ runner, distro: 'Ubuntu', runtimeFile: '/home/u/runtime/Ubuntu.json', info: { port: 1, token: '', version: 'T', commit: 'C', pid: 4321, startedAt: 'now' }, waitMs: 0, dataDir: '/home/u/data' });
++	assert.ok(!calls.some(c => /kill -TERM|kill -9 "\$1"/.test(c)), `no signal may run without an identity check: ${JSON.stringify(calls)}`);
++	assert.ok(calls.some(c => c.includes('pkill')), 'the sweep is what still stops it');
 +});
 +
 +test('an unknown pid is never handed to kill', async () => {
@@ -9241,10 +9305,10 @@ index 00000000..b38aabc8
 +});
 diff --git a/extensions/picket-remote-wsl/test/shim.test.js b/extensions/picket-remote-wsl/test/shim.test.js
 new file mode 100644
-index 00000000..ffd788ff
+index 00000000..6e4b01da
 --- /dev/null
 +++ b/extensions/picket-remote-wsl/test/shim.test.js
-@@ -0,0 +1,169 @@
+@@ -0,0 +1,173 @@
 +'use strict';
 +
 +// RED first: this file must fail until src/shim.js exists.
@@ -9398,21 +9462,25 @@ index 00000000..ffd788ff
 +	assert.match(result.message ?? '', /wrong-target/);
 +});
 +
-+test('removeShim deletes only our payloads, the link and our own code alias', async () => {
++test('removeShim deletes only the shim script, the link and our own code alias', async () => {
 +	const r = recordingRunner([]);
 +	await removeShim({ runner: r, distro: 'Ubuntu', home: HOME });
 +	assert.strictEqual(r.calls.length, 2);
-+	// `~/.vscode-server/bin` is shared with the official extension, so the script
-+	// may only walk the picket-* children — never the directory itself.
++	// `~/.vscode-server/bin/picket-<version>/` holds the server a window may still
++	// be running, so removal may only unlink the script we generated inside it —
++	// never the directory, and never anything outside `picket-*`.
 +	const script = r.calls[0].args[5];
 +	assert.ok(r.calls[0].args.includes(`${HOME}/.vscode-server/bin`));
 +	assert.ok(r.calls[0].args.includes(`${HOME}/.local/bin/picket-code`));
-+	assert.match(script, /"\$1"\/picket-\*/);
++	assert.match(script, /rm -f "\$1"\/picket-\*\/bin\/picket-code/);
++	assert.doesNotMatch(script, /rm -rf/, 'a payload directory must survive a CLI removal');
 +	assert.doesNotMatch(script, /rm -rf "\$1"/, 'the shared bin directory must survive');
 +	// The alias has to be checked, not listed: a `code` that is not ours stays.
 +	assert.ok(r.calls[1].args.includes(`${HOME}/.vscode-server/bin`));
 +	assert.ok(r.calls[1].args.includes(`${HOME}/.local/bin/code`));
 +	assert.match(r.calls[1].args[5], /readlink/);
++	// …and "ours" means inside a picket-* payload, not anywhere under bin/.
++	assert.match(r.calls[1].args[5], /"\$1"\/picket-\*\/\*/);
 +});
 diff --git a/extensions/picket-remote-wsl/test/tree.test.js b/extensions/picket-remote-wsl/test/tree.test.js
 new file mode 100644
