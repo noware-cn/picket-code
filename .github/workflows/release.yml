@@ -314,20 +314,35 @@ jobs:
         shell: pwsh
         run: |
           $root = Join-Path $env:GITHUB_WORKSPACE "picket-code-win32-x64"
+          # The launcher name is a packaging detail (build/win32/rename-exe.mjs makes it
+          # code.exe), so pick it by extension instead of by name.
           $exe = (Get-ChildItem "$root\*.exe" | Where-Object {
             $_.Name -notmatch 'ffmpeg|elevate|crashpad' } | Select-Object -First 1).FullName
-          $logs = "$env:APPDATA\Picket Code\logs"
-          Remove-Item $logs -Recurse -Force -ErrorAction SilentlyContinue
-          $p = Start-Process -FilePath $exe -ArgumentList '--verbose' -PassThru
+          # An explicit profile keeps the log directory a property of this step rather
+          # than of product.json's nameShort. When nameShort moved from "Picket Code" to
+          # "picket-code" the logs followed it, the scan below found nothing, and this
+          # gate reported success without reading a single log line.
+          $profile = Join-Path $env:RUNNER_TEMP "smoke-profile"
+          Remove-Item $profile -Recurse -Force -ErrorAction SilentlyContinue
+          $p = Start-Process -FilePath $exe -ArgumentList '--verbose', "--user-data-dir=$profile" -PassThru
           Start-Sleep -Seconds 55
+          $logs = Join-Path $profile "logs"
           $hits = @()
+          $logFiles = @()
           if (Test-Path $logs) {
-            $hits = Get-ChildItem $logs -Recurse -Filter *.log -ErrorAction SilentlyContinue |
+            $logFiles = @(Get-ChildItem $logs -Recurse -Filter *.log -ErrorAction SilentlyContinue)
+            $hits = $logFiles |
               Select-String -Pattern 'ERR_INVALID_PACKAGE_CONFIG|Invalid package config|Uncaught Exception|Could not locate the bindings file|Cannot find module|is not iterable|Error scanning installed extensions|reading .extensionId'
           }
           Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
           if ($hits) {
             $hits | ForEach-Object { "HIT: " + $_.Line.Trim() }
+            exit 1
+          }
+          # No logs means the app either never started or ignored --user-data-dir; both
+          # leave the scan above with nothing to look at, so neither may pass.
+          if ($logFiles.Count -eq 0) {
+            "no log files under $logs: the packaged app did not start (or ignored --user-data-dir)"
             exit 1
           }
           "no packaging errors in app logs"
