@@ -38,7 +38,7 @@ index f3486874..ab8805ac 100644
  export class AgentsWindow {
  
  	constructor(private code: Code, private quickaccess: QuickAccess) { }
-@@ -872,6 +901,174 @@ export class AgentsWindow {
+@@ -872,6 +901,183 @@ export class AgentsWindow {
  		}
  	}
  
@@ -183,6 +183,10 @@ index f3486874..ab8805ac 100644
 +	 * Open the diff editor of one file listed in the active turn's changes
 +	 * summary. Rows open the checkpoint diff, because
 +	 * `chat.editing.openChangedFileInDiffEditor` defaults to true.
++	 *
++	 * The modified side is a `git-blob:` resource whose URI appends a JSON query
++	 * (`?{"sessionUri":…,"sha":"refs/agents/…/checkpoints/turn/1",…}`), so the
++	 * `data-uri` attribute does not end with the file name — match on a substring.
 +	 */
 +	async openTurnChangeDiff(file: string, timeoutMs: number = 60_000): Promise<void> {
 +		await this.expandTurnChanges(timeoutMs);
@@ -190,13 +194,18 @@ index f3486874..ab8805ac 100644
 +		const row = page.locator(ACTIVE_SESSION_TURN_CHANGES_ROW, { hasText: file }).first();
 +		await row.waitFor({ state: 'visible', timeout: timeoutMs });
 +		await row.click();
-+		await page.locator(`${DIFF_EDITOR_MODIFIED}[data-uri$="${file}"]`).first().waitFor({ state: 'visible', timeout: timeoutMs });
++		await page.locator(this.diffEditorSelector(file)).first().waitFor({ state: 'visible', timeout: timeoutMs });
 +	}
 +
 +	/** Wait for the modified side of the open diff editor for `file` to satisfy `accept`. */
 +	async waitForDiffEditorText(file: string, accept: (text: string) => boolean, timeoutMs: number = 60_000): Promise<string> {
-+		const selector = `${DIFF_EDITOR_MODIFIED}[data-uri$="${file}"] .view-lines`;
++		const selector = `${this.diffEditorSelector(file)} .view-lines`;
 +		return this.code.waitForTextContent(selector, undefined, text => accept(text.replace(/\u00a0/g, ' ')), Math.ceil(timeoutMs / 100));
++	}
++
++	private diffEditorSelector(file: string): string {
++		const escaped = file.replace(/[\\"]/g, '\\$&');
++		return `${DIFF_EDITOR_MODIFIED}[data-uri*="${escaped}"]`;
 +	}
 +
 +	private async expandTurnChanges(timeoutMs: number): Promise<void> {
