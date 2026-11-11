@@ -313,18 +313,24 @@ jobs:
         if: matrix.platform == 'win32'
         shell: pwsh
         run: |
-          $root = Join-Path $env:GITHUB_WORKSPACE "picket-code-win32-x64"
-          # The launcher name is a packaging detail (build/win32/rename-exe.mjs makes it
-          # code.exe), so pick it by extension instead of by name.
-          $exe = (Get-ChildItem "$root\*.exe" | Where-Object {
-            $_.Name -notmatch 'ffmpeg|elevate|crashpad' } | Select-Object -First 1).FullName
+          $root = Join-Path $env:GITHUB_WORKSPACE "picket-code-win32-${{ matrix.arch }}"
+          # build/win32/rename-exe.mjs is what puts the launcher here; if it did not
+          # run, the release would ship the long name and break every documented
+          # command, so assert the contract before starting anything.
+          $exe = Join-Path $root "code.exe"
+          if (-not (Test-Path $exe)) {
+            "no launcher at $exe - build/win32/rename-exe.mjs did not run"
+            exit 1
+          }
           # An explicit profile keeps the log directory a property of this step rather
           # than of product.json's nameShort. When nameShort moved from "Picket Code" to
           # "picket-code" the logs followed it, the scan below found nothing, and this
           # gate reported success without reading a single log line.
           $profile = Join-Path $env:RUNNER_TEMP "smoke-profile"
           Remove-Item $profile -Recurse -Force -ErrorAction SilentlyContinue
-          $p = Start-Process -FilePath $exe -ArgumentList '--verbose', "--user-data-dir=$profile" -PassThru
+          # Quoted: Start-Process joins these with spaces and does not quote them itself.
+          $appArgs = @('--verbose', "--user-data-dir=`"$profile`"")
+          $p = Start-Process -FilePath $exe -ArgumentList $appArgs -PassThru
           Start-Sleep -Seconds 55
           $logs = Join-Path $profile "logs"
           $hits = @()
@@ -342,7 +348,7 @@ jobs:
           # No logs means the app either never started or ignored --user-data-dir; both
           # leave the scan above with nothing to look at, so neither may pass.
           if ($logFiles.Count -eq 0) {
-            "no log files under $logs: the packaged app did not start (or ignored --user-data-dir)"
+            "no log files under ${logs}: the packaged app did not start (or ignored --user-data-dir)"
             exit 1
           }
           "no packaging errors in app logs"
