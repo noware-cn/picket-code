@@ -1,5 +1,5 @@
 diff --git a/test/automation/src/agentsWindow.ts b/test/automation/src/agentsWindow.ts
-index f3486874..ab8805ac 100644
+index f3486874..8443d859 100644
 --- a/test/automation/src/agentsWindow.ts
 +++ b/test/automation/src/agentsWindow.ts
 @@ -45,6 +45,35 @@ const CONTEXT_USAGE_DETAILS = '.chat-context-usage-details';
@@ -38,7 +38,7 @@ index f3486874..ab8805ac 100644
  export class AgentsWindow {
  
  	constructor(private code: Code, private quickaccess: QuickAccess) { }
-@@ -872,6 +901,183 @@ export class AgentsWindow {
+@@ -872,6 +901,217 @@ export class AgentsWindow {
  		}
  	}
  
@@ -197,10 +197,44 @@ index f3486874..ab8805ac 100644
 +		await page.locator(this.diffEditorSelector(file)).first().waitFor({ state: 'visible', timeout: timeoutMs });
 +	}
 +
-+	/** Wait for the modified side of the open diff editor for `file` to satisfy `accept`. */
++	/**
++	 * Wait for the modified side of the open diff editor for `file` to satisfy
++	 * `accept`.
++	 *
++	 * Inline diffs render the *removed* lines in a view zone that carries its own
++	 * `.view-lines` (`div.view-zones > div.view-lines.line-delete`, see
++	 * `diffEditorViewZones.ts`). That element precedes the editor's real
++	 * `.view-lines` in the DOM, so a bare `… .view-lines` selector resolves to the
++	 * deleted-lines zone — which is empty when the file was created — and never
++	 * sees the document. Only the primary `.lines-content > .view-lines` holds the
++	 * modified document.
++	 */
 +	async waitForDiffEditorText(file: string, accept: (text: string) => boolean, timeoutMs: number = 60_000): Promise<string> {
-+		const selector = `${this.diffEditorSelector(file)} .view-lines`;
-+		return this.code.waitForTextContent(selector, undefined, text => accept(text.replace(/\u00a0/g, ' ')), Math.ceil(timeoutMs / 100));
++		const selector = `${this.diffEditorSelector(file)} .lines-content > .view-lines`;
++		try {
++			return await this.code.waitForTextContent(selector, undefined, text => accept(text.replace(/\u00a0/g, ' ')), Math.ceil(timeoutMs / 100));
++		} catch (error) {
++			const message = error instanceof Error ? error.message : String(error);
++			throw new Error(`${message.replace(/\.$/, '')}. ${await this.describeOpenDiffEditors(file)}`);
++		}
++	}
++
++	/** Reports what the diff editors of `file` currently render, for failure messages. */
++	private async describeOpenDiffEditors(file: string): Promise<string> {
++		try {
++			const editors = await this.code.driver.currentPage.evaluate((needle: string) => {
++				return Array.from(document.querySelectorAll('.monaco-editor'))
++					.filter(editor => (editor.getAttribute('data-uri') ?? '').includes(needle))
++					.map(editor => ({
++						uri: editor.getAttribute('data-uri'),
++						viewLines: Array.from(editor.querySelectorAll('.view-lines')).map(element => (element.textContent ?? '').slice(0, 500)),
++						text: (editor.textContent ?? '').slice(0, 500),
++					}));
++			}, file);
++			return `Observed editors for "${file}": ${JSON.stringify(editors)}`;
++		} catch (error) {
++			return `The diff editor DOM for "${file}" could not be inspected: ${error instanceof Error ? error.message : String(error)}`;
++		}
 +	}
 +
 +	private diffEditorSelector(file: string): string {
