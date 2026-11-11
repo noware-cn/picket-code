@@ -84,6 +84,8 @@
 | 重启后历史回填 | 关窗重开同会话 → 历史文本仍在 |
 
 > 前提：假 ACP CLI 需要真实改动工作区（`diff` 场景写文件），且会话工作目录必须由 workspace pill 指定为临时 git 仓库——该步骤本身就是被测行为。
+>
+> 前提二：运行 L4 的环境必须有 git 身份（`user.name` / `user.email`）。turn 的变更列表来自 agent host 的 checkpoint，它是用 `git commit-tree` 写 tree 的；没有身份时这一步以 `fatal: empty ident name` 退出 128，checkpoint 静默失败，该轮就只剩「0 files changed」而看不到假 CLI 写的文件。`tests-ui.yml` 的 `ui` 作业因此在 checkout 后显式配置了一个身份。
 
 ### L5 打包产物（已存在，纳入报告）
 

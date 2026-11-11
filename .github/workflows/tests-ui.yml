@@ -89,6 +89,16 @@ jobs:
           # git tag --list needs the tags, see the resolve step.
           fetch-depth: 0
 
+      - name: Configure a git identity (the agent host checkpoints turns with git commit-tree)
+        shell: bash
+        run: |
+          # Without an identity `git commit-tree` exits 128 with "empty ident name",
+          # the turn checkpoint is dropped, and the turn then reports zero changed
+          # files — the diff scenario's assertions never see probe-diff.txt.
+          git config --global user.name "Picket Smoke"
+          git config --global user.email "smoke@picket-code.invalid"
+          git var GIT_AUTHOR_IDENT
+
       - name: Resolve tag (input → release tag → newest release tag → upstream latest)
         id: resolve
         shell: bash
