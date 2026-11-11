@@ -37,10 +37,13 @@ echo "ok: downloaders derive versioned names and resolve the latest tag"
 
 # ---- 2. archive layout promised by the docs matches the packaging scripts ----
 layout_ok=1
-grep -q 'picket-code-win32-x64\\Picket Code.exe' "$ROOT_DIR/docs/download-one-liner.md" || layout_ok=0
+grep -q 'picket-code-win32-x64\\code.exe' "$ROOT_DIR/docs/download-one-liner.md" || layout_ok=0
 # The zip must contain `picket-code-win32-<arch>/` as its single top-level dir, i.e. the
 # archive source argument is "$OUT_DIR" itself, not "$OUT_DIR"/*.
 grep -q -- '-tzip "[^"]*" "\$OUT_DIR"' "$SCRIPT_DIR/win32/package.sh" || layout_ok=0
+# The launcher rename is what makes that path true; a package stage that stops calling
+# it ships `Picket Code.exe` while the docs promise `code.exe`.
+grep -q 'rename-exe.mjs' "$SCRIPT_DIR/win32/package.sh" || layout_ok=0
 if [ "$layout_ok" -eq 1 ]; then
   echo "ok: win32 archive layout matches docs"
 else

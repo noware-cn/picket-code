@@ -154,7 +154,7 @@ hero:
   <div class="pc-step">
     <span class="pc-step-no">2</span>
     <h3>解压并启动</h3>
-    <p>Linux 运行 <code>./picket-code</code>，Windows 运行 <code>Picket Code.exe</code>，无需安装、无需联网。</p>
+    <p>Linux 运行 <code>./picket-code</code>，Windows 运行 <code>code.exe</code>，无需安装、无需联网。</p>
   </div>
   <div class="pc-step">
     <span class="pc-step-no">3</span>
@@ -189,7 +189,7 @@ hero:
     </div>
     <ul>
       <li>压缩包：<code>picket-code-v1.143.1-win32-x64.zip</code>（文件名带版本）</li>
-      <li>启动：<code>Picket Code.exe</code></li>
+      <li>启动：<code>code.exe</code></li>
       <li><a href="https://download.noware.cn/picket-code-v1.143.1-win32-x64.zip">镜像直链</a> · <a href="/guide/download">一键下载安装命令 →</a></li>
     </ul>
   </div>

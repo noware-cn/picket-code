@@ -41,7 +41,7 @@ curl -fSL https://download.noware.cn/picket-code-v1.143.1-SHA256SUMS -o SHA256SU
 sha256sum -c --ignore-missing SHA256SUMS
 ```
 
-解压后运行 `picket-code`（Linux）或 `Picket Code.exe`（Windows）；归档内的顶层目录不含版本号，仍是 `picket-code-win32-x64/`（Windows）与 `picket-code-linux-x64/`（Linux）。
+解压后运行 `picket-code`（Linux）或 `code.exe`（Windows）；归档内的顶层目录不含版本号，仍是 `picket-code-win32-x64/`（Windows）与 `picket-code-linux-x64/`（Linux）。Windows 可执行文件名为 `code.exe`（`v1.143.1-picket.1-rc.8` 起；更早的 RC 叫 `Picket Code.exe`）。用户配置与数据在 `%APPDATA%\picket-code`（Windows）、`~/.config/picket-code`（Linux），路径不含空格。
 
 - 镜像保留最近 **3 个版本**，更早的版本不承诺长期可下载；
 - 旧的无版本 URL（`/picket-code-win32-x64.zip`、`/SHA256SUMS`）已废弃，不提供兼容，访问返回 404；

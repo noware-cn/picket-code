@@ -103,8 +103,10 @@ jobs:
   # The suites build/wsl/gate.sh gates WSL packaging on. They import the extension's
   # sources out of the patched tree, so they need `vscode/` (but not node_modules or
   # out/), and without this job they only ever ran on a developer machine.
+  # build/win32/test comes along for the same reason: the launcher rename only runs
+  # in the release job, where a mistake is discovered after the tag is cut.
   packaging:
-    name: "Packaging suites (build/wsl/test)"
+    name: "Packaging suites (build/wsl/test, build/win32/test)"
     needs: [resolve]
     runs-on: ubuntu-latest
     timeout-minutes: 20
@@ -128,8 +130,8 @@ jobs:
         run: |
           # Unquoted on purpose: the shell expands the glob into file paths, which every
           # Node version accepts, while a quoted glob needs newer runners.
-          echo '==> node --test build/wsl/test/*.test.mjs'
-          node --test build/wsl/test/*.test.mjs
+          echo '==> node --test build/wsl/test/*.test.mjs build/win32/test/*.test.mjs'
+          node --test build/wsl/test/*.test.mjs build/win32/test/*.test.mjs
 
   # One npm ci and one transpile for every layer. Cache key: upstream tag + hash of the
   # patched package-lock.json + digest of build/patches and build/product.json, so a

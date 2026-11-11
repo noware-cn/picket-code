@@ -37,7 +37,7 @@ const VERSION_REGEXP = /^(\^|>=)?((\d+)|x)\.((\d+)|x)\.((\d+)|x)(\-.*)?$/;
 构建后自检：
 
 ```powershell
-& "D:\Downloads\picket-code-win32-x64\Picket Code.exe" --version
+& "D:\Downloads\picket-code-win32-x64\code.exe" --version
 # 期望：1.143.1（带 +p 就说明是旧构建，装不了任何扩展）
 ```
 
@@ -49,13 +49,13 @@ const VERSION_REGEXP = /^(\^|>=)?((\d+)|x)\.((\d+)|x)\.((\d+)|x)(\-.*)?$/;
 
 ```powershell
 # CLI 方式
-& "D:\Downloads\picket-code-win32-x64\Picket Code.exe" `
+& "D:\Downloads\picket-code-win32-x64\code.exe" `
   --install-extension "D:\Downloads\ms-vscode-remote.remote-wsl-1.104.7.vsix"
 
 # 或 GUI：扩展面板 → ··· → 从 VSIX 安装…
 
 # 确认
-& "D:\Downloads\picket-code-win32-x64\Picket Code.exe" --list-extensions --show-versions |
+& "D:\Downloads\picket-code-win32-x64\code.exe" --list-extensions --show-versions |
   Select-String remote-wsl
 ```
 
@@ -226,7 +226,7 @@ Windows 侧打开/重载 WSL 窗口，WSL 输出面板（`remote.WSL.logLevel` �
    ```
 
    ```powershell
-   & "<Picket Code>\Picket Code.exe" --uninstall-extension ms-vscode-remote.remote-wsl
+   & "<Picket Code>\code.exe" --uninstall-extension ms-vscode-remote.remote-wsl
    ```
 
 如果目的只是"在 Windows 上编辑 WSL 里的工程"，其实**不需要** Remote-WSL：直接打开 `\\wsl.localhost\Ubuntu\home\<user>\...`，或在 WSL 内启动 `picket-code .` 走 WSLg 显示；代价是文件监听、端口转发要自己处理（分析文档第七节有两条相关结论）。

@@ -36,8 +36,8 @@
 ### 1. 装扩展
 
 ```powershell
-& "<Picket Code>\Picket Code.exe" --install-extension .\ms-vscode-remote.remote-wsl-1.104.7.vsix
-& "<Picket Code>\Picket Code.exe" --list-extensions      # 确认已列出
+& "<Picket Code>\code.exe" --install-extension .\ms-vscode-remote.remote-wsl-1.104.7.vsix
+& "<Picket Code>\code.exe" --list-extensions      # 确认已列出
 ```
 
 GUI 等价操作：扩展面板 → `···` → 从 VSIX 安装。

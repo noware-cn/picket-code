@@ -29,7 +29,7 @@ async function fixtureApp(options = {}) {
 	const app = await mkdtemp(join(tmpdir(), 'picket-assemble-'));
 	await mkdir(join(app, 'extensions', 'picket-remote-wsl'), { recursive: true });
 	await writeFile(join(app, 'product.json'), JSON.stringify({
-		nameShort: 'Picket Code',
+		nameShort: 'picket-code',
 		commit: options.commit ?? COMMIT,
 		extensionEnabledApiProposals: { 'noware.picket-remote-wsl': ['resolvers', 'contribViewsRemote'] },
 		...(options.extra ?? {})

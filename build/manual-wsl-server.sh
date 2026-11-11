@@ -285,7 +285,7 @@ if [ -x "$NODE" ] && [ -f "$PRODUCT" ]; then
     }
     fs.writeFileSync(file, JSON.stringify(p, null, 2) + "\n");
   ' "$PRODUCT" \
-    'nameShort="Picket Code"' \
+    'nameShort="picket-code"' \
     'nameLong="Picket Code"' \
     'applicationName="picket-code"' \
     'dataFolderName=".picket-code"' \

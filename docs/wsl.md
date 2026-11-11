@@ -55,6 +55,16 @@ Remote-WSL 扩展已卸载**（它装在本产品上时，WSL 功能整体关闭
 公开版是**按需下载**（`ondemand`）：首次打开 WSL 文件夹会提示「自动下载 / 从文件
 安装 / 取消」。SHA256 校验不通过一律拒绝安装——不要绕过它。
 
+镜像根地址只提供随包 `catalog.json` 里写明的那个文件（当前是
+`picket-code-server-1.143.1-linux-x64.tar.gz`），不需要 `SHA256SUMS`：校验用的
+sha256 与大小都来自随包 catalog。设完不必重启，下次「自动下载」或
+`Picket: 组件…` 就会用新地址。
+
+设置在 `%APPDATA%\picket-code\User\settings.json`（Windows；目录名取自
+`product.json` 的 `nameShort`，与安装目录一样不含空格），或命令面板
+`Preferences: Open User Settings (JSON)`。rc.8 之前的版本用的是
+`%APPDATA%\Picket Code`（带空格），升级后是全新配置，需要重新设一次。
+
 ### 代理与自签证书
 
 下载走扩展自己的 HTTP 客户端（不是 `fetch`，它没法配代理和 CA），因此可以直接吃
