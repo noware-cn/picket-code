@@ -47,6 +47,13 @@ class _Shifted:
     def __getattr__(self, name):
         return getattr(self._pen, name)
 
+    def addComponent(self, glyphName, transformation):
+        # "i" is a composite (dotlessi + uni0307). SVGPathPen draws components
+        # onto itself at the font origin, so without this the dot and stem of
+        # the "i" land on the first letter instead of their own slot.
+        a, b, c, d, e, f = transformation
+        self._pen.addComponent(glyphName, (a, b, c, d, e + self._dx, f))
+
     def _pt(self, pt):
         return (pt[0] + self._dx, pt[1])
 
@@ -84,6 +91,13 @@ def outline(font, text):
         glyph.draw(_Shifted(bounds_pen, x))
         if bounds_pen.bounds:
             left, _, right, _ = bounds_pen.bounds
+            local_left, local_right = left - x, right - x
+            if local_left < -1 or local_right > glyph.width + 100:
+                raise SystemExit(
+                    f"glyph {char!r} draws outside its own slot "
+                    f"([{local_left:.0f}, {local_right:.0f}] vs advance {glyph.width}): "
+                    "a component lost its offset"
+                )
             ink_left = left if ink_left is None else min(ink_left, left)
             ink_right = right if ink_right is None else max(ink_right, right)
         x += glyph.width + TRACKING * UPM / SIZE
