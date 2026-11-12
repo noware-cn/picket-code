@@ -9,10 +9,10 @@ index 00000000..96fab092
 +tsconfig.json
 diff --git a/extensions/picket-remote-wsl/extension.js b/extensions/picket-remote-wsl/extension.js
 new file mode 100644
-index 00000000..10108f82
+index 00000000..7c32d5b2
 --- /dev/null
 +++ b/extensions/picket-remote-wsl/extension.js
-@@ -0,0 +1,312 @@
+@@ -0,0 +1,315 @@
 +'use strict';
 +
 +const { join } = require('node:path');
@@ -206,6 +206,9 @@ index 00000000..10108f82
 +			await vscode.window.showTextDocument(document);
 +		},
 +		uriFor: (parts) => vscode.Uri.from(parts),
++		// A Windows path is not a URI path: `Uri.from` would keep the backslashes
++		// and the drive colon verbatim, so `wslpath -w` output goes through here.
++		fileUri: (path) => vscode.Uri.file(path),
 +		executeCommand: (id, ...args) => vscode.commands.executeCommand(id, ...args)
 +	};
 +
@@ -919,7 +922,7 @@ index 00000000..45983e00
 +module.exports = { loadCatalog };
 diff --git a/extensions/picket-remote-wsl/src/commands.js b/extensions/picket-remote-wsl/src/commands.js
 new file mode 100644
-index 00000000..71c2f7af
+index 00000000..ed45cc81
 --- /dev/null
 +++ b/extensions/picket-remote-wsl/src/commands.js
 @@ -0,0 +1,553 @@
@@ -1198,7 +1201,7 @@ index 00000000..71c2f7af
 +		}
 +		try {
 +			const windowsPath = await toWindowsPath(runner, distro, folder.uri.path);
-+			await host.openFolder(host.uriFor({ scheme: 'file', path: windowsPath }), { forceNewWindow: true, remoteAuthority: '' });
++			await host.openFolder(host.fileUri(windowsPath), { forceNewWindow: true, remoteAuthority: '' });
 +		} catch (error) {
 +			await host.showErrorMessage(`无法映射回 Windows 路径：${error.message}`);
 +		}
@@ -5648,10 +5651,10 @@ index 00000000..1d666a4e
 +});
 diff --git a/extensions/picket-remote-wsl/test/commands.test.js b/extensions/picket-remote-wsl/test/commands.test.js
 new file mode 100644
-index 00000000..b4732805
+index 00000000..e1b30781
 --- /dev/null
 +++ b/extensions/picket-remote-wsl/test/commands.test.js
-@@ -0,0 +1,327 @@
+@@ -0,0 +1,355 @@
 +// RED first: this file must fail until src/commands.js exists.
 +const test = require('node:test');
 +const assert = require('node:assert');
@@ -5670,7 +5673,7 @@ index 00000000..b4732805
 +
 +/**
 + * Everything the command layer touches, minus VS Code itself.
-+ * @param {{ flavor?: 'embedded' | 'ondemand', state?: 'installed' | 'absent', host?: any, fail?: string, http?: { proxy?: string, proxyStrictSSL?: boolean }, settings?: any, catalogVersion?: string, installedVersion?: string }} [options]
++ * @param {{ flavor?: 'embedded' | 'ondemand', state?: 'installed' | 'absent', host?: any, fail?: string, http?: { proxy?: string, proxyStrictSSL?: boolean }, settings?: any, catalogVersion?: string, installedVersion?: string, currentFolders?: () => readonly any[], currentAuthority?: () => string }} [options]
 + */
 +function harness(options = {}) {
 +	const host = createFakeHost(options.host);
@@ -5703,6 +5706,9 @@ index 00000000..b4732805
 +			}
 +			if (key.endsWith('printenv HOME')) {
 +				return { code: 0, stdout: '/home/u\n', stderr: '' };
++			}
++			if (key.includes('wslpath -w')) {
++				return { code: 0, stdout: 'D:\\work\\demo\n', stderr: '' };
 +			}
 +			if (key.includes('wslpath -u')) {
 +				return { code: 0, stdout: '/mnt/c/project\n', stderr: '' };
@@ -5747,6 +5753,8 @@ index 00000000..b4732805
 +		resolver: { async stop(distro) { stopped.push(distro); } },
 +		log: { info() { }, error() { } },
 +		http: options.http,
++		currentFolders: options.currentFolders,
++		currentAuthority: options.currentAuthority,
 +		extensionPath: '/ext'
 +	});
 +
@@ -5826,6 +5834,29 @@ index 00000000..b4732805
 +	await ctx.commands.openFolder();
 +	assert.ok(ctx.calls.some(args => args.join(' ').includes('wslpath -u')), 'expected a wslpath translation');
 +	assert.strictEqual(ctx.host.opened[0].uri.path, '/mnt/c/project');
++});
++
++test('reopening a WSL folder in Windows builds a file URI from the wslpath output', async () => {
++	// `wslpath -w` answers `D:\work\demo`; handing that string to Uri.from({ path })
++	// would produce `file:///D:%5Cwork%5Cdemo`, which Windows cannot open.
++	const ctx = harness({
++		currentFolders: () => [{
++			uri: {
++				scheme: 'vscode-remote',
++				authority: 'picket-wsl+Ubuntu-24.04',
++				path: '/home/u/project',
++				fsPath: '\\\\wsl.localhost\\Ubuntu-24.04\\home\\u\\project'
++			}
++		}],
++		currentAuthority: () => 'picket-wsl+Ubuntu-24.04'
++	});
++	await ctx.commands.reopenInWindows();
++	assert.ok(ctx.calls.some(args => args.join(' ').includes('wslpath -w /home/u/project')), 'expected the posix path to be translated');
++	assert.strictEqual(ctx.host.opened.length, 1);
++	assert.strictEqual(ctx.host.opened[0].uri.scheme, 'file');
++	assert.strictEqual(ctx.host.opened[0].uri.fsPath, 'D:\\work\\demo');
++	assert.strictEqual(ctx.host.opened[0].uri.path, '/d:/work/demo');
++	assert.deepStrictEqual(ctx.host.opened[0].opts, { forceNewWindow: true, remoteAuthority: '' });
 +});
 +
 +test('a failing install is reported, not thrown', async () => {
@@ -6936,10 +6967,10 @@ index 00000000..eab68457
 +});
 diff --git a/extensions/picket-remote-wsl/test/fixtures/fake-host.js b/extensions/picket-remote-wsl/test/fixtures/fake-host.js
 new file mode 100644
-index 00000000..48630e64
+index 00000000..47b9fe9c
 --- /dev/null
 +++ b/extensions/picket-remote-wsl/test/fixtures/fake-host.js
-@@ -0,0 +1,180 @@
+@@ -0,0 +1,191 @@
 +'use strict';
 +
 +/**
@@ -7037,6 +7068,17 @@ index 00000000..48630e64
 +		/** @param {{ scheme?: string, authority?: string, path?: string }} parts */
 +		uriFor(parts) {
 +			return { ...parts, fsPath: parts.path ?? '' };
++		},
++		/**
++		 * `Uri.file` as VS Code does it: a Windows path becomes a URI whose path is
++		 * `/d:/work/demo` (or `/wsl.localhost/Ubuntu/...` for a UNC share) while
++		 * `fsPath` keeps the backslashes.
++		 * @param {string} path
++		 */
++		fileUri(path) {
++			const plain = path.replace(/\\/g, '/');
++			const slash = /^[A-Za-z]:\//.test(plain) ? `/${plain[0].toLowerCase()}${plain.slice(1)}` : `/${plain.replace(/^\/+/, '')}`;
++			return { scheme: 'file', path: slash, fsPath: path };
 +		}
 +	};
 +	return host;
