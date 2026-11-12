@@ -94,11 +94,21 @@ jobs:
       - uses: actions/setup-python@v7
         with:
           python-version: "3.11"
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "22"
       - name: Run the release contract checks
         shell: bash
         run: |
           echo "==> bash build/check-contract.sh"
           bash build/check-contract.sh
+      # The icons are binaries nobody reads: a re-merge with upstream can restore
+      # the VS Code logo without any test noticing. This reads the frame tables.
+      - name: Check the shipped brand assets
+        shell: bash
+        run: |
+          echo "==> node build/brand/check-assets.mjs"
+          node build/brand/check-assets.mjs
 
   # The suites build/wsl/gate.sh gates WSL packaging on. They import the extension's
   # sources out of the patched tree, so they need `vscode/` (but not node_modules or

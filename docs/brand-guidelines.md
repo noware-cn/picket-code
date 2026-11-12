@@ -16,7 +16,7 @@ Picket Code 是面向 AI 编码 agent 的加固版 Code-OSS 发行版。视觉�
 | Night Navy | `#081A2B` | 深色背景、图标底色 |
 | Signal Cyan | `#19C6D8` | 图形核心、深色背景强调 |
 | Text Teal | `#007E8A` | 浅色背景上的强调文字 |
-| Cloud | `#F7F9FC` | 浅色背景 |
+| Cloud | `#F4F8FC` | 浅色背景、深色背景上的图形 |
 
 ## 字体
 
@@ -35,6 +35,32 @@ Picket Code 是面向 AI 编码 agent 的加固版 Code-OSS 发行版。视觉�
 GitHub 的 camo 代理下渲染一致。改动字样或字距时用
 `build/brand/build-wordmark.py` 重新生成，且 `website/public/` 与
 `website/docs/public/` 下的副本必须保持逐字节相同。
+
+## 应用与发行物
+
+徽记是纯几何（四个角部模块 + 中央菱形），因此应用图标不经 SVG 光栅化，
+而由 `build/brand/export-icons.py` 直接绘制并导出所有位图。改动徽记后重跑
+该脚本，不要手工编辑下列文件：
+
+| 产物 | 规格 |
+|---|---|
+| `vscode/resources/win32/code.ico` | 16/24/32/48/64/128/256，圆角 17.5%，透明圆角外 |
+| `vscode/resources/win32/code_70x70.png` | 通知图标，同规格 |
+| `vscode/resources/win32/code_150x150.png` | 源码运行时的窗口图标，同规格 |
+| `vscode/resources/darwin/code.icns` | 16–1024 七个 PNG 块，底板 824/1024、圆角 22.45%，四周留 macOS 投影区 |
+| `vscode/resources/linux/code.png` | 512，圆角 17.5%（`linuxIconName=picket-code`） |
+| `vscode/resources/server/{favicon.ico,code-192.png,code-512.png}` | 浏览器版工作台的 favicon 与 PWA 图标；`manifest.json` 的应用名为 Picket Code |
+| `vscode/extensions/picket-remote-wsl/resources/icon.png` | 128，扩展列表图标 |
+| `website/public/og-image.png` | 1200×630，Night Navy 底 + 横版字标，宽 960 居中；`website/docs/public/` 下为逐字节相同的副本 |
+
+窗口内还有两处品牌位，改动时同一批次处理：空编辑器水印
+`vscode/src/vs/workbench/browser/parts/editor/media/letterpress-{light,dark,hcLight,hcDark}.svg`
+（用徽记几何、单色、沿用各主题原有的不透明度 0.1/0.3/填充灰），以及登录回环页
+`loopbackServer.ts` 里内联的默认背景图。
+
+`node build/brand/check-assets.mjs` 校验上述全部产物：格式、帧尺寸集合、
+与上游 VS Code 图标不是同一文件、水印与回环页仍是徽记。CI 的 Contract 作业
+会运行它，任何一次与上游的重新合并如果把这些文件带回 VS Code 版本都会失败。
 
 横版标志已经包含 "Picket Code" 字样，因此**不要**与站点标题文字并排使用，
 也不要放进方形或 24px 高的槽位：导航栏与首页主图用 `favicon.svg` 加文字标题，

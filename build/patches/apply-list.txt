@@ -11,3 +11,4 @@
 65-icode-smoke-tests.patch
 66-gallery-no-account.patch
 67-picket-remote-wsl.patch
+68-picket-brand-icons.patch

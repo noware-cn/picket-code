@@ -327,10 +327,10 @@ index 00000000..10108f82
 +module.exports = { activate, deactivate };
 diff --git a/extensions/picket-remote-wsl/package.json b/extensions/picket-remote-wsl/package.json
 new file mode 100644
-index 00000000..0dfa5687
+index 00000000..4d588c3b
 --- /dev/null
 +++ b/extensions/picket-remote-wsl/package.json
-@@ -0,0 +1,363 @@
+@@ -0,0 +1,364 @@
 +{
 +	"name": "picket-remote-wsl",
 +	"displayName": "Picket Remote - WSL",
@@ -342,6 +342,7 @@ index 00000000..0dfa5687
 +		"vscode": "^1.143.0"
 +	},
 +	"main": "./extension.js",
++	"icon": "resources/icon.png",
 +	"extensionKind": [
 +		"ui"
 +	],
@@ -706,6 +707,87 @@ index 00000000..133efcc3
 +	"flavor": "ondemand",
 +	"components": []
 +}
+diff --git a/extensions/picket-remote-wsl/resources/icon.png b/extensions/picket-remote-wsl/resources/icon.png
+new file mode 100644
+index 0000000000000000000000000000000000000000..c84d9979696d455a78b006b2d2c50fa453fed81a
+GIT binary patch
+literal 3688
+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
+CCDZ5t
+
+literal 0
+HcmV?d00001
+
 diff --git a/extensions/picket-remote-wsl/src/catalog.js b/extensions/picket-remote-wsl/src/catalog.js
 new file mode 100644
 index 00000000..45983e00
