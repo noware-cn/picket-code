@@ -1,0 +1,30 @@
+[github_app]
+pr_commands = ["/agentic_review"]
+handle_push_trigger = true
+push_commands = ["/agentic_review"]
+ignore_bot_pr = false
+
+[review_agent]
+comments_location_policy = "both"
+inline_comments_severity_threshold = 2
+override_effort = "extended"
+enable_review_md = true
+enable_incremental_review = true
+issues_user_guidelines = """
+请使用简体中文进行完整评审。项目是 Picket Code：基于 Code-OSS 的加固发行版，重点关注受控扩展、默认离线、iCode ACP 集成、私有模型网关配套能力、项目沙箱边界，以及 Windows/WSL 远程开发能力。
+
+评审必须以当前 PR 的实际 diff 和仓库文档为依据，不要臆测产品需求。优先识别可复现的功能缺陷、数据丢失、进程/资源生命周期错误、跨平台兼容问题、发布与供应链风险、凭据暴露、权限边界绕过、测试门禁缺失和回归风险。
+
+对于 WSL 功能，重点检查 Windows 与 Linux 进程边界、WSL 发行版识别、远程服务启动/停止/恢复、锁与状态文件原子性、PID 所属平台、CLI 安装/卸载、载荷下载与 SHA256 校验、代理和自定义 CA、版本/提交一致性、路径转义及空格/中文路径。
+
+对于 iCode ACP，重点检查协议状态映射、事件顺序、取消与超时、进程退出、会话/历史恢复、权限与工具调用、变更集生命周期，以及 UI 状态一致性。
+
+对于构建和发布，重点检查最小权限、PAT 作用域和暴露范围、不可变依赖与校验、tag/ref 来源、工作流触发条件、必需状态检查、失败时是否 fail closed，以及发布产物与源代码/载荷的对应关系。
+
+不要把个人自用场景强行扩展为多人协作或企业 RBAC 需求；但不得因此降低本地安全、凭据保护、进程隔离、供应链完整性和数据正确性的要求。
+
+只报告有明确证据的问题。每条发现说明严重度、受影响文件/行、触发条件、实际影响和修复方向。避免重复已有且已修复的历史意见；结合当前 HEAD 重新验证旧问题。
+"""
+compliance_user_guidelines = """
+使用简体中文。检查代码与仓库安全政策、依赖许可、凭据管理、最小权限和供应链完整性的一致性。不得将推测写成事实；对无法从 diff 或仓库文档确认的事项明确标注待验证。
+"""
