@@ -37,10 +37,13 @@ echo "ok: downloaders derive versioned names and resolve the latest tag"
 
 # ---- 2. archive layout promised by the docs matches the packaging scripts ----
 layout_ok=1
-grep -q 'picket-code-win32-x64\\Picket Code.exe' "$ROOT_DIR/docs/download-one-liner.md" || layout_ok=0
+grep -q 'picket-code-win32-x64\\code.exe' "$ROOT_DIR/docs/download-one-liner.md" || layout_ok=0
 # The zip must contain `picket-code-win32-<arch>/` as its single top-level dir, i.e. the
 # archive source argument is "$OUT_DIR" itself, not "$OUT_DIR"/*.
 grep -q -- '-tzip "[^"]*" "\$OUT_DIR"' "$SCRIPT_DIR/win32/package.sh" || layout_ok=0
+# The launcher rename is what makes that path true; a package stage that stops calling
+# it ships `Picket Code.exe` while the docs promise `code.exe`.
+grep -q 'rename-exe.mjs' "$SCRIPT_DIR/win32/package.sh" || layout_ok=0
 if [ "$layout_ok" -eq 1 ]; then
   echo "ok: win32 archive layout matches docs"
 else
@@ -76,6 +79,26 @@ if grep -rqi --exclude=check-contract.sh 'gitee\.com' "$ROOT_DIR/build" "$ROOT_D
   fail "a gitee.com URL is still referenced"
 else
   echo "ok: artifacts fetched from GitHub Releases + verified against SHA256SUMS"
+fi
+
+# ---- 5. the WSL server component stays wired into the packaging pipeline ----
+grep -q '"noware.picket-remote-wsl"' "$ROOT_DIR/build/product.json" \
+  || fail "build/product.json lost the picket-remote-wsl API proposal"
+# The official extension is what we replace, so it must not keep API rights in a
+# build that cannot contain it: a proposal granted to an id nothing ships is a
+# silent hole for anyone who installs that id later.
+if grep -q '"ms-vscode-remote.remote-wsl"' "$ROOT_DIR/build/product.json"; then
+  fail "build/product.json still grants API proposals to ms-vscode-remote.remote-wsl"
+fi
+for f in build.sh win32/package.sh linux/package.sh; do
+  grep -q 'wsl/check.mjs' "$SCRIPT_DIR/$f" \
+    || fail "$f no longer verifies the WSL component before packaging"
+done
+for f in wsl/assemble.mjs wsl/check.mjs wsl/offline-bundle.mjs wsl/fetch-payload.sh; do
+  [ -f "$SCRIPT_DIR/$f" ] || fail "build/$f is missing"
+done
+if [ "$FAILED" -eq 0 ]; then
+  echo "ok: picket-remote-wsl proposal enabled and WSL component packaging wired"
 fi
 
 if [ "$FAILED" -ne 0 ]; then

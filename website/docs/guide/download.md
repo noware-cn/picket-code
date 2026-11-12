@@ -69,7 +69,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\download-verify.ps1 -Tag v
 - 脚本从 GitHub Releases 解析并下载产物；国内网络可改用上面的镜像直链。
 - WebClient 自动使用系统代理 + 当前 Windows 用户凭据，企业网络可直接下载。
 - 若代理要求单独账号密码：`powershell -NoProfile -ExecutionPolicy Bypass -File .\download-verify.ps1 -ProxyCredential (Get-Credential)`
-- 完成后程序位置：`<当前目录>\picket-code-win32-x64\Picket Code.exe`
+- 完成后程序位置：`<当前目录>\picket-code-win32-x64\code.exe`
 
 ### Linux（bash 单行）
 

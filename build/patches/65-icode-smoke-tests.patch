@@ -1,0 +1,751 @@
+diff --git a/test/automation/src/agentsWindow.ts b/test/automation/src/agentsWindow.ts
+index f3486874..8443d859 100644
+--- a/test/automation/src/agentsWindow.ts
++++ b/test/automation/src/agentsWindow.ts
+@@ -45,6 +45,35 @@ const CONTEXT_USAGE_DETAILS = '.chat-context-usage-details';
+ // sibling `span.quota-value` holds the percentage).
+ const CONTEXT_USAGE_TOKEN_LABEL = `${CONTEXT_USAGE_DETAILS} .quota-label span:not(.quota-value)`;
+ 
++// Interactive affordances rendered inside the active session's response: the
++// `ask_user` question carousel (`ChatQuestionCarouselPart`) and the tool
++// confirmation banner (`ChatConfirmationWidget`).
++const ACTIVE_SESSION_QUESTION_CAROUSEL = `${ACTIVE_SESSION} .chat-question-carousel-container`;
++// Single-select rows carry `aria-label="Option {n}: {label}"`.
++const QUESTION_CAROUSEL_OPTION = `${ACTIVE_SESSION_QUESTION_CAROUSEL} .chat-question-list-item`;
++// The confirmation widget renders outside the response container, so it is
++// resolved workbench-wide — same selector as `chat.ts`.
++const TOOL_CONFIRMATION_WIDGET = '.chat-confirmation-widget2';
++// Collapsible tool part header inside the active session's response: generic
++// tool parts render their header as a button that mirrors the expanded state
++// onto `aria-expanded` (see `ChatCollapsibleInputOutputContentPart`).
++const ACTIVE_SESSION_TOOL_PART_HEADER = `${ACTIVE_SESSION} .interactive-item-container.interactive-response .chat-confirmation-widget-collapsible .chat-confirmation-widget-title`;
++
++// Per-turn changes summary (`ChatTurnPillsContentPart`): a `<details>` whose
++// summary reports `N files changed +ins -del` and whose body lists the changed
++// files (`renderChangesSummaryFileList` → a `WorkbenchList`).
++const ACTIVE_SESSION_TURN_CHANGES = `${ACTIVE_SESSION} .chat-turn-pills-part`;
++const ACTIVE_SESSION_TURN_CHANGES_HEADER = `${ACTIVE_SESSION_TURN_CHANGES} .checkpoint-file-changes-summary-header`;
++// The `N files changed` label toggles the `<details>`; the sibling
++// `.chat-file-changes-counts` button opens the changes editor instead.
++const ACTIVE_SESSION_TURN_CHANGES_LABEL = `${ACTIVE_SESSION_TURN_CHANGES_HEADER} .chat-file-changes-label`;
++const ACTIVE_SESSION_TURN_CHANGES_DETAILS = `${ACTIVE_SESSION_TURN_CHANGES} details.checkpoint-file-changes-disclosure`;
++const ACTIVE_SESSION_TURN_CHANGES_ROW = `${ACTIVE_SESSION_TURN_CHANGES} .monaco-list-row`;
++// Modified side of an open diff editor. `data-uri` is stamped on the inner
++// editor's root by `CodeEditorWidget`, so this matches both a plain diff editor
++// and the per-file editors of a multi-diff editor.
++const DIFF_EDITOR_MODIFIED = '.monaco-editor.modified-in-monaco-diff-editor';
++
+ export class AgentsWindow {
+ 
+ 	constructor(private code: Code, private quickaccess: QuickAccess) { }
+@@ -872,6 +901,217 @@ export class AgentsWindow {
+ 		}
+ 	}
+ 
++	/**
++	 * Wait until the active session renders the `ask_user` question carousel
++	 * with an option for every label in `optionLabels`. Rows are matched on
++	 * their `aria-label` (`"Option {n}: {label}"`), so pass the option labels
++	 * the provider offered, not the row text.
++	 *
++	 * The carousel is a chat content part inside the assistant response, but
++	 * this is deliberately not {@link waitForAssistantText}: an unanswered
++	 * question keeps the turn open, so waiting for the response to settle would
++	 * never return.
++	 */
++	async waitForQuestionCarousel(optionLabels: readonly string[], timeoutMs: number = 60_000): Promise<void> {
++		const retryCount = Math.ceil(timeoutMs / 100);
++		await this.code.waitForElement(ACTIVE_SESSION_QUESTION_CAROUSEL, undefined, retryCount);
++
++		const deadline = Date.now() + timeoutMs;
++		let lastSeen: string[] = [];
++		while (Date.now() < deadline) {
++			lastSeen = await this._questionOptionAriaLabels();
++			const missing = optionLabels.filter(label => !lastSeen.some(seen => seen.toLowerCase().includes(`: ${label.trim().toLowerCase()}`)));
++			if (missing.length === 0) {
++				return;
++			}
++			await new Promise(r => setTimeout(r, 250));
++		}
++		const summary = lastSeen.length ? lastSeen.map(label => `  ${JSON.stringify(label)}`).join('\n') : '  (no options rendered)';
++		throw new Error(`Timed out waiting for question carousel options ${JSON.stringify(optionLabels)}\nVisible options:\n${summary}`);
++	}
++
++	/**
++	 * Click the carousel option labelled `label`. A single-question carousel
++	 * submits as soon as an option is clicked (`handleNextOrSubmit`), which
++	 * resumes the parked `ask_user` request — callers then wait for the
++	 * follow-up response text.
++	 */
++	async selectQuestionOption(label: string, timeoutMs: number = 60_000): Promise<void> {
++		await this.waitForQuestionCarousel([label], timeoutMs);
++
++		const needle = `: ${label.trim().toLowerCase()}`;
++		const labels = await this._questionOptionAriaLabels();
++		const match = labels.find(ariaLabel => ariaLabel.toLowerCase().includes(needle));
++		if (!match) {
++			throw new Error(`Question carousel option "${label}" not found. Available: ${labels.join(' | ')}`);
++		}
++		await this.code.driver.currentPage.locator(`${QUESTION_CAROUSEL_OPTION}[aria-label="${match}"]`).first().click();
++	}
++
++	/** The `aria-label` of every rendered question carousel row (empty when none). */
++	private async _questionOptionAriaLabels(): Promise<string[]> {
++		const elements = await this.code.getElements(QUESTION_CAROUSEL_OPTION, /* recursive */ true);
++		return (elements ?? []).map(element => (element.attributes['aria-label'] ?? (element.textContent ?? '')).trim()).filter(label => !!label);
++	}
++
++	/**
++	 * Wait until a tool confirmation banner is on screen. Providers that ask for
++	 * approval (iCode does, over ACP `session/request_permission`) block the turn
++	 * until the banner is answered, so this precedes {@link acceptToolConfirmation}.
++	 *
++	 * Returns the banner's text so callers can assert which tool call it gates.
++	 */
++	async waitForToolConfirmation(timeoutMs: number = 60_000): Promise<string> {
++		await this.code.waitForElement(TOOL_CONFIRMATION_WIDGET, undefined, Math.ceil(timeoutMs / 100));
++		const elements = await this.code.getElements(TOOL_CONFIRMATION_WIDGET, /* recursive */ true);
++		return (elements ?? []).map(element => (element.textContent ?? '').trim()).join('\n');
++	}
++
++	/** Click "Allow" on the pending tool confirmation; see {@link acceptToolConfirmationIfPresent}. */
++	async acceptToolConfirmation(): Promise<void> {
++		await acceptToolConfirmationIfPresent(this.code);
++	}
++
++	/**
++	 * Wait until no tool confirmation banner remains, i.e. the answered request
++	 * left the chat's pending-input state and the turn could resume.
++	 */
++	async waitForToolConfirmationGone(timeoutMs: number = 60_000): Promise<void> {
++		await this.code.waitForElement(TOOL_CONFIRMATION_WIDGET, result => !result, Math.ceil(timeoutMs / 100));
++	}
++
++	/**
++	 * Wait until the active session's response bubble drops the
++	 * `chat-response-loading` class.
++	 *
++	 * Needed for turns whose observable outcome is a lifecycle transition rather
++	 * than new response text — e.g. an approved tool call that is hidden once
++	 * complete.
++	 */
++	async waitForActiveResponseSettled(timeoutMs: number = 60_000): Promise<void> {
++		const selector = `${ACTIVE_SESSION} .interactive-item-container.interactive-response:not(.chat-response-loading)`;
++		await this.code.waitForElement(selector, undefined, Math.ceil(timeoutMs / 100));
++	}
++
++	/**
++	 * Expand the collapsible tool part in the active response whose header
++	 * reads `label`, revealing its Input/Output code blocks.
++	 *
++	 * Generic tool parts keep the invocation input in a code block that
++	 * `ChatCollapsibleInputOutputContentPart` only creates on first expansion
++	 * (it renders the header as a `ButtonWithIcon` mirroring the state onto
++	 * `aria-expanded`), so the input text is not in the DOM until the header
++	 * is clicked.
++	 */
++	async expandToolCall(label: string, timeoutMs: number = 60_000): Promise<void> {
++		const page = this.code.driver.currentPage;
++		const collapsedHeader = `${ACTIVE_SESSION_TOOL_PART_HEADER}[aria-expanded="false"]`;
++		const expandedHeader = `${ACTIVE_SESSION_TOOL_PART_HEADER}[aria-expanded="true"]`;
++
++		const header = page.locator(collapsedHeader, { hasText: label }).first();
++		const deadline = Date.now() + timeoutMs;
++		let lastError: unknown;
++		while (Date.now() < deadline) {
++			try {
++				await header.click({ timeout: 5_000 });
++				lastError = undefined;
++				break;
++			} catch (error) {
++				lastError = error;
++				await new Promise(r => setTimeout(r, 250));
++			}
++		}
++		if (lastError) {
++			throw new Error(`Timed out expanding the tool call "${label}": ${lastError instanceof Error ? lastError.message : String(lastError)}`);
++		}
++
++		await page.locator(expandedHeader, { hasText: label }).first().waitFor({ state: 'visible', timeout: timeoutMs });
++	}
++
++	/**
++	 * Wait for the active turn's changes summary and return the file labels it
++	 * lists (each row also carries the `+added / -removed` counts).
++	 */
++	async getTurnChangedFiles(timeoutMs: number = 60_000): Promise<string[]> {
++		await this.expandTurnChanges(timeoutMs);
++		const rows = await this.code.driver.currentPage.locator(ACTIVE_SESSION_TURN_CHANGES_ROW).allTextContents();
++		return rows.map(text => text.replace(/\s+/g, ' ').trim()).filter(text => text.length > 0);
++	}
++
++	/**
++	 * Open the diff editor of one file listed in the active turn's changes
++	 * summary. Rows open the checkpoint diff, because
++	 * `chat.editing.openChangedFileInDiffEditor` defaults to true.
++	 *
++	 * The modified side is a `git-blob:` resource whose URI appends a JSON query
++	 * (`?{"sessionUri":…,"sha":"refs/agents/…/checkpoints/turn/1",…}`), so the
++	 * `data-uri` attribute does not end with the file name — match on a substring.
++	 */
++	async openTurnChangeDiff(file: string, timeoutMs: number = 60_000): Promise<void> {
++		await this.expandTurnChanges(timeoutMs);
++		const page = this.code.driver.currentPage;
++		const row = page.locator(ACTIVE_SESSION_TURN_CHANGES_ROW, { hasText: file }).first();
++		await row.waitFor({ state: 'visible', timeout: timeoutMs });
++		await row.click();
++		await page.locator(this.diffEditorSelector(file)).first().waitFor({ state: 'visible', timeout: timeoutMs });
++	}
++
++	/**
++	 * Wait for the modified side of the open diff editor for `file` to satisfy
++	 * `accept`.
++	 *
++	 * Inline diffs render the *removed* lines in a view zone that carries its own
++	 * `.view-lines` (`div.view-zones > div.view-lines.line-delete`, see
++	 * `diffEditorViewZones.ts`). That element precedes the editor's real
++	 * `.view-lines` in the DOM, so a bare `… .view-lines` selector resolves to the
++	 * deleted-lines zone — which is empty when the file was created — and never
++	 * sees the document. Only the primary `.lines-content > .view-lines` holds the
++	 * modified document.
++	 */
++	async waitForDiffEditorText(file: string, accept: (text: string) => boolean, timeoutMs: number = 60_000): Promise<string> {
++		const selector = `${this.diffEditorSelector(file)} .lines-content > .view-lines`;
++		try {
++			return await this.code.waitForTextContent(selector, undefined, text => accept(text.replace(/\u00a0/g, ' ')), Math.ceil(timeoutMs / 100));
++		} catch (error) {
++			const message = error instanceof Error ? error.message : String(error);
++			throw new Error(`${message.replace(/\.$/, '')}. ${await this.describeOpenDiffEditors(file)}`);
++		}
++	}
++
++	/** Reports what the diff editors of `file` currently render, for failure messages. */
++	private async describeOpenDiffEditors(file: string): Promise<string> {
++		try {
++			const editors = await this.code.driver.currentPage.evaluate((needle: string) => {
++				return Array.from(document.querySelectorAll('.monaco-editor'))
++					.filter(editor => (editor.getAttribute('data-uri') ?? '').includes(needle))
++					.map(editor => ({
++						uri: editor.getAttribute('data-uri'),
++						viewLines: Array.from(editor.querySelectorAll('.view-lines')).map(element => (element.textContent ?? '').slice(0, 500)),
++						text: (editor.textContent ?? '').slice(0, 500),
++					}));
++			}, file);
++			return `Observed editors for "${file}": ${JSON.stringify(editors)}`;
++		} catch (error) {
++			return `The diff editor DOM for "${file}" could not be inspected: ${error instanceof Error ? error.message : String(error)}`;
++		}
++	}
++
++	private diffEditorSelector(file: string): string {
++		const escaped = file.replace(/[\\"]/g, '\\$&');
++		return `${DIFF_EDITOR_MODIFIED}[data-uri*="${escaped}"]`;
++	}
++
++	private async expandTurnChanges(timeoutMs: number): Promise<void> {
++		const page = this.code.driver.currentPage;
++		await page.locator(ACTIVE_SESSION_TURN_CHANGES_HEADER).first().waitFor({ state: 'visible', timeout: timeoutMs });
++		const isOpen = await page.evaluate(selector => (document.querySelector(selector) as HTMLDetailsElement | null)?.open === true, ACTIVE_SESSION_TURN_CHANGES_DETAILS);
++		if (isOpen) {
++			return;
++		}
++		await page.locator(ACTIVE_SESSION_TURN_CHANGES_LABEL).first().click();
++		await page.waitForFunction(selector => (document.querySelector(selector) as HTMLDetailsElement | null)?.open === true, ACTIVE_SESSION_TURN_CHANGES_DETAILS, { timeout: timeoutMs });
++	}
++
+ 	/**
+ 	 * Open the model picker in the active session input and select the model
+ 	 * whose displayed name contains `modelName`. Clicks the model-picker name
+diff --git a/test/automation/src/chat.ts b/test/automation/src/chat.ts
+index bf06aae8..7f542446 100644
+--- a/test/automation/src/chat.ts
++++ b/test/automation/src/chat.ts
+@@ -528,9 +528,12 @@ export async function acceptToolConfirmationIfPresent(code: Code): Promise<void>
+ 	const allowButtonSelector = '.chat-confirmation-widget2 .monaco-button.monaco-text-button';
+ 	try {
+ 		const buttons = await code.driver.getElements(allowButtonSelector, /* recursive */ true);
+-		// The first text button in the widget is "Allow"; only proceed when
+-		// that holds so we never accidentally hit "Skip".
+-		if (!buttons || buttons.length === 0 || (buttons[0].textContent ?? '').trim() !== 'Allow') {
++		// The first text button in the widget is an allow label; only proceed
++		// when that holds so we never accidentally hit "Skip". Providers may
++		// offer several nuances of approval ("Allow Once", "Allow in this
++		// Session"), so match the label family rather than one exact string.
++		const isAllowLabel = (text: string | undefined) => /^Allow( Once| in this Session| Always)?$/.test((text ?? '').trim());
++		if (!buttons || buttons.length === 0 || !isAllowLabel(buttons[0].textContent)) {
+ 			return;
+ 		}
+ 		// Filter to only visible "Allow" buttons: the DOM can contain multiple
+@@ -540,7 +543,7 @@ export async function acceptToolConfirmationIfPresent(code: Code): Promise<void>
+ 		// element order and often pick a hidden one.
+ 		const allowButtons = code.driver.currentPage
+ 			.locator('.chat-confirmation-widget2 .monaco-button.monaco-text-button')
+-			.filter({ hasText: /^Allow$/ });
++			.filter({ hasText: /^Allow( Once| in this Session| Always)?$/ });
+ 		const total = await allowButtons.count();
+ 		for (let i = 0; i < total; i++) {
+ 			const b = allowButtons.nth(i);
+diff --git a/test/smoke/src/areas/agentsWindow/icode.test.ts b/test/smoke/src/areas/agentsWindow/icode.test.ts
+new file mode 100644
+index 00000000..3acc84a0
+--- /dev/null
++++ b/test/smoke/src/areas/agentsWindow/icode.test.ts
+@@ -0,0 +1,434 @@
++/*---------------------------------------------------------------------------------------------
++ *  Copyright (c) Microsoft Corporation. All rights reserved.
++ *  Licensed under the MIT License. See License.txt in the project root for license information.
++ *--------------------------------------------------------------------------------------------*/
++
++import * as assert from 'assert';
++import * as cp from 'child_process';
++import * as fs from 'fs';
++import * as os from 'os';
++import * as path from 'path';
++import { Application, ApplicationOptions, Logger } from '../../../../automation';
++import { createApp, dumpFailureDiagnostics, installAppAfterHandler, installDiagnosticsHandler, suiteCrashPath, suiteLogsPath } from '../../utils';
++
++/**
++ * Layer 4 (UI smoke) coverage for the iCode agent-host provider, driven by the
++ * fake ACP CLI in `test/fixtures/fake-icode-acp.mjs` (see `docs/testing.md`
++ * §2 "L4 UI 冒烟").
++ *
++ * These suites deliberately do NOT use `setupAgentHostSuite`: that helper wires
++ * a mock LLM server for the Copilot-backed providers, while iCode talks ACP to
++ * a local subprocess. Pointing `PICKET_ICODE_BIN` at the fake CLI and enabling
++ * the provider via `PICKET_ICODE_AGENT_ENABLED` is the whole setup.
++ *
++ * `FAKE_ICODE_SCENARIO` is read by the subprocess, so it is fixed for the
++ * lifetime of one app launch — hence one `describe` per scenario, each with its
++ * own app (mirroring how the other Agents Window suites create one app per
++ * suite).
++ *
++ * Suite titles carry a lowercase `[icode]` token on purpose: the smoke runner
++ * maps `-f`/`-g` onto mocha's `grep` (`new RegExp` without flags, see
++ * `test/smoke/test/index.js`), which is case-sensitive and matches the full
++ * nested title — so `-f icode` only selects a title containing lowercase
++ * `icode`.
++ */
++
++// `out/areas/agentsWindow/icode.test.js` → `<vscode>/test/fixtures/…`
++const FAKE_ICODE_BIN = path.resolve(__dirname, '..', '..', '..', '..', 'fixtures', 'fake-icode-acp.mjs');
++
++const PROMPT = 'icode smoke prompt';
++
++// Text the fake CLI emits per scenario (see `test/fixtures/fake-icode-acp.mjs`).
++// `text` streams three `fake-` chunks, so the rendered bubble reads `fake-fake-fake`.
++const FAKE_TEXT = 'fake-fake-fake';
++// `text` starts an `execute` tool call as `{toolCallId: 'tc-1', kind: 'execute',
++// rawInput: {command: 'echo fake'}}` with no `title`, so the provider falls back
++// to the ACP tool call id as the display name (`icodeMapEvents.mapToolCallStart`).
++const FAKE_TOOL_CALL_ID = 'tc-1';
++// The command the `execute` tool call carries in its `rawInput`.
++const FAKE_TOOL_COMMAND = 'echo fake';
++// The command is rendered inside a code block (Monaco view lines render spaces
++// as non-breaking spaces), so match it with a whitespace-tolerant pattern
++// instead of a literal-space `includes` check.
++const FAKE_TOOL_COMMAND_PATTERN = /echo\s+fake/;
++// `ask` is answered with this chunk once the question carousel is submitted.
++const FAKE_ASK_FOLLOW_UP = 'after-answer';
++// `permission` gates an `execute` tool call with this id behind
++// `session/request_permission`, so the confirmation banner is the visible
++// evidence that the call is waiting for approval.
++const FAKE_PERMISSION_TOOL_CALL_ID = 'tc-p';
++// `diff` names this file in its `edit` tool call title, then appends a
++// `change-<n>` line to it inside the session folder.
++const FAKE_DIFF_FILE = 'probe-diff.txt';
++const FAKE_DIFF_LINE_PATTERN = /change-\d+/;
++
++// Selector for the send button in the Agents Window new-session homepage.
++// Kept in sync with `SEND_BUTTON_ENABLED` in `test/automation/src/agentsWindow.ts`
++// (without the `:not(.disabled)` filter so we can observe the disabled state).
++const AGENTS_SEND_BUTTON_SELECTOR = '.sessions-chat-widget .new-chat-widget-container .sessions-chat-send-button .monaco-button';
++
++const SESSION_TYPE = 'iCode';
++
++/**
++ * Creates a throwaway git repository to use as the session's working
++ * directory. The agent host passes the folder the Agents Window hands over to
++ * `session/new` as the chat's cwd, and its per-turn checkpoints only work
++ * inside a repository (`IcodeAgent._sendMessage`), so the diff scenario needs a
++ * real repo — which is itself part of the behaviour under test. The ACP
++ * subprocess is spawned with that same cwd, so the fake CLI's relative writes
++ * land in the session folder and the checkpoints capture them.
++ */
++function createTempGitRepo(): string {
++	const repoPath = fs.mkdtempSync(path.join(os.tmpdir(), 'vscode-icode-smoke-'));
++	const git = (args: readonly string[]) => cp.execFileSync('git', args, { cwd: repoPath, stdio: 'pipe' });
++	git(['init', '--quiet']);
++	fs.writeFileSync(path.join(repoPath, 'README.md'), '# iCode smoke workspace\n');
++	git(['add', 'README.md']);
++	// Pass the identity explicitly so the commit does not depend on (and is not
++	// blocked by) the machine's global git configuration; `--no-gpg-sign` keeps
++	// a globally configured `commit.gpgsign` from needing a passphrase.
++	git(['-c', 'user.email=smoke@example.com', '-c', 'user.name=VS Code Smoke', 'commit', '--no-gpg-sign', '--quiet', '-m', 'Initial commit']);
++	return repoPath;
++}
++
++interface IIcodeSuiteContext {
++	/** The temp git repo backing the suite; `undefined` before the app hook ran. */
++	readonly repoPath: string | undefined;
++}
++
++/**
++ * Installs the shared hooks for one iCode scenario: guards the platform, starts
++ * the app with the fake ACP CLI as `PICKET_ICODE_BIN`, pre-seeds the smoke
++ * settings into both profile roots, and opens the temp repo in the Agents
++ * Window.
++ */
++function setupIcodeSuite(logger: Logger, config: { readonly label: string; readonly scenario: string }): IIcodeSuiteContext {
++	let repoPath: string | undefined;
++
++	// Runs before the app hooks below, so an unsupported environment skips the
++	// suite without ever launching Electron.
++	before(function () {
++		// The transport spawns `PICKET_ICODE_BIN` directly and only falls back to
++		// a shell for `.cmd`/`.bat` shims, so a `.mjs` fixture cannot be started
++		// on Windows.
++		if (process.platform === 'win32') {
++			logger.log(`Skipping ${config.label}: the fake iCode ACP CLI ('test/fixtures/fake-icode-acp.mjs') cannot be spawned directly on Windows.`);
++			this.skip();
++		}
++		if (!fs.existsSync(FAKE_ICODE_BIN)) {
++			logger.log(`Skipping ${config.label}: fake iCode ACP CLI not found at ${FAKE_ICODE_BIN}.`);
++			this.skip();
++		}
++		// The session workspace is a throwaway git repository (see
++		// `createTempGitRepo`), so the suite cannot run without git on PATH.
++		try {
++			cp.execFileSync('git', ['--version'], { stdio: 'pipe' });
++		} catch {
++			logger.log(`Skipping ${config.label}: git is not available, so the temp session workspace cannot be a repository.`);
++			this.skip();
++		}
++	});
++
++	installDiagnosticsHandler(logger);
++
++	before(async function () {
++		const suiteName = this.test?.parent?.title ?? 'unknown';
++		const defaultOptions: ApplicationOptions = {
++			...this.defaultOptions,
++			logsPath: suiteLogsPath(this.defaultOptions, suiteName),
++			crashesPath: suiteCrashPath(this.defaultOptions, suiteName),
++		};
++
++		repoPath = createTempGitRepo();
++		this.app = createApp(defaultOptions, opts => ({
++			...opts,
++			// The temp repo is the session's working directory: the Agents Window
++			// hands its folder to the agent host and the ACP session is created
++			// with that cwd.
++			workspacePath: repoPath,
++			extraEnv: {
++				...(opts.extraEnv ?? {}),
++				PICKET_ICODE_BIN: FAKE_ICODE_BIN,
++				PICKET_ICODE_AGENT_ENABLED: '1',
++				FAKE_ICODE_SCENARIO: config.scenario,
++			},
++		}));
++
++		// Pre-seed settings.json on disk into BOTH the default profile and the
++		// Agents profile so Agent Host startup observes the test configuration.
++		const userDataDir = (this.app as Application).userDataPath;
++		if (userDataDir) {
++			const settings = JSON.stringify({
++				// The session folder is handed over as-is; a worktree would add a
++				// branch the per-turn checkpoint assertions do not expect and the
++				// temp repo is disposable anyway.
++				'sessions.useWorktree': false,
++				// Agent sessions run without a Copilot account in these suites.
++				'chat.allowAnonymousAccess': true,
++				// Keep the AHP transcript on disk so a failure can be diagnosed
++				// from the suite logs.
++				'chat.agentHost.ahpJsonlLoggingEnabled': true,
++			}, null, 2);
++			for (const settingsPath of [
++				path.join(userDataDir, 'User', 'settings.json'),
++				path.join(userDataDir, 'User', 'profiles', 'builtin', 'agents', 'settings.json'),
++			]) {
++				fs.mkdirSync(path.dirname(settingsPath), { recursive: true });
++				fs.writeFileSync(settingsPath, settings);
++			}
++		}
++
++		await (this.app as Application).start();
++	});
++
++	installAppAfterHandler(undefined, async () => {
++		// The app is already stopped here; drop the temp repo so repeated runs
++		// leave nothing behind.
++		if (repoPath) {
++			fs.rmSync(repoPath, { recursive: true, force: true });
++			repoPath = undefined;
++		}
++	});
++
++	before(async function () {
++		const app = this.app as Application;
++		const windowsBefore = app.code.driver.getAllWindows().length;
++		await app.workbench.agentsWindow.openCurrentFolderInAgentsWindow();
++		await app.workbench.agentsWindow.switchToAgentsWindow(windowsBefore);
++	});
++
++	return {
++		get repoPath() { return repoPath; },
++	};
++}
++
++/**
++ * Starts a fresh session with the iCode provider and submits `prompt`.
++ *
++ * Selecting a session type only preselects the provider in the new-session
++ * composer; the active session view appears once the prompt is sent, because
++ * the ACP session is created lazily per chat.
++ */
++async function submitIcodePrompt(app: Application, prompt: string): Promise<void> {
++	const agentsWindow = app.workbench.agentsWindow;
++	await agentsWindow.startNewSession();
++	await agentsWindow.waitForNewSessionView();
++	await agentsWindow.selectSessionType(SESSION_TYPE);
++	await agentsWindow.submitNewSessionPrompt(prompt);
++}
++
++/** Logs the failure diagnostics for `label` and rethrows the original error. */
++async function reportFailure(app: Application, logger: Logger, label: string, error: unknown): Promise<never> {
++	logger.log(`${label} FAILURE: ${error instanceof Error ? error.stack ?? error.message : String(error)}`);
++	await dumpFailureDiagnostics(app, logger, label, { sendButtonSelector: AGENTS_SEND_BUTTON_SELECTOR });
++	throw error;
++}
++
++export function setup(logger: Logger): void {
++
++	describe('Agents Window [icode] text scenario', () => {
++
++		setupIcodeSuite(logger, { label: 'Agents Window [icode] text scenario', scenario: 'text' });
++
++		it('offers iCode in the session-type picker and opens a session', async function () {
++			this.timeout(5 * 60 * 1000);
++			const app = this.app as Application;
++			const agentsWindow = app.workbench.agentsWindow;
++
++			try {
++				await agentsWindow.startNewSession();
++				await agentsWindow.waitForNewSessionView();
++
++				assert.ok(
++					await agentsWindow.isSessionTypeAvailable(SESSION_TYPE),
++					`The session-type picker must offer "${SESSION_TYPE}" when PICKET_ICODE_BIN points at the fake ACP CLI and PICKET_ICODE_AGENT_ENABLED=1`,
++				);
++				await agentsWindow.selectSessionType(SESSION_TYPE);
++
++				// Selecting a session type only preselects the provider; the active
++				// session view appears when the first prompt opens the ACP session.
++				await agentsWindow.submitNewSessionPrompt(PROMPT);
++				await agentsWindow.waitForActiveSessionView();
++			} catch (error) {
++				await reportFailure(app, logger, 'Agents Window [icode] text scenario', error);
++			}
++		});
++
++		it('renders the assistant text of one turn', async function () {
++			this.timeout(5 * 60 * 1000);
++			const app = this.app as Application;
++
++			try {
++				await submitIcodePrompt(app, PROMPT);
++				const response = await app.workbench.agentsWindow.waitForAssistantText(FAKE_TEXT, 120_000);
++				assert.ok(response.includes(FAKE_TEXT), `Expected the assistant response to contain "${FAKE_TEXT}" (got "${response}")`);
++			} catch (error) {
++				await reportFailure(app, logger, 'Agents Window [icode] text scenario', error);
++			}
++		});
++
++		it('renders the execute tool call with its command text', async function () {
++			this.timeout(5 * 60 * 1000);
++			const app = this.app as Application;
++			const agentsWindow = app.workbench.agentsWindow;
++
++			try {
++				await submitIcodePrompt(app, PROMPT);
++
++				// The tool call header shows the ACP tool call id, because the fake
++				// `execute` update carries no `title` and the provider falls back to
++				// the id as the display name.
++				await agentsWindow.waitForAssistantText(FAKE_TOOL_CALL_ID, 120_000);
++
++				// ACP's `rawInput.command` reaches the UI as the tool call's input.
++				// iCode does not stamp the `_meta.toolKind` rendering hint that routes
++				// a call to the terminal renderer (`stateToProgressAdapter`'s
++				// `isTerminalToolCall`), so the call renders as a generic tool part
++				// whose input lives in a collapsed code block that is only created on
++				// first expansion — expanding is what surfaces the command text.
++				await agentsWindow.expandToolCall(FAKE_TOOL_CALL_ID);
++				const response = await agentsWindow.waitForAssistantText(FAKE_TOOL_COMMAND_PATTERN, 120_000);
++				assert.ok(FAKE_TOOL_COMMAND_PATTERN.test(response), `Expected the tool call to render the command "${FAKE_TOOL_COMMAND}" (got "${response}")`);
++			} catch (error) {
++				await reportFailure(app, logger, 'Agents Window [icode] text scenario', error);
++			}
++		});
++	});
++
++	describe('Agents Window [icode] diff scenario', () => {
++
++		const context = setupIcodeSuite(logger, { label: 'Agents Window [icode] diff scenario', scenario: 'diff' });
++
++		it('reports the changed file of the turn and shows its diff', async function () {
++			this.timeout(5 * 60 * 1000);
++			const app = this.app as Application;
++			const agentsWindow = app.workbench.agentsWindow;
++
++			try {
++				const repoPath = context.repoPath;
++				assert.ok(repoPath && fs.existsSync(path.join(repoPath, '.git')), 'Expected the session workspace to be a git repository');
++
++				await submitIcodePrompt(app, PROMPT);
++
++				// The turn's changes summary must list the file the `edit` tool call
++				// wrote. The ACP subprocess runs in the session folder, so the fake
++				// CLI's `appendFileSync(join(process.cwd(), 'probe-diff.txt'))` really
++				// touches the repo the checkpoints are taken against.
++				const files = await agentsWindow.getTurnChangedFiles(120_000);
++				assert.strictEqual(files.length, 1, `Expected the turn changes summary to list one file (got ${JSON.stringify(files)})`);
++				assert.ok(files[0].includes(FAKE_DIFF_FILE), `Expected the turn changes summary to list "${FAKE_DIFF_FILE}" (got ${JSON.stringify(files)})`);
++
++				// Selecting the row opens the checkpoint diff; its modified side must
++				// show the appended line, which only holds if the checkpoint captured
++				// the real file contents rather than an empty change.
++				await agentsWindow.openTurnChangeDiff(FAKE_DIFF_FILE, 120_000);
++				const diffText = await agentsWindow.waitForDiffEditorText(FAKE_DIFF_FILE, text => FAKE_DIFF_LINE_PATTERN.test(text), 120_000);
++				assert.ok(FAKE_DIFF_LINE_PATTERN.test(diffText), `Expected the diff of "${FAKE_DIFF_FILE}" to show the appended line (got "${diffText}")`);
++			} catch (error) {
++				await reportFailure(app, logger, 'Agents Window [icode] diff scenario', error);
++			}
++		});
++	});
++
++	describe('Agents Window [icode] ask scenario', () => {
++
++		setupIcodeSuite(logger, { label: 'Agents Window [icode] ask scenario', scenario: 'ask' });
++
++		it('answers the ask_user form and keeps the turn going', async function () {
++			this.timeout(5 * 60 * 1000);
++			const app = this.app as Application;
++			const agentsWindow = app.workbench.agentsWindow;
++
++			try {
++				await submitIcodePrompt(app, PROMPT);
++
++				// The fake CLI parks the turn on `_chrys/request_input` with one
++				// question (`Q?`) and the options `A` and `B`, which the provider
++				// maps to a single-select question carousel in the response.
++				await agentsWindow.waitForQuestionCarousel(['A', 'B'], 120_000);
++				await agentsWindow.selectQuestionOption('A');
++
++				// Answering resumes the parked request, so the follow-up text can
++				// only arrive after the selection landed.
++				const response = await agentsWindow.waitForAssistantText(FAKE_ASK_FOLLOW_UP, 120_000);
++				assert.ok(response.includes(FAKE_ASK_FOLLOW_UP), `Expected the turn to continue with "${FAKE_ASK_FOLLOW_UP}" (got "${response}")`);
++			} catch (error) {
++				await reportFailure(app, logger, 'Agents Window [icode] ask scenario', error);
++			}
++		});
++	});
++
++	describe('Agents Window [icode] permission scenario', () => {
++
++		setupIcodeSuite(logger, { label: 'Agents Window [icode] permission scenario', scenario: 'permission' });
++
++		it('shows the tool confirmation and finishes after allowing it', async function () {
++			this.timeout(5 * 60 * 1000);
++			const app = this.app as Application;
++			const agentsWindow = app.workbench.agentsWindow;
++
++			try {
++				await submitIcodePrompt(app, PROMPT);
++
++				// `session/request_permission` from the fake CLI becomes a chat tool
++				// confirmation that blocks the turn. If this times out the session
++				// auto-approved the shell command, which is itself the regression
++				// this test guards against.
++				const banner = await agentsWindow.waitForToolConfirmation(120_000);
++				assert.ok(banner.includes(FAKE_PERMISSION_TOOL_CALL_ID), `Expected the confirmation to gate the tool call "${FAKE_PERMISSION_TOOL_CALL_ID}" (got "${banner}")`);
++
++				await agentsWindow.acceptToolConfirmation();
++
++				// Allowing resumes the parked request and the turn ends. The approved
++				// call's result text is deliberately not asserted: a call admitted while
++				// pending confirmation is created with
++				// `ToolInvocationPresentation.HiddenAfterComplete`
++				// (`stateToProgressAdapter.toolCallStateToInvocation`), so its output
++				// never enters the transcript. The confirmation card itself stays
++				// rendered as the record of the decision, so the contract pinned here is
++				// "the approval affordance appears, and allowing it lets the turn
++				// finish" — waiting for the card to vanish would assert a UI detail that
++				// is not what this test is about.
++				await agentsWindow.waitForActiveResponseSettled(120_000);
++			} catch (error) {
++				await reportFailure(app, logger, 'Agents Window [icode] permission scenario', error);
++			}
++		});
++	});
++
++	describe('Agents Window [icode] restore scenario', () => {
++
++		setupIcodeSuite(logger, { label: 'Agents Window [icode] restore scenario', scenario: 'restore' });
++
++		it('restores the conversation after a window reload', async function () {
++			this.timeout(8 * 60 * 1000);
++			const app = this.app as Application;
++			const agentsWindow = app.workbench.agentsWindow;
++
++			try {
++				await submitIcodePrompt(app, PROMPT);
++				await agentsWindow.waitForAssistantText(FAKE_TEXT, 120_000);
++
++				// Reload only the Agents Window and reopen the session from the
++				// list: the chat is persisted with the provider data (ACP session id
++				// + cwd), so a reload must bring the previous transcript back rather
++				// than an empty conversation.
++				//
++				// The text is the one the live turn rendered (`fake-fake-fake`), not
++				// the `history-*` transcript the `restore` scenario replays for
++				// `session/load`: the workbench rehydrates the chat from its stored
++				// transcript, which takes precedence over the provider's history
++				// backfill for a chat that already has one.
++				await app.code.reloadWindow(() => app.workbench.quickaccess.runCommand('Developer: Reload Window', { match: 'exactLabel', keepOpen: true }));
++
++				// `responseLabel` makes activation wait until the reopened session
++				// actually renders the previous assistant text.
++				await agentsWindow.activateSessionByLabel(PROMPT, FAKE_TEXT, 120_000);
++				const response = await agentsWindow.waitForAssistantText(FAKE_TEXT, 120_000);
++				assert.ok(response.includes(FAKE_TEXT), `Expected the restored session to still render "${FAKE_TEXT}" (got "${response}")`);
++			} catch (error) {
++				await reportFailure(app, logger, 'Agents Window [icode] restore scenario', error);
++			}
++		});
++	});
++}
+
+diff --git a/test/smoke/src/main.ts b/test/smoke/src/main.ts
+index 8c940f9c..02bee7c0 100644
+--- a/test/smoke/src/main.ts
++++ b/test/smoke/src/main.ts
+@@ -35,6 +35,7 @@ import { setup as setupChatSessionsTests } from './areas/chat/chatSessions.test'
+ import { setup as setupChatModelConfigTests } from './areas/chat/chatModelConfig.test';
+ import { setup as setupAccessibilityTests } from './areas/accessibility/accessibility.test';
+ import { setup as setupAgentsWindowTests } from './areas/agentsWindow/agentsWindow.test';
++import { setup as setupIcodeTests } from './areas/agentsWindow/icode.test';
+ import { setup as setupBrowserViewTests } from './areas/browserView/browserView.test';
+ import { setup as setupPolicyTests } from './areas/policy/policy.test';
+ 
+@@ -468,6 +469,10 @@ const smokeTestSuite = describe(`VSCode Smoke Tests (${opts.web ? 'Web' : 'Elect
+ 	if (!opts.web && !opts.remote) { setupChatSessionsTests(logger); }
+ 	if (!opts.web && !opts.remote) { setupChatModelConfigTests(logger); }
+ 	if (!opts.web && !opts.remote) { setupAgentsWindowTests(logger, quality); }
++	// iCode drives its own ACP subprocess, so these suites need no Copilot
++	// account or mock LLM server — only desktop Electron (the fake CLI is
++	// spawned directly, which Windows cannot do; the suite skips itself there).
++	if (!opts.web && !opts.remote) { setupIcodeTests(logger); }
+ 	if (!opts.web && !opts.remote) { setupBrowserViewTests(logger); }
+ 	// Native policy fixtures modify OS state outside the test profile; opt in only on disposable runners so you don't break your own machine.
+ 	if (!opts.web && !opts.remote && process.env.VSCODE_SMOKE_TEST_POLICY === '1') { setupPolicyTests(logger); }

@@ -50,6 +50,9 @@ OUT_DIR="picket-code-linux-$ARCH"
 rm -rf "$OUT_DIR"
 mv "$SRC_DIR" "$OUT_DIR"
 
+echo "==> [picket-code] Verifying the packaged WSL component (flavor: ${PICKET_WSL_PAYLOAD:-ondemand})"
+node "$SCRIPT_DIR/../wsl/check.mjs" --app "$ROOT_DIR/$OUT_DIR/resources/app" --flavor "${PICKET_WSL_PAYLOAD:-ondemand}"
+
 echo "==> [picket-code] Archiving"
 tar czf "$ROOT_DIR/picket-code-linux-$ARCH.tar.gz" "$OUT_DIR"
 

@@ -20,7 +20,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -Command '$f=(Join-Path $PWD "down
 - 脚本从 GitHub raw 拉取（`main` 分支，永远是最新脚本）。
 - WebClient 自动使用系统代理 + 当前 Windows 用户凭据，企业网络可直接下载（已解决 407 代理认证）。
 - 若代理要求单独账号密码：`powershell -NoProfile -ExecutionPolicy Bypass -File .\download-verify.ps1 -ProxyCredential (Get-Credential)`
-- 完成后程序位置：`<当前目录>\picket-code-win32-x64\Picket Code.exe`（压缩包文件名带版本，解压出的顶层目录不带）
+- 完成后程序位置：`<当前目录>\picket-code-win32-x64\code.exe`（压缩包文件名带版本，解压出的顶层目录不带）
 
 **已下载过脚本、只想重新运行**（要指定版本就加 `-Tag`）：
 

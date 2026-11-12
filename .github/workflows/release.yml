@@ -18,6 +18,35 @@ on:
 permissions:
   contents: write
 
+# WSL server component (docs/superpowers/plans/2026-11-04-picket-wsl.md Task 12).
+# Public builds ship the ondemand flavor: the app carries only the component
+# catalog and downloads the payload on first use. Embedded builds (payload
+# inside the app, zero first-use download) are cut by the internal
+# distribution from a checkout that overrides PICKET_WSL_PAYLOAD=embedded.
+# The server is versioned separately from the client, so a build states a floor
+# and a version rather than an exact tag: PICKET_SERVER_MIN_VERSION is the oldest
+# picket-code-server this client accepts, PICKET_SERVER_VERSION is the payload it
+# ships and defaults to the floor, exactly as build.sh does. Only the floor is
+# required: a repository that never set the optional version must not fail — the
+# empty value would otherwise reach fetch-payload.sh and the offline bundle.
+# That repository is public, so the payload is fetched over plain HTTPS and
+# no token is involved. (Setting PICKET_SERVER_TOKEN still switches
+# fetch-payload.sh to `gh`, for a private mirror via PICKET_SERVER_REPO.)
+env:
+  PICKET_WSL_PAYLOAD: ondemand
+  PICKET_SERVER_MIN_VERSION: ${{ vars.PICKET_SERVER_MIN_VERSION }}
+  PICKET_SERVER_VERSION: ${{ vars.PICKET_SERVER_VERSION || vars.PICKET_SERVER_MIN_VERSION }}
+
+# Gate order (docs/testing.md §3.1): the automated test layers run before anything is
+# compiled, packaged or published, so a red layer means no artifacts and no release.
+#   tests     → L1 (iCode + agentHostChangeset) and L2 (fake ACP CLI) + contract checks
+#   tests-ui  → L4 (Electron/Agents Window smoke) + the WSL acceptance matrix
+#               (build/wsl/acceptance.sh --all), tag pushes only: ~40 and ~15 minutes
+# `tests-ui` reports one result for both of its jobs, so a red WSL job blocks the release
+# through the existing `needs.tests-ui.result == 'success'` guards below — no extra
+# condition, and no way for the WSL layer to be skipped into a green state.
+# A reusable-workflow job cannot carry `timeout-minutes`; every job inside tests.yml and
+# tests-ui.yml sets its own, which bounds those jobs.
 jobs:
   # Version resolution first: vscode tag, upstream node version, picket-code version.
   versions:
@@ -57,12 +86,41 @@ jobs:
             echo "picket-code=0.0.0-dev" >> "$GITHUB_OUTPUT"
           fi
 
+  # ---- release gate ---------------------------------------------------------------------
+  # Both jobs reuse the standalone workflows, so a release runs exactly what a PR runs.
+  tests:
+    name: "Tests (contract + L1 + L2 + L3)"
+    needs: versions
+    uses: ./.github/workflows/tests.yml
+    with:
+      # Test the tree this release is built from, not "whatever is newest upstream".
+      vscode_version: ${{ needs.versions.outputs.vscode }}
+
+  # 35–45 minutes for the UI job plus ~15 for the WSL matrix: only worth it when
+  # something is about to be published.
+  tests-ui:
+    name: "Tests (L4 UI smoke + WSL acceptance)"
+    needs: versions
+    if: startsWith(github.ref, 'refs/tags/')
+    uses: ./.github/workflows/tests-ui.yml
+    with:
+      vscode_version: ${{ needs.versions.outputs.vscode }}
+    secrets:
+      # The WSL job installs the noware-cn/picket-code-server payload, which is
+      # public and needs no credential. A reusable workflow still only sees the
+      # secrets the caller names, so the optional token is forwarded for the
+      # private-mirror case; the version travels through the repository variables.
+      PICKET_SERVER_TOKEN: ${{ secrets.PICKET_SERVER_TOKEN }}
+
   # Compile stage: clone + patch + npm ci + upstream min build, then ship the
   # vscode/ tree + built VSCode-<plat>-<arch> as vscode.tar.gz. Mirrors
   # VSCodium's compile job; no packaging happens here.
   compile:
     name: "Compile ${{ matrix.platform }}-${{ matrix.arch }}"
-    needs: versions
+    needs: [versions, tests, tests-ui]
+    # The gate: nothing is built unless the test layers passed. `tests-ui` only runs on
+    # tag pushes, so a manual (non-tag) dispatch is gated by `tests` alone.
+    if: ${{ !cancelled() && needs.tests.result == 'success' && (needs.tests-ui.result == 'success' || needs.tests-ui.result == 'skipped') }}
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -116,7 +174,10 @@ jobs:
   # picket-code-*, archives, checksums. Mirrors VSCodium's package jobs.
   package:
     name: "Package ${{ matrix.platform }}-${{ matrix.arch }}"
-    needs: [versions, compile]
+    needs: [versions, compile, tests, tests-ui]
+    # Same gate as compile; listed here too so the dependency is explicit in the graph
+    # instead of only transitive.
+    if: ${{ !cancelled() && needs.tests.result == 'success' && (needs.tests-ui.result == 'success' || needs.tests-ui.result == 'skipped') }}
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -146,6 +207,27 @@ jobs:
         shell: bash
         run: |
           bash build/${{ matrix.platform }}/package.sh "${{ matrix.platform }}" "${{ matrix.arch }}"
+
+      # The offline component bundle is platform-independent (a Linux server
+      # payload plus metadata), so it is built once, in the win32 job only —
+      # WSL is a Windows-host scenario and duplicate artifact names collide.
+      # The payload's commit is read from the packaged app: that is the value the
+      # client stamps, so the bundle's catalog must carry the same one.
+      - name: Offline WSL component bundle
+        if: matrix.platform == 'win32'
+        shell: bash
+        run: |
+          APP="picket-code-win32-${{ matrix.arch }}/resources/app"
+          export PICKET_SERVER_COMMIT="$(node -e 'process.stdout.write(JSON.parse(require("fs").readFileSync(process.argv[1], "utf8")).commit ?? "")' "$APP/product.json")"
+          if [ -z "$PICKET_SERVER_COMMIT" ]; then
+            echo "the packaged product.json carries no commit" >&2
+            exit 1
+          fi
+          bash build/wsl/fetch-payload.sh "$PICKET_SERVER_VERSION"
+          node build/wsl/offline-bundle.mjs \
+            --dir build/wsl/download --version "$PICKET_SERVER_VERSION" \
+            --min-version "$PICKET_SERVER_MIN_VERSION" \
+            --out "picket-code-${{ github.ref_name }}-offline-wsl.zip"
 
       # The archives leave package.sh under a version-less name so the checks below
       # can address one stable directory. Published files, however, carry the tag:
@@ -231,21 +313,42 @@ jobs:
         if: matrix.platform == 'win32'
         shell: pwsh
         run: |
-          $root = Join-Path $env:GITHUB_WORKSPACE "picket-code-win32-x64"
-          $exe = (Get-ChildItem "$root\*.exe" | Where-Object {
-            $_.Name -notmatch 'ffmpeg|elevate|crashpad' } | Select-Object -First 1).FullName
-          $logs = "$env:APPDATA\Picket Code\logs"
-          Remove-Item $logs -Recurse -Force -ErrorAction SilentlyContinue
-          $p = Start-Process -FilePath $exe -ArgumentList '--verbose' -PassThru
+          $root = Join-Path $env:GITHUB_WORKSPACE "picket-code-win32-${{ matrix.arch }}"
+          # build/win32/rename-exe.mjs is what puts the launcher here; if it did not
+          # run, the release would ship the long name and break every documented
+          # command, so assert the contract before starting anything.
+          $exe = Join-Path $root "code.exe"
+          if (-not (Test-Path $exe)) {
+            "no launcher at $exe - build/win32/rename-exe.mjs did not run"
+            exit 1
+          }
+          # An explicit profile keeps the log directory a property of this step rather
+          # than of product.json's nameShort. When nameShort moved from "Picket Code" to
+          # "picket-code" the logs followed it, the scan below found nothing, and this
+          # gate reported success without reading a single log line.
+          $profile = Join-Path $env:RUNNER_TEMP "smoke-profile"
+          Remove-Item $profile -Recurse -Force -ErrorAction SilentlyContinue
+          # Quoted: Start-Process joins these with spaces and does not quote them itself.
+          $appArgs = @('--verbose', "--user-data-dir=`"$profile`"")
+          $p = Start-Process -FilePath $exe -ArgumentList $appArgs -PassThru
           Start-Sleep -Seconds 55
+          $logs = Join-Path $profile "logs"
           $hits = @()
+          $logFiles = @()
           if (Test-Path $logs) {
-            $hits = Get-ChildItem $logs -Recurse -Filter *.log -ErrorAction SilentlyContinue |
+            $logFiles = @(Get-ChildItem $logs -Recurse -Filter *.log -ErrorAction SilentlyContinue)
+            $hits = $logFiles |
               Select-String -Pattern 'ERR_INVALID_PACKAGE_CONFIG|Invalid package config|Uncaught Exception|Could not locate the bindings file|Cannot find module|is not iterable|Error scanning installed extensions|reading .extensionId'
           }
           Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
           if ($hits) {
             $hits | ForEach-Object { "HIT: " + $_.Line.Trim() }
+            exit 1
+          }
+          # No logs means the app either never started or ignored --user-data-dir; both
+          # leave the scan above with nothing to look at, so neither may pass.
+          if ($logFiles.Count -eq 0) {
+            "no log files under ${logs}: the packaged app did not start (or ignored --user-data-dir)"
             exit 1
           }
           "no packaging errors in app logs"
@@ -268,13 +371,16 @@ jobs:
           name: picket-code-${{ matrix.platform }}-${{ matrix.arch }}
           path: |
             picket-code-${{ github.ref_name }}-${{ matrix.platform }}-${{ matrix.arch }}.*
+            picket-code-${{ github.ref_name }}-offline-wsl.zip
             SHA256SUMS-${{ matrix.platform }}-${{ matrix.arch }}
           if-no-files-found: error
 
   release:
     name: Publish GitHub Release
-    needs: package
-    if: startsWith(github.ref, 'refs/tags/')
+    needs: [package, tests, tests-ui]
+    # Publishing is impossible unless every layer passed: the tag-only L4 job must be
+    # green here, not merely skipped, because a tag build is what users download.
+    if: ${{ !cancelled() && startsWith(github.ref, 'refs/tags/') && needs.package.result == 'success' && needs.tests.result == 'success' && needs.tests-ui.result == 'success' }}
     runs-on: ubuntu-latest
     steps:
       # `gh release view/edit` shell out to git when they cannot resolve the repo
@@ -283,8 +389,11 @@ jobs:
         with:
           fetch-depth: 1
 
+      # Only the final deliverables: the vscode-* compile intermediates are not published
+      # and pulling them here just cost disk and time.
       - uses: actions/download-artifact@v8
         with:
+          pattern: picket-code-*
           path: artifacts
           merge-multiple: true
 
@@ -295,6 +404,32 @@ jobs:
           cat artifacts/SHA256SUMS-* > "artifacts/picket-code-${{ github.ref_name }}-SHA256SUMS"
           cat "artifacts/picket-code-${{ github.ref_name }}-SHA256SUMS"
 
+      # The JUnit XML from the gate jobs, merged into one directory: L1/L2/L3 from
+      # tests.yml (test-results-unit, test-results-acp-process, test-results-host-e2e),
+      # L4 from tests-ui.yml (test-results-ui) and the WSL smoke area from the same
+      # workflow (test-results-wsl).
+      - name: Download the test reports (L1–L4)
+        uses: actions/download-artifact@v8
+        with:
+          pattern: test-results-*
+          path: test-report
+          merge-multiple: true
+
+      # Zero-dependency script, so the runner's own node is enough here.
+      - name: Summarize the test reports (JUnit → Markdown)
+        shell: bash
+        run: |
+          echo "==> node build/test/summarize.mjs --dir test-report"
+          node build/test/summarize.mjs --dir test-report
+
+      - name: Package the test report
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "==> tar -czf test-report-${{ github.ref_name }}.tar.gz test-report"
+          tar -czf "test-report-${{ github.ref_name }}.tar.gz" test-report
+          ls -l "test-report-${{ github.ref_name }}.tar.gz"
+
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
@@ -303,7 +438,11 @@ jobs:
           # The versioned names (archives + checksums) all start with `picket-code-`.
           files: |
             artifacts/picket-code-*
-          prerelease: ${{ github.event.inputs.pre_release == 'true' }}
+            test-report-*.tar.gz
+          # A tag push carries no inputs, so the manual `pre_release` switch alone made
+          # every `-rc.N` tag publish as a full release competing for the Latest badge.
+          # The tag name decides; the switch only adds to it.
+          prerelease: ${{ github.event.inputs.pre_release == 'true' || contains(github.ref_name, '-rc.') }}
           generate_release_notes: true
 
       # Put the mirror links on top of the generated notes; the script is shared with

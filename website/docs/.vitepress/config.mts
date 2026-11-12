@@ -19,6 +19,12 @@ export default defineConfig({
       },
     ],
     ['meta', { property: 'og:type', content: 'website' }],
+    // Absolute URLs: several crawlers will not resolve a relative og:image.
+    ['meta', { property: 'og:image', content: 'https://picket-code.noware.cn/og-image.png' }],
+    ['meta', { property: 'og:image:width', content: '1200' }],
+    ['meta', { property: 'og:image:height', content: '630' }],
+    ['meta', { property: 'og:image:alt', content: 'Picket Code' }],
+    ['meta', { name: 'twitter:card', content: 'summary_large_image' }],
   ],
 
   cleanUrls: true,

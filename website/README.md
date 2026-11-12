@@ -22,6 +22,7 @@
 │   ├── architecture/         # 架构与安全：设计总览 / AgentHost / 合规
 │   └── project/              # 项目：路线图 / 许可
 ├── public/                   # 独立徽记 favicon.svg + 横版字标 logo.svg / logo-light.svg
+│                             # + 社交分享图 og-image.png（docs/public 下为同一份副本）
 └── deploy/                   # Cloudflare Pages / R2 部署说明与示例
 ```
 

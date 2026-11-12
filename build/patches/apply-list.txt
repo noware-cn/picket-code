@@ -1,48 +1,3 @@
-# apply-list.txt — git apply patches enabled for the current pinned upstream tag.
-#
-# One filename per line (relative to build/patches/). Lines starting with '#'
-# are comments. A listed patch MUST apply cleanly, otherwise build.sh aborts.
-#
-# Status (2026-10-27, upstream tag 1.143.1 = e646868227c, verified forward on a clean tree):
-#   - 52-ext-copilot-remove-it.json  : ENABLED (JSON actions, applied automatically)
-#   - 53-ext-copilot-remove-it.patch : ENABLED — Copilot/agentHost reference cleanup
-#     (28 modified + 2 deleted files), verified forward on a clean worktree.
-#   - 54-picket-code-disable-node-compile-cache.patch : ENABLED (build reproducibility)
-#   - 55 : RETIRED (file deleted). It unpacked 30 packages from node_modules.asar
-#     to dodge the writer race that patch 56 now fixes; upstream's 11-entry list
-#     is sufficient again, so `.asar.unpacked` stays small.
-#   - 56 : serialize `Filesystem.insertFile` in build/lib/asar.ts (asar 3.2.0
-#     hands concurrent inserts the same offset, which silently corrupts ~20% of
-#     the entries on the Windows build host; `tar/package.json` read back as a
-#     LICENSE text and the agent host failed to start).
-#   - 57 : agent host boots without the Copilot packages. `copilotApiService.ts`
-#     splits into `copilotApiTypes.ts` (DI seam, no Copilot imports) and
-#     `copilotApiServiceImpl.ts` (dead in this build), `localModelSetupTypes.ts`
-#     holds the local-model seam, and `noCopilotServices.ts` supplies the no-op
-#     registrations that replace the Copilot-backed implementations.
-#   - 61 : build-script adaptations (dirs.ts / gulpfile filters, AppX + signtool
-#     tolerance, built-in extensions from GitHub). Supersedes patch-vscode.py.
-#   - 58 : the workbench runs with a `product.json` that has no `defaultChatAgent`.
-#     `defaultAccount.ts` returns a neutral config, skips registering the
-#     default-account provider and releases the waiters that would otherwise block
-#     on it forever; the onboarding wizard stays closed instead of asserting at
-#     import time; the chat welcome text, the chat status dashboard, the chat
-#     status bar entry and the extension-management "is this the chat extension?"
-#     checks treat a missing agent as "no chat extension" rather than dereferencing
-#     `undefined`; the Getting Started Copilot step never renders; the terminal
-#     keeps the plain "install commands in PATH" entry instead of a `copilot`
-#     shim we do not ship; the settings page no longer lists the chat extension as
-#     a recommended entry. 13 files.
-#   - 59 : the chat surfaces stop waiting for services this build does not ship.
-#     Dictation no longer asks for GitHub sessions when the provider cannot be
-#     registered (that was a 10s wait on every start); the Voice Mode contribution
-#     and its input-mode actions are no longer loaded, so `agentsVoice.*` commands
-#     and the cloud-dictation entry point disappear while on-device dictation
-#     stays; the welcome page no longer opens on startup, its agents banner never
-#     offers a sign-in that cannot complete, and the two "Get started with VS Code"
-#     cards are gone; the agent host stops registering a reverse BYOK bridge for
-#     the Electron main-process connection, which logged
-#     `Unknown channel: agentHostClientByokLm` on every start. 10 files.
 53-ext-copilot-remove-it.patch
 54-picket-code-disable-node-compile-cache.patch
 56-asar-serialize-inserts.patch
@@ -50,3 +5,10 @@
 58-agenthost-clean-product-config.patch
 59-voice-welcome-byok.patch
 61-build-source-adaptations.patch
+62-chat-default-agent-fallback.patch
+63-agenthost-icode-provider.patch
+64-changeset-auto-diff-strategy.patch
+65-icode-smoke-tests.patch
+66-gallery-no-account.patch
+67-picket-remote-wsl.patch
+68-picket-brand-icons.patch

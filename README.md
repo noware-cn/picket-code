@@ -26,6 +26,13 @@ MVP 范围（当前发行）：**Linux (x64)** 与 **Windows (x64)**——`tar.g
 
 Windows 上还可在 WSL2 发行版里做远程开发：需自行侧载微软 Remote-WSL 并手工预置服务端载荷，**仅限个人自用**，步骤与许可边界见 [docs/manual-remote-wsl.md](docs/manual-remote-wsl.md)。
 
+## 参与开发
+
+- 分支模型、保护规则，以及"哪些事 AI 可以自己定、哪些必须人签字"：[docs/branching.md](docs/branching.md)
+- 六层测试矩阵、GitHub Actions 能覆盖到哪一层、发布测试报告与人工验收清单：[docs/testing.md](docs/testing.md)
+- 每次发布的人工验收步骤：[docs/release-checklist.md](docs/release-checklist.md)
+- 发行版与上游的差异（补丁清单）：[build/patches/README.md](build/patches/README.md)
+
 ## 快速开始
 
 当前发行版 **v1.143.1**（上游 VS Code `1.143.1`）。发行包文件名带版本号，推荐从镜像站下载（国内访问更快）：
@@ -41,7 +48,7 @@ curl -fSL https://download.noware.cn/picket-code-v1.143.1-SHA256SUMS -o SHA256SU
 sha256sum -c --ignore-missing SHA256SUMS
 ```
 
-解压后运行 `picket-code`（Linux）或 `Picket Code.exe`（Windows）；归档内的顶层目录不含版本号，仍是 `picket-code-win32-x64/`（Windows）与 `picket-code-linux-x64/`（Linux）。
+解压后运行 `picket-code`（Linux）或 `code.exe`（Windows）；归档内的顶层目录不含版本号，仍是 `picket-code-win32-x64/`（Windows）与 `picket-code-linux-x64/`（Linux）。Windows 可执行文件名为 `code.exe`（`v1.143.1-picket.1-rc.8` 起；更早的 RC 叫 `Picket Code.exe`）。用户配置与数据在 `%APPDATA%\picket-code`（Windows）、`~/.config/picket-code`（Linux），路径不含空格。
 
 - 镜像保留最近 **3 个版本**，更早的版本不承诺长期可下载；
 - 旧的无版本 URL（`/picket-code-win32-x64.zip`、`/SHA256SUMS`）已废弃，不提供兼容，访问返回 404；
