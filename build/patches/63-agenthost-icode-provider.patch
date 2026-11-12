@@ -455,10 +455,10 @@ index 00000000..7febc833
 +}
 diff --git a/src/vs/platform/agentHost/node/icode/icodeAgent.ts b/src/vs/platform/agentHost/node/icode/icodeAgent.ts
 new file mode 100644
-index 00000000..a7fa50d8
+index 00000000..6992e6cc
 --- /dev/null
 +++ b/src/vs/platform/agentHost/node/icode/icodeAgent.ts
-@@ -0,0 +1,1064 @@
+@@ -0,0 +1,1074 @@
 +/*---------------------------------------------------------------------------------------------
 + *  Copyright (c) Microsoft Corporation. All rights reserved.
 + *  Licensed under the MIT License. See License.txt in the project root for license information.
@@ -679,6 +679,8 @@ index 00000000..a7fa50d8
 +	private readonly _activePrompts = new Map<string, Promise<void>>();
 +	/** Turns the host cancelled before they had a session to send `session/cancel` to. */
 +	private readonly _cancelledTurns = new Set<string>();
++	/** Chats whose live turn has already sent its prompt, so `abort` can cancel it directly. */
++	private readonly _promptingChats = new Set<string>();
 +	/** Live turns by turn id, so a process exit can report each one with its duration. */
 +	private readonly _liveTurns = new Map<string, { readonly chat: URI; readonly startedAt: number }>();
 +	/** Permission requests waiting for the host's answer, keyed by host tool call id. */
@@ -791,15 +793,19 @@ index 00000000..a7fa50d8
 +			// the host's approval card — alive even after the session is cancelled.
 +			this._cancelPendingInputs(key => key === chatKey);
 +			this._cancelPendingPermissions(key => key === chatKey);
++			// Decide by what this turn has done, not by which session is cached: a
++			// turn that moved to another directory is still waiting for its own
++			// `session/new` while the chat's previous session is still on record,
++			// and cancelling that idle one leaves the new turn running. The turn
++			// honours the recorded cancel as soon as it has a session of its own.
++			if (this._activePrompts.has(chatKey) && !this._promptingChats.has(chatKey)) {
++				this._cancelledTurns.add(chatKey);
++				this._logService.trace(`[icode] abort recorded: ${chatKey} has not prompted yet`);
++				return Promise.resolve();
++			}
 +			const session = this._sessions.get(chatKey);
 +			const entry = session && this._clients.get(session.cwd);
 +			if (!session || !entry) {
-+				// The stop button is live before iCode answers `session/new`, so this
-+				// turn may have no session to cancel yet. Remember the cancel: the
-+				// turn honours it once it has a session instead of running anyway.
-+				if (this._activePrompts.has(chatKey)) {
-+					this._cancelledTurns.add(chatKey);
-+				}
 +				this._logService.trace(`[icode] abort ignored: no live session for ${chatKey}`);
 +				return Promise.resolve();
 +			}
@@ -1071,6 +1077,9 @@ index 00000000..a7fa50d8
 +
 +		this._liveTurns.set(turnId, { chat, startedAt });
 +		try {
++			// From here on the turn owns a session, so `abort` cancels it directly
++			// instead of recording the cancel for this check.
++			this._promptingChats.add(chatKey);
 +			let result: IIcodePromptResult | undefined;
 +			try {
 +				result = await client.request<IIcodePromptResult>('session/prompt', {
@@ -1107,6 +1116,7 @@ index 00000000..a7fa50d8
 +					break;
 +			}
 +		} finally {
++			this._promptingChats.delete(chatKey);
 +			this._turns.delete(chatKey);
 +			this._liveTurns.delete(turnId);
 +		}
@@ -3596,10 +3606,10 @@ index 00000000..70b5683a
 +});
 diff --git a/src/vs/platform/agentHost/test/node/icode/icodeAgent.test.ts b/src/vs/platform/agentHost/test/node/icode/icodeAgent.test.ts
 new file mode 100644
-index 00000000..82b6fad0
+index 00000000..d1391c3d
 --- /dev/null
 +++ b/src/vs/platform/agentHost/test/node/icode/icodeAgent.test.ts
-@@ -0,0 +1,1133 @@
+@@ -0,0 +1,1165 @@
 +/*---------------------------------------------------------------------------------------------
 + *  Copyright (c) Microsoft Corporation. All rights reserved.
 + *  Licensed under the MIT License. See License.txt in the project root for license information.
@@ -3908,6 +3918,38 @@ index 00000000..82b6fad0
 +		// there — but the turn still has to end, exactly once.
 +		assert.deepStrictEqual(client.notifications, []);
 +		assert.strictEqual((signals[signals.length - 1] as IAgentActionSignal).action.type, ActionType.ChatTurnCancelled);
++		agent.dispose();
++	});
++
++	test('abort while the turn is still starting its process stops it', async () => {
++		const client = new FakeIcodeClient();
++		const other = tempDirectory('icode-other-');
++		let release!: () => void;
++		const gate = new Promise<void>(resolve => { release = resolve; });
++		const agent = new IcodeAgent(new NullLogService(), async cwd => {
++			if (cwd !== workspace.fsPath) {
++				await gate;
++			}
++			return client;
++		});
++
++		// The chat gets a session in the first directory.
++		const first = agent.chats.sendMessage(chat, 'hello', [workspace], undefined, 'turn-1');
++		await timeout(10);
++		client.finishPrompt({ stopReason: 'end_turn' });
++		await first;
++
++		// The next turn opens in another directory, so it waits for that
++		// directory's process while the chat still holds the first session.
++		const second = agent.chats.sendMessage(chat, 'again', [URI.file(other)], undefined, 'turn-2');
++		await timeout(10);
++		await agent.chats.abort(chat, chat);
++		release();
++		await second;
++
++		assert.deepStrictEqual(client.requests.map(r => r.method), ['session/new', 'session/prompt', 'session/new']);
++		// Cancelling the idle first session would have left this turn running.
++		assert.deepStrictEqual(client.notifications, []);
 +		agent.dispose();
 +	});
 +
