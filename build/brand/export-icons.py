@@ -3,10 +3,17 @@
 
 The emblem is pure geometry (four corner modules plus a central diamond), so it
 is drawn here directly instead of rasterizing favicon.svg: no SVG renderer, no
-text, and identical output on any machine with Pillow.
+text, and identical output on any machine with Pillow. The OG banner is the one
+exception — it embeds the traced wordmark, so that file is rendered through
+ImageMagick.
 
 Usage:
   uv run --with pillow python build/brand/export-icons.py
+
+Prerequisites: Pillow (the command above installs it) and ImageMagick on PATH
+(`magick`, or `convert` from the 6.x line) for the wordmark. The script checks
+for ImageMagick before the first write, so a missing renderer leaves every file
+untouched instead of half-updated.
 
 Writes (paths relative to the repository root):
   vscode/resources/win32/code.ico              16..256, flat plate
@@ -162,7 +169,27 @@ def write_browser_icons(directory: pathlib.Path) -> None:
     write_png(directory / "code-512.png", 512)
 
 
-def write_og_image(path: pathlib.Path, logo: pathlib.Path) -> None:
+def imagemagick() -> list[str]:
+    """The ImageMagick entry point, or a stop taken before anything is written.
+
+    Pillow draws every icon; only the OG banner needs the traced wordmark, and
+    rasterizing an outlined SVG without a real renderer is not worth it.
+    """
+    import shutil
+    for name in ("magick", "convert"):
+        found = shutil.which(name)
+        if found:
+            return [found]
+    raise SystemExit(
+        "ImageMagick is required to render website/public/logo.svg; nothing was written.\n"
+        "Install it and re-run:\n"
+        "  Debian/Ubuntu: sudo apt-get install -y imagemagick\n"
+        "  macOS:         brew install imagemagick\n"
+        "  Windows:       winget install ImageMagick.ImageMagick"
+    )
+
+
+def write_og_image(path: pathlib.Path, logo: pathlib.Path, magick: list[str]) -> None:
     """1200x630 banner: the wordmark (already outlined) on deep navy.
 
     The wordmark is the only asset that is not pure geometry, so it goes through
@@ -174,7 +201,7 @@ def write_og_image(path: pathlib.Path, logo: pathlib.Path) -> None:
     width, height = 1200, 630
     canvas = Image.new("RGBA", (width, height), PLATE)
     result = subprocess.run(
-        ["convert", "-background", "none", "-density", "192", str(logo), "png:-"],
+        [*magick, "-background", "none", "-density", "192", str(logo), "png:-"],
         capture_output=True,
     )
     if result.returncode != 0 or not result.stdout:
@@ -193,6 +220,10 @@ def main() -> None:
     root = args.repo_root
     vscode = root / "vscode"
 
+    # Resolved before the first write: without a renderer the run would refresh
+    # every icon and then stop, leaving both sharing images stale.
+    magick = imagemagick()
+
     write_ico(vscode / "resources/win32/code.ico")
     print("wrote", vscode / "resources/win32/code.ico")
     write_png(vscode / "resources/win32/code_70x70.png", 70)
@@ -206,7 +237,7 @@ def main() -> None:
     print("wrote the web workbench icons (favicon.ico, code-192, code-512)")
     write_png(vscode / "extensions/picket-remote-wsl/resources/icon.png", 128)
     print("wrote the extension icon")
-    write_og_image(root / "website/public/og-image.png", root / "website/public/logo.svg")
+    write_og_image(root / "website/public/og-image.png", root / "website/public/logo.svg", magick)
     print("wrote", root / "website/public/og-image.png")
     # VitePress serves docs/public, so the site needs its own byte-identical copy.
     (root / "website/docs/public/og-image.png").write_bytes((root / "website/public/og-image.png").read_bytes())

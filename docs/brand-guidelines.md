@@ -42,6 +42,15 @@ GitHub 的 camo 代理下渲染一致。改动字样或字距时用
 而由 `build/brand/export-icons.py` 直接绘制并导出所有位图。改动徽记后重跑
 该脚本，不要手工编辑下列文件：
 
+```
+uv run --with pillow python build/brand/export-icons.py
+```
+
+前置条件：脚本自身只需要 Pillow（上面的命令会装好），但 `og-image.png` 里的
+横版字标是描边 SVG，需要 PATH 上有 ImageMagick（`magick`，或 6.x 的 `convert`）。
+脚本在写第一个文件之前就检查它，缺了会直接报错退出，不会留下“图标已更新、
+分享图为旧”的半成品。
+
 | 产物 | 规格 |
 |---|---|
 | `vscode/resources/win32/code.ico` | 16/24/32/48/64/128/256，圆角 17.5%，透明圆角外 |
