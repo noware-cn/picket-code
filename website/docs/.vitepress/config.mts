@@ -26,7 +26,10 @@ export default defineConfig({
 
   themeConfig: {
     appearance: 'force-dark',
-    logo: '/logo.svg',
+    // The wordmark (logo.svg) is 760x180 and already spells the name, so VitePress
+    // would draw it at 24px tall next to a second "Picket Code" from siteTitle.
+    // The nav takes the square emblem and keeps the text title.
+    logo: '/favicon.svg',
     siteTitle: 'Picket Code',
 
     nav: [

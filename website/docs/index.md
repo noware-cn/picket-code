@@ -6,7 +6,9 @@ hero:
   text: 面向 AI 编码 agent 的加固版 VS Code 发行版
   tagline: 受控扩展 · 私有模型网关 · 按项目沙箱。默认离线、无遥测、无账号绑定，AgentHost 为 iCode 预留一等接入点 —— 为银行 / 信创内网而生的可信 IDE。
   image:
-    src: /logo.svg
+    # VitePress sizes the hero image for a square; the wordmark belongs in wide
+    # slots (README, banners), so the emblem sits next to the hero title.
+    src: /favicon.svg
     alt: Picket Code
   actions:
     - theme: brand
