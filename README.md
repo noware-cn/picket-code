@@ -1,5 +1,8 @@
 <div align="center">
-  <img src="website/docs/public/logo-light.svg" alt="Picket Code" width="520" />
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="website/docs/public/logo.svg" />
+    <img src="website/docs/public/logo-light.svg" alt="Picket Code" width="520" />
+  </picture>
 </div>
 
 # Picket Code
