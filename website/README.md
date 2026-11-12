@@ -21,7 +21,7 @@
 │   ├── guide/                # 指南：快速开始 / 下载 / 构建 / 扩展 / 发行
 │   ├── architecture/         # 架构与安全：设计总览 / AgentHost / 合规
 │   └── project/              # 项目：路线图 / 许可
-├── public/                   # logo.svg / favicon.svg
+├── public/                   # 独立徽记 favicon.svg + 横版字标 logo.svg / logo-light.svg
 └── deploy/                   # Cloudflare Pages / R2 部署说明与示例
 ```
 
