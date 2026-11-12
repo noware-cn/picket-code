@@ -94,21 +94,11 @@ jobs:
       - uses: actions/setup-python@v7
         with:
           python-version: "3.11"
-      - uses: actions/setup-node@v6
-        with:
-          node-version: "22"
       - name: Run the release contract checks
         shell: bash
         run: |
           echo "==> bash build/check-contract.sh"
           bash build/check-contract.sh
-      # The icons are binaries nobody reads: a re-merge with upstream can restore
-      # the VS Code logo without any test noticing. This reads the frame tables.
-      - name: Check the shipped brand assets
-        shell: bash
-        run: |
-          echo "==> node build/brand/check-assets.mjs"
-          node build/brand/check-assets.mjs
 
   # The suites build/wsl/gate.sh gates WSL packaging on. They import the extension's
   # sources out of the patched tree, so they need `vscode/` (but not node_modules or
@@ -142,6 +132,15 @@ jobs:
           # Node version accepts, while a quoted glob needs newer runners.
           echo '==> node --test build/wsl/test/*.test.mjs build/win32/test/*.test.mjs'
           node --test build/wsl/test/*.test.mjs build/win32/test/*.test.mjs
+
+      # The icons under vscode/resources are binaries nobody reads: a re-merge with
+      # upstream can restore the VS Code logo without any suite noticing. This reads
+      # their frame tables and hashes, so it has to run against the patched tree.
+      - name: Check the shipped brand assets
+        shell: bash
+        run: |
+          echo "==> node build/brand/check-assets.mjs"
+          node build/brand/check-assets.mjs
 
   # One npm ci and one transpile for every layer. Cache key: upstream tag + hash of the
   # patched package-lock.json + digest of build/patches and build/product.json, so a
