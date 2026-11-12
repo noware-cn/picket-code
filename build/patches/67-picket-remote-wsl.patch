@@ -837,7 +837,7 @@ index 00000000..45983e00
 +module.exports = { loadCatalog };
 diff --git a/extensions/picket-remote-wsl/src/commands.js b/extensions/picket-remote-wsl/src/commands.js
 new file mode 100644
-index 00000000..82a32073
+index 00000000..71c2f7af
 --- /dev/null
 +++ b/extensions/picket-remote-wsl/src/commands.js
 @@ -0,0 +1,553 @@
@@ -1040,7 +1040,7 @@ index 00000000..82a32073
 +		if (chosen?.scheme === 'vscode-remote') {
 +			return chosen.path;
 +		}
-+		const candidate = raw.startsWith('/') ? raw : String(chosen?.path ?? raw);
++		const candidate = String(raw || chosen?.path || '').replace(/^\/(?=[A-Za-z]:[\\/])/, '');
 +		if (candidate.startsWith('/')) {
 +			return candidate;
 +		}
@@ -5566,10 +5566,10 @@ index 00000000..1d666a4e
 +});
 diff --git a/extensions/picket-remote-wsl/test/commands.test.js b/extensions/picket-remote-wsl/test/commands.test.js
 new file mode 100644
-index 00000000..50f9abe8
+index 00000000..b4732805
 --- /dev/null
 +++ b/extensions/picket-remote-wsl/test/commands.test.js
-@@ -0,0 +1,325 @@
+@@ -0,0 +1,327 @@
 +// RED first: this file must fail until src/commands.js exists.
 +const test = require('node:test');
 +const assert = require('node:assert');
@@ -5735,9 +5735,11 @@ index 00000000..50f9abe8
 +});
 +
 +test('a Windows path chosen in the dialog is translated by wslpath', async () => {
++	// A real file URI for C:\project has fsPath "C:\project" and path
++	// "/c:/project": the leading slash is URI syntax, not a POSIX root.
 +	const ctx = harness({
 +		state: 'installed',
-+		host: { quickPick: 'Ubuntu-24.04', openDialog: [{ path: 'C:\\project', fsPath: 'C:\\project', scheme: 'file' }] }
++		host: { quickPick: 'Ubuntu-24.04', openDialog: [{ path: '/c:/project', fsPath: 'C:\\project', scheme: 'file' }] }
 +	});
 +	await ctx.commands.openFolder();
 +	assert.ok(ctx.calls.some(args => args.join(' ').includes('wslpath -u')), 'expected a wslpath translation');
