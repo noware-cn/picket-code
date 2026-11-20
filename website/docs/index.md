@@ -3,7 +3,7 @@ layout: home
 
 hero:
   name: Picket Code
-  text: 面向 AI 编码 agent 的加固版 VS Code 发行版
+  text: 面向 AI 编码 agent 的加固版 Code-OSS 发行版
   tagline: 受控扩展 · 私有模型网关 · 按项目沙箱。默认离线、无遥测、无账号绑定，AgentHost 为 iCode 预留一等接入点 —— 为银行 / 信创内网而生的可信 IDE。
   image:
     # VitePress sizes the hero image for a square; the wordmark belongs in wide
@@ -19,7 +19,7 @@ hero:
       link: /guide/quickstart
     - theme: alt
       text: GitHub 仓库
-      link: https://github.com/dantesun/picket-code
+      link: https://github.com/noware-cn/picket-code
 ---
 
 <div class="pc-section">
@@ -151,7 +151,7 @@ hero:
   <div class="pc-step">
     <span class="pc-step-no">1</span>
     <h3>下载发行包</h3>
-    <p>从镜像站 <a href="https://download.noware.cn/picket-code-v1.143.1-win32-x64.zip"><code>download.noware.cn</code></a>（或 <a href="https://github.com/dantesun/picket-code/releases">GitHub Releases</a>）获取对应平台的 <code>tar.gz</code> / <code>zip</code>，脚本自动完成 SHA256 校验。<a href="/guide/download">下载页</a> 有完整地址与校验命令。</p>
+    <p>从镜像站 <a href="https://download.noware.cn/picket-code-v1.143.1-win32-x64.zip"><code>download.noware.cn</code></a>（或 <a href="https://github.com/noware-cn/picket-code/releases">GitHub Releases</a>）获取对应平台的 <code>tar.gz</code> / <code>zip</code>，脚本自动完成 SHA256 校验。<a href="/guide/download">下载页</a> 有完整地址与校验命令。</p>
   </div>
   <div class="pc-step">
     <span class="pc-step-no">2</span>
@@ -160,8 +160,8 @@ hero:
   </div>
   <div class="pc-step">
     <span class="pc-step-no">3</span>
-    <h3>模型 BYO（待接入）</h3>
-    <p>模型一律自带（BYO），推荐指向自托管网关（如 LiteLLM）。当前发行版尚无 agent 后端，iCode 适配层（P3–P4）落地后模型配置才真正生效。</p>
+    <h3>模型 BYO</h3>
+    <p>模型一律自带（BYO），推荐指向自托管网关（如 LiteLLM）。iCode 经 ACP 接入为唯一 agent：<code>icode</code> 可解析时自动注册，会话、审批与 diff 预览都在 Agents Window 内完成。</p>
   </div>
 </div>
 
@@ -170,7 +170,7 @@ hero:
 <div class="pc-section">
 
 <h2 class="pc-title">平台支持与 <span>下载</span></h2>
-<p class="pc-sub">当前发行：Linux (x64) 与 Windows (x64)，tar.gz 与 zip 压缩包；macOS 与 ARM64 在 P0 验证闭环后加入。下载走 <code>https://download.noware.cn</code>（保留最近 3 个版本，更早的版本不承诺长期可下载）。</p>
+<p class="pc-sub">当前发行：Linux (x64) 与 Windows (x64)，tar.gz 与 zip 压缩包；macOS 与 ARM64 在 P0 验证闭环后加入。下载走 <code>https://download.noware.cn</code>（保留最近 3 个版本，更早的版本不承诺长期可下载）。Windows 版可直接打开 WSL 发行版里的目录（内置 <code>picket-remote-wsl</code>，服务端组件首次使用时按需下载）。预发行版（RC）在 GitHub Releases 上以 <code>-rc.N</code> 标签发布，标注为 Pre-release，资产名同样带标签。</p>
 
 <div class="pc-dl-grid">
   <div class="pc-dl-card">
@@ -224,7 +224,7 @@ hero:
     <p>下载 v1.143.1，或在 GitHub 上查看源码、提交 Issue、参与路线图。</p>
     <div class="pc-cta-actions">
       <a class="primary" href="/guide/download">下载 v1.143.1</a>
-      <a class="ghost" href="https://github.com/dantesun/picket-code">GitHub 仓库</a>
+      <a class="ghost" href="https://github.com/noware-cn/picket-code">GitHub 仓库</a>
       <a class="ghost" href="/project/roadmap">查看路线图</a>
     </div>
   </div>

@@ -1,8 +1,8 @@
 # 设计总览
 
-> 面向 AI 编码 agent 的加固版 VS Code 发行版——受控扩展、私有模型网关、按项目沙箱、iCode 一等公民。
+> 面向 AI 编码 agent 的加固版 Code-OSS 发行版——受控扩展、私有模型网关、按项目沙箱、iCode 一等公民。
 
-完整设计文档见仓库 [docs/design.md](https://github.com/dantesun/picket-code/blob/main/docs/design.md)（v1.0，2026-10-23 审核通过）。
+完整设计文档见仓库 [docs/design.md](https://github.com/noware-cn/picket-code/blob/main/docs/design.md)（v1.0，2026-10-23 审核通过）。
 
 ## 背景与目标
 

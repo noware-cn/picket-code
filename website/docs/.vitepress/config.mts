@@ -4,18 +4,21 @@ export default defineConfig({
   lang: 'zh-CN',
   title: 'Picket Code',
   description:
-    '面向 AI 编码 agent 的加固版 VS Code 发行版 —— 受控扩展、私有模型网关、按项目沙箱，为银行 / 信创内网而生的可信 IDE。',
+    '面向 AI 编码 agent 的加固版 Code-OSS 发行版 —— 受控扩展、私有模型网关、按项目沙箱，为银行 / 信创内网而生的可信 IDE。',
 
   head: [
-    ['link', { rel: 'icon', href: '/favicon.svg' }],
+    ['link', { rel: 'icon', href: '/favicon.svg', type: 'image/svg+xml' }],
     ['script', { src: '/analytics.js', defer: true }],
-    ['meta', { name: 'theme-color', content: '#0b1220' }],
+    // Night Navy: the browser chrome then matches the page instead of the old navy.
+    ['meta', { name: 'theme-color', content: '#081a2b' }],
+    ['meta', { property: 'og:site_name', content: 'Picket Code' }],
+    ['meta', { property: 'og:locale', content: 'zh_CN' }],
     ['meta', { property: 'og:title', content: 'Picket Code' }],
     [
       'meta',
       {
         property: 'og:description',
-        content: '面向 AI 编码 agent 的加固版 VS Code 发行版 —— 受控扩展、私有模型网关、按项目沙箱',
+        content: '面向 AI 编码 agent 的加固版 Code-OSS 发行版 —— 受控扩展、私有模型网关、按项目沙箱',
       },
     ],
     ['meta', { property: 'og:type', content: 'website' }],
@@ -67,7 +70,7 @@ export default defineConfig({
           { text: '许可', link: '/project/license' },
         ],
       },
-      { text: 'GitHub', link: 'https://github.com/dantesun/picket-code' },
+      { text: 'GitHub', link: 'https://github.com/noware-cn/picket-code' },
     ],
 
     sidebar: {
@@ -127,10 +130,10 @@ export default defineConfig({
       },
     },
 
-    socialLinks: [{ icon: 'github', link: 'https://github.com/dantesun/picket-code' }],
+    socialLinks: [{ icon: 'github', link: 'https://github.com/noware-cn/picket-code' }],
 
     editLink: {
-      pattern: 'https://github.com/dantesun/picket-code/edit/main/website/:path',
+      pattern: 'https://github.com/noware-cn/picket-code/edit/main/website/:path',
       text: '在 GitHub 上编辑此页',
     },
 

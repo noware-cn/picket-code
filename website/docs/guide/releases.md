@@ -42,6 +42,15 @@ versions ──► compile(linux) ──┐
 - **推送 `v*` 标签**：标签以上游 VS Code 版本命名，当前为 `v1.143.1`（上游 `1.143.1`）。同一上游版本重建时**移动标签**：删掉旧 Release（`gh release delete <tag> --yes --cleanup-tag`），把同名 tag 重新指向新提交后 `git push origin <tag> --force`，不复用 `-pN` 后缀；工作流对历史遗留的 `-pN` 标签仍会剥掉后缀再定位上游 tag。
 - **手动触发**：`workflow_dispatch`，可指定上游版本与是否预发布。
 
+### 预发行版（RC）
+
+预发行版走同一条流水线，只是标签带 RC 后缀、Release 自动标注 Pre-release：
+
+- 标签格式 `v<上游版本>-picket.<N>-rc.<M>`（如 `v1.143.1-picket.1-rc.8`）；`versions` 阶段把 `-picket…` 之后的部分整体剥掉后定位上游 tag；
+- 推 `-rc.` 标签时 `tests-ui` 无论输入如何都会运行（L4 UI 冒烟 + WSL 验收矩阵），红色即不出产物；
+- 资产名同样带标签，同时额外产出 `…-offline-wsl.zip` 离线组件包与 `test-report-<tag>.tar.gz`；
+- RC 也镜像到 R2，但 `prune-r2.sh` 只识别 `vX.Y.Z` / `-pN` 形态，因此 RC 对象不会被自动清理。
+
 > 历史：早期用 `-pN` 区分同一上游版本的重建（`v1.143.1-p1` … `v1.143.1-p4`）。`p1`/`p2` 因 `product.json` 两个字段被写成 `null` / `{}`，扩展扫描器构造即抛错、装后不加载任何扩展；`p3`/`p4` 修好了扩展加载但仍按旧策略命名。2026-10-31 起改为单一标签：`v1.143.1` 指向当前发行（含提案 API 白名单与 WSL 服务端打包脚本），`-p1`…`-p4` 的 Release 与 tag 已全部删除。
 
 ## 当前版本 v1.143.1

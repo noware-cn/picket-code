@@ -1,6 +1,6 @@
 # 快速开始
 
-> 面向 AI 编码 agent 的加固版 VS Code 发行版——受控扩展、私有模型网关、按项目沙箱，开箱即用。
+> 面向 AI 编码 agent 的加固版 Code-OSS 发行版——受控扩展、私有模型网关、按项目沙箱，开箱即用。
 
 Picket Code 是 [Code - OSS](https://github.com/microsoft/vscode) 的发行版（fork），以干净、无遥测的二进制分发。它面向在可信、按项目隔离的环境中运行 AI 编码 agent 的团队，以 [iCode](https://github.com/openJiuwen-ai/iCode) 作为唯一 agent 方向——典型场景是银行 / 信创内网。
 
@@ -8,7 +8,7 @@ Picket Code 是 [Code - OSS](https://github.com/microsoft/vscode) 的发行版�
 
 ## 1. 下载
 
-从镜像站 `https://download.noware.cn` 下载对应平台的压缩包（文件名带版本号，示例版本 `v1.143.1`；同名资产也在 [GitHub Releases](https://github.com/dantesun/picket-code/releases) 上），或使用[一键下载安装命令](/guide/download)（自动解析最新版本并校验 SHA256）。
+从镜像站 `https://download.noware.cn` 下载对应平台的压缩包（文件名带版本号，示例版本 `v1.143.1`；同名资产也在 [GitHub Releases](https://github.com/noware-cn/picket-code/releases) 上），或使用[一键下载安装命令](/guide/download)（自动解析最新版本并校验 SHA256）。
 
 | 平台 | 压缩包 | 启动方式 |
 |---|---|---|

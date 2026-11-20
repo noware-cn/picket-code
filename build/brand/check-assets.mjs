@@ -125,6 +125,46 @@ if (og) {
 	check(publicCopy && publicCopy.equals(og), 'website/public/og-image.png differs from the docs copy');
 }
 
+// --- Website -----------------------------------------------------------------
+// The site carries the same palette and wordmark as the app, and its two public
+// directories must stay byte-identical: VitePress serves docs/public, while
+// website/public is what a Pages build starting at the repo root would use.
+for (const name of ['favicon.svg', 'logo.svg', 'logo-light.svg', 'og-image.png']) {
+	const served = read(`website/docs/public/${name}`);
+	const mirror = read(`website/public/${name}`);
+	check(served && mirror && served.equals(mirror), `website/public/${name} differs from the docs copy`);
+}
+
+for (const name of ['Geist-Variable.woff2', 'Geist-Italic-Variable.woff2', 'GeistMono-Variable.woff2', 'GeistMono-Italic-Variable.woff2', 'OFL.txt']) {
+	const served = read(`website/docs/public/fonts/${name}`);
+	const mirror = read(`website/public/fonts/${name}`);
+	check(served && mirror && served.equals(mirror), `website/public/fonts/${name} differs from the docs copy`);
+}
+
+const theme = read('website/docs/.vitepress/theme/style.css')?.toString('utf8');
+if (theme !== undefined) {
+	for (const [token, value] of [
+		['--pc-navy', '#10243a'],
+		['--pc-night', '#081a2b'],
+		['--pc-cyan', '#19c6d8'],
+		['--pc-teal', '#007e8a'],
+		['--pc-cloud', '#f4f8fc'],
+	]) {
+		check(theme.includes(`${token}: ${value}`), `style.css: ${token} is not ${value}`);
+	}
+	for (const retired of ['#10b981', '#34d399', '#059669', '#38bdf8', '#0a0f1e']) {
+		check(!theme.includes(retired), `style.css: still uses the retired colour ${retired}`);
+	}
+	check(theme.includes("font-family: 'Geist'") && theme.includes("font-family: 'Geist Mono'"), 'style.css: brand fonts are not declared');
+}
+
+const siteConfig = read('website/docs/.vitepress/config.mts')?.toString('utf8');
+if (siteConfig !== undefined) {
+	check(siteConfig.includes('content: \'#081a2b\''), 'config.mts: theme-color is not Night Navy');
+	check(siteConfig.includes('加固版 Code-OSS 发行版'), 'config.mts: description does not use the Code-OSS wording');
+	check(!siteConfig.includes('dantesun/picket-code'), 'config.mts: still links the pre-move repository');
+}
+
 // --- In-app surfaces ---------------------------------------------------------
 const EMBLEM = 'M0 0h58v40L40 58H0z'; // the first module of favicon.svg
 for (const name of ['light', 'dark', 'hcLight', 'hcDark']) {
@@ -146,4 +186,4 @@ if (failures.length) {
 	for (const failure of failures) { console.error(`    - ${failure}`); }
 	process.exit(1);
 }
-console.log('==> brand assets ok (Windows ICO, macOS ICNS, Linux PNG, extension icon, OG banner, watermark, loopback logo)');
+console.log('==> brand assets ok (Windows ICO, macOS ICNS, Linux PNG, extension icon, OG banner, watermark, loopback logo, website palette and fonts)');
