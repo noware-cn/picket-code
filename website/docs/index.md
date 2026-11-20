@@ -3,7 +3,7 @@ layout: home
 
 hero:
   name: Picket Code
-  text: 面向 AI 编码 agent 的加固版 VS Code 发行版
+  text: 面向 AI 编码 agent 的加固版 Code-OSS 发行版
   tagline: 受控扩展 · 私有模型网关 · 按项目沙箱。默认离线、无遥测、无账号绑定，AgentHost 为 iCode 预留一等接入点 —— 为银行 / 信创内网而生的可信 IDE。
   image:
     # VitePress sizes the hero image for a square; the wordmark belongs in wide
@@ -19,7 +19,7 @@ hero:
       link: /guide/quickstart
     - theme: alt
       text: GitHub 仓库
-      link: https://github.com/dantesun/picket-code
+      link: https://github.com/noware-cn/picket-code
 ---
 
 <div class="pc-section">
@@ -79,8 +79,8 @@ hero:
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="m5 8 4-3.5L13 8l4-3.5L21 8v11a1.5 1.5 0 0 1-1.5 1.5h-15A1.5 1.5 0 0 1 3 19Z"/><path d="M3 13h18"/><path d="M8 16.5h4"/></svg>
   </div>
   <h3>Agent 宿主就绪</h3>
-  <p>AgentHost 在完全不装 Copilot 包的情况下启动并说协议（57 号补丁），保留 IAgent、registerProvider、providerConfigurations 与协议客户端等扩展点；iCode 适配器尚未实现，当前发行版没有可用的 agent 后端。</p>
-  <span class="pc-tag">宿主可用 · 后端待接</span>
+  <p>AgentHost 在完全不装 Copilot 包的情况下启动并说协议（57 号补丁），保留 IAgent、registerProvider、providerConfigurations 与协议客户端等扩展点；iCode 经 ACP 接入（P3 注册、P4 会话恢复与 diff 预览，63/64 号补丁），<code>icode</code> 可解析时自动注册为唯一 provider。</p>
+  <span class="pc-tag">宿主可用 · iCode 已接入</span>
 </div>
 
 </div>
@@ -89,7 +89,7 @@ hero:
 <div class="pc-section">
 
 <h2 class="pc-title">分层架构 <span>To Be</span></h2>
-<p class="pc-sub">复用上游、减法优先：沿 VSCodium 验证过的构建路径做减法，先删后补。六层架构中，发行层与扩展层已落地，AgentHost 平台层裁剪为"零 provider + 编排核心"且已在无 Copilot 包的情况下启动，iCode 经适配层接入（适配层待落地，当前发行版无可用 agent 后端）。</p>
+<p class="pc-sub">复用上游、减法优先：沿 VSCodium 验证过的构建路径做减法，先删后补。六层架构中，发行层与扩展层已落地，AgentHost 平台层裁剪为"零 provider + 编排核心"且已在无 Copilot 包的情况下启动，iCode 经适配层接入（P3 已通过：注册、单轮往返与打断在 Agents Window 实测可用；P4 已通过：会话恢复、审批与输入往返、模型目录、per-turn diff 预览）。</p>
 
 <div class="pc-stack">
   <div class="pc-stack-head">
@@ -151,17 +151,17 @@ hero:
   <div class="pc-step">
     <span class="pc-step-no">1</span>
     <h3>下载发行包</h3>
-    <p>从镜像站 <a href="https://download.noware.cn/picket-code-v1.143.1-win32-x64.zip"><code>download.noware.cn</code></a>（或 <a href="https://github.com/dantesun/picket-code/releases">GitHub Releases</a>）获取对应平台的 <code>tar.gz</code> / <code>zip</code>，脚本自动完成 SHA256 校验。<a href="/guide/download">下载页</a> 有完整地址与校验命令。</p>
+    <p>从镜像站 <a href="https://download.noware.cn/picket-code-v1.143.1-win32-x64.zip"><code>download.noware.cn</code></a>（或 <a href="https://github.com/noware-cn/picket-code/releases">GitHub Releases</a>）获取对应平台的 <code>tar.gz</code> / <code>zip</code>，脚本自动完成 SHA256 校验。<a href="/guide/download">下载页</a> 有完整地址与校验命令。</p>
   </div>
   <div class="pc-step">
     <span class="pc-step-no">2</span>
     <h3>解压并启动</h3>
-    <p>Linux 运行 <code>./picket-code</code>，Windows 运行 <code>Picket Code.exe</code>，无需安装、无需联网。</p>
+    <p>Linux 运行 <code>./picket-code</code>，Windows 运行 <code>code.exe</code>，无需安装、无需联网。</p>
   </div>
   <div class="pc-step">
     <span class="pc-step-no">3</span>
-    <h3>模型 BYO（待接入）</h3>
-    <p>模型一律自带（BYO），推荐指向自托管网关（如 LiteLLM）。当前发行版尚无 agent 后端，iCode 适配层（P3–P4）落地后模型配置才真正生效。</p>
+    <h3>模型 BYO</h3>
+    <p>模型一律自带（BYO），推荐指向自托管网关（如 LiteLLM）。iCode 经 ACP 接入为唯一 agent：<code>icode</code> 可解析时自动注册，会话、审批与 diff 预览都在 Agents Window 内完成。</p>
   </div>
 </div>
 
@@ -170,7 +170,7 @@ hero:
 <div class="pc-section">
 
 <h2 class="pc-title">平台支持与 <span>下载</span></h2>
-<p class="pc-sub">当前发行：Linux (x64) 与 Windows (x64)，tar.gz 与 zip 压缩包；macOS 与 ARM64 在 P0 验证闭环后加入。下载走 <code>https://download.noware.cn</code>（保留最近 3 个版本，更早的版本不承诺长期可下载）。</p>
+<p class="pc-sub">当前发行：Linux (x64) 与 Windows (x64)，tar.gz 与 zip 压缩包；macOS 与 ARM64 在 P0 验证闭环后加入。下载走 <code>https://download.noware.cn</code>（保留最近 3 个版本，更早的版本不承诺长期可下载）。Windows 版可直接打开 WSL 发行版里的目录（内置 <code>picket-remote-wsl</code>，服务端组件首次使用时按需下载）。预发行版（RC）在 GitHub Releases 上以 <code>-rc.N</code> 标签发布，标注为 Pre-release，资产名同样带标签。</p>
 
 <div class="pc-dl-grid">
   <div class="pc-dl-card">
@@ -191,7 +191,7 @@ hero:
     </div>
     <ul>
       <li>压缩包：<code>picket-code-v1.143.1-win32-x64.zip</code>（文件名带版本）</li>
-      <li>启动：<code>Picket Code.exe</code></li>
+      <li>启动：<code>code.exe</code></li>
       <li><a href="https://download.noware.cn/picket-code-v1.143.1-win32-x64.zip">镜像直链</a> · <a href="/guide/download">一键下载安装命令 →</a></li>
     </ul>
   </div>
@@ -224,7 +224,7 @@ hero:
     <p>下载 v1.143.1，或在 GitHub 上查看源码、提交 Issue、参与路线图。</p>
     <div class="pc-cta-actions">
       <a class="primary" href="/guide/download">下载 v1.143.1</a>
-      <a class="ghost" href="https://github.com/dantesun/picket-code">GitHub 仓库</a>
+      <a class="ghost" href="https://github.com/noware-cn/picket-code">GitHub 仓库</a>
       <a class="ghost" href="/project/roadmap">查看路线图</a>
     </div>
   </div>

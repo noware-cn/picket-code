@@ -2,7 +2,7 @@
 
 ## 仓库许可
 
-本仓库为 **MIT License**（[LICENSE](https://github.com/dantesun/picket-code/blob/main/LICENSE)）。
+本仓库为 **MIT License**（[LICENSE](https://github.com/noware-cn/picket-code/blob/main/LICENSE)）。
 
 ## 发行二进制
 
@@ -22,7 +22,7 @@
 - 打进发行版、对外镜像、做成一键安装器均属明确禁止；
 - 想做成产品能力，客户端需换 MIT 实现（如 `open-remote-wsl`），服务端需用上游 MIT 源码自建 reh server，命名避开微软商标。
 
-条款原文与逐条判断见 [手工安装 Remote-WSL 与 VS Code Server](https://github.com/dantesun/picket-code/blob/main/docs/manual-remote-wsl.md) 第九节。
+条款原文与逐条判断见 [手工安装 Remote-WSL 与 VS Code Server](https://github.com/noware-cn/picket-code/blob/main/docs/manual-remote-wsl.md) 第九节。
 
 ## 商标声明
 

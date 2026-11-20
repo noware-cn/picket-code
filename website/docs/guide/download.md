@@ -32,11 +32,22 @@
 - Linux (x64)：`https://download.noware.cn/picket-code-v1.143.1-linux-x64.tar.gz`
 - 校验和：`https://download.noware.cn/picket-code-v1.143.1-SHA256SUMS`
 
-同一版本的同名资产也在 [GitHub Releases](https://github.com/dantesun/picket-code/releases) 上。
+同一版本的同名资产也在 [GitHub Releases](https://github.com/noware-cn/picket-code/releases) 上。
 
 > 镜像保留最近 **3 个版本**，更早的版本不承诺长期可下载。
 > 旧的无版本 URL（`/picket-code-win32-x64.zip`、`/SHA256SUMS`）已废弃，不提供兼容，请求返回 404。
 > 文件名含版本，因此每个 URL 的内容永不改变：可以永久引用、长期缓存。
+
+## 预发行版（RC）
+
+预发行版用于验证尚未进入稳定版的能力（如 WSL 远程、iCode 适配层的最新修复）。它们发布在 [GitHub Releases](https://github.com/noware-cn/picket-code/releases) 并标注为 **Pre-release**，因此不会被“最新版本”解析选中：
+
+- 标签：`v<上游版本>-picket.<N>-rc.<M>`，例如 `v1.143.1-picket.1-rc.8`；
+- 资产：`picket-code-<标签>-<os>-<arch>.<ext>`、`picket-code-<标签>-SHA256SUMS`，另有 `…-offline-wsl.zip` 离线组件包与测试报告；
+- 下载地址把资产名接到镜像域名后面即可（`https://download.noware.cn/picket-code-v<…>-rc.<M>-win32-x64.zip`）。RC 同样会镜像，但自动清理只识别 `vX.Y.Z` / `-pN` 形态，因此 RC 对象不会被自动删除；
+- 一键下载脚本传 `-Tag v1.143.1-picket.1-rc.8` 可以取得指定 RC。
+
+> RC 之间的行为差异以对应 Release 说明为准；稳定发行仍是 `v1.143.1`。
 
 ## 校验
 
@@ -56,7 +67,7 @@ Windows 上可用 `Get-FileHash .\picket-code-v1.143.1-win32-x64.zip -Algorithm 
 ::: code-group
 
 ```powershell [PowerShell]
-powershell -NoProfile -ExecutionPolicy Bypass -Command '$f=(Join-Path $PWD "download-verify.ps1");$wc=New-Object System.Net.WebClient;$wc.DownloadFile("https://raw.githubusercontent.com/dantesun/picket-code/main/build/download-verify.ps1",$f);& $f'
+powershell -NoProfile -ExecutionPolicy Bypass -Command '$f=(Join-Path $PWD "download-verify.ps1");$wc=New-Object System.Net.WebClient;$wc.DownloadFile("https://raw.githubusercontent.com/noware-cn/picket-code/main/build/download-verify.ps1",$f);& $f'
 ```
 
 ```cmd [CMD]
@@ -69,12 +80,12 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\download-verify.ps1 -Tag v
 - 脚本从 GitHub Releases 解析并下载产物；国内网络可改用上面的镜像直链。
 - WebClient 自动使用系统代理 + 当前 Windows 用户凭据，企业网络可直接下载。
 - 若代理要求单独账号密码：`powershell -NoProfile -ExecutionPolicy Bypass -File .\download-verify.ps1 -ProxyCredential (Get-Credential)`
-- 完成后程序位置：`<当前目录>\picket-code-win32-x64\Picket Code.exe`
+- 完成后程序位置：`<当前目录>\picket-code-win32-x64\code.exe`
 
 ### Linux（bash 单行）
 
 ```bash
-curl -fSL "https://raw.githubusercontent.com/dantesun/picket-code/main/build/download-verify.sh" -o dv.sh && bash dv.sh
+curl -fSL "https://raw.githubusercontent.com/noware-cn/picket-code/main/build/download-verify.sh" -o dv.sh && bash dv.sh
 ```
 
 完成后程序位置：解压后目录下的 `bin/picket-code`。
@@ -102,7 +113,7 @@ Get-FileHash .\picket-code-v1.143.1-win32-x64.zip -Algorithm SHA256
 
 ## 方式三：让 AI 助手自动安装
 
-复制 [docs/ai-download-prompt.md](https://github.com/dantesun/picket-code/blob/main/docs/ai-download-prompt.md) 中的任务全文发给任意 AI 助手（豆包、Claude、Codex 等），AI 将自动完成下载、校验与安装，并报告发行包 SHA256、校验结果与安装路径。
+复制 [docs/ai-download-prompt.md](https://github.com/noware-cn/picket-code/blob/main/docs/ai-download-prompt.md) 中的任务全文发给任意 AI 助手（豆包、Claude、Codex 等），AI 将自动完成下载、校验与安装，并报告发行包 SHA256、校验结果与安装路径。
 
 ## 常见问题
 

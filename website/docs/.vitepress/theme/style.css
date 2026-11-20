@@ -1,35 +1,72 @@
 /* ============================================================
    Picket Code — 品牌主题样式
-   暗色安全基调 + 翠绿 / 天蓝品牌渐变（护栏 · 哨兵 · 可信内网）
+   夜海军蓝底 + 工程青（Signal Cyan）单色强调，字体 Geist / Geist Mono
+   色值与字体见 docs/brand-guidelines.md，此处不引入规范以外的色相
    ============================================================ */
+
+/* ---------- 品牌字体（Geist 可变字重，SIL OFL 1.1，见 /fonts/OFL.txt） ---------- */
+@font-face {
+  font-family: 'Geist';
+  src: url('/fonts/Geist-Variable.woff2') format('woff2');
+  font-weight: 100 900;
+  font-style: normal;
+  font-display: swap;
+}
+@font-face {
+  font-family: 'Geist';
+  src: url('/fonts/Geist-Italic-Variable.woff2') format('woff2');
+  font-weight: 100 900;
+  font-style: italic;
+  font-display: swap;
+}
+@font-face {
+  font-family: 'Geist Mono';
+  src: url('/fonts/GeistMono-Variable.woff2') format('woff2');
+  font-weight: 100 900;
+  font-style: normal;
+  font-display: swap;
+}
+@font-face {
+  font-family: 'Geist Mono';
+  src: url('/fonts/GeistMono-Italic-Variable.woff2') format('woff2');
+  font-weight: 100 900;
+  font-style: italic;
+  font-display: swap;
+}
 
 /* ---------- 品牌色板与字体 ---------- */
 :root {
-  /* 品牌主色（翡翠绿） */
-  --pc-brand: #10b981;
-  --pc-brand-2: #34d399;
-  --pc-brand-3: #059669;
-  --pc-sky: #38bdf8;
-  --pc-gradient: linear-gradient(120deg, #34d399 0%, #38bdf8 100%);
+  /* 品牌色（docs/brand-guidelines.md） */
+  --pc-navy: #10243a;      /* Deep Navy：主文字、浅色背景标志 */
+  --pc-night: #081a2b;     /* Night Navy：深色背景、图标底色 */
+  --pc-cyan: #19c6d8;      /* Signal Cyan：图形核心、深色背景强调 */
+  --pc-teal: #007e8a;      /* Text Teal：浅色背景强调 */
+  --pc-cloud: #f4f8fc;     /* Cloud：浅色背景、深色背景上的图形 */
 
-  /* 底色 */
-  --pc-bg: #0a0f1e;
-  --pc-bg-soft: #0e1628;
-  --pc-panel: #111a2e;
-  --pc-panel-2: #0d1526;
-  --pc-border: rgba(148, 163, 184, 0.16);
-  --pc-border-strong: rgba(52, 211, 153, 0.35);
+  --pc-brand: var(--pc-cyan);
+  --pc-brand-2: var(--pc-cyan);
+  --pc-brand-3: var(--pc-teal);
+  --pc-gradient: linear-gradient(120deg, var(--pc-cyan) 0%, var(--pc-teal) 100%);
 
-  /* 文本 */
-  --pc-text: #e6edf7;
-  --pc-text-mute: #94a3b8;
-  --pc-text-dim: #64748b;
+  /* 底色：Night Navy 及其加减明度 */
+  --pc-bg: var(--pc-night);
+  --pc-bg-soft: #0b2033;
+  --pc-panel: var(--pc-navy);
+  --pc-panel-2: #0c1e30;
+  --pc-border: rgba(244, 248, 252, 0.14);
+  --pc-border-strong: rgba(25, 198, 216, 0.42);
+
+  /* 文本：Cloud 及其透明度变体 */
+  --pc-text: var(--pc-cloud);
+  --pc-text-mute: #a7bccd;
+  --pc-text-dim: #6f8698;
+  --pc-ink: #04141f;
 
   /* 覆盖 VitePress 变量 */
   --vp-c-brand-1: var(--pc-brand);
   --vp-c-brand-2: var(--pc-brand-2);
   --vp-c-brand-3: var(--pc-brand-3);
-  --vp-c-brand-soft: rgba(16, 185, 129, 0.15);
+  --vp-c-brand-soft: rgba(25, 198, 216, 0.15);
 
   --vp-c-bg: var(--pc-bg);
   --vp-c-bg-alt: var(--pc-bg-soft);
@@ -44,9 +81,9 @@
   --vp-c-divider: var(--pc-border);
   --vp-c-gutter: var(--pc-bg);
 
-  --vp-font-family-base: 'Inter', -apple-system, BlinkMacSystemFont, 'PingFang SC',
+  --vp-font-family-base: 'Geist', -apple-system, BlinkMacSystemFont, 'PingFang SC',
     'Microsoft YaHei', 'Noto Sans SC', 'Helvetica Neue', 'Segoe UI', sans-serif;
-  --vp-font-family-mono: 'JetBrains Mono', 'SFMono-Regular', Menlo, Consolas,
+  --vp-font-family-mono: 'Geist Mono', 'SFMono-Regular', Menlo, Consolas,
     'Liberation Mono', monospace;
 
   --vp-nav-height: 60px;
@@ -56,16 +93,16 @@
 body {
   background-color: var(--pc-bg);
   background-image:
-    radial-gradient(ellipse 900px 420px at 50% -160px, rgba(16, 185, 129, 0.13), transparent 60%),
-    radial-gradient(ellipse 700px 380px at 88% 18%, rgba(56, 189, 248, 0.07), transparent 60%),
-    radial-gradient(ellipse 600px 360px at 6% 30%, rgba(16, 185, 129, 0.05), transparent 60%);
+    radial-gradient(ellipse 900px 420px at 50% -160px, rgba(25, 198, 216, 0.13), transparent 60%),
+    radial-gradient(ellipse 700px 380px at 88% 18%, rgba(0, 126, 138, 0.07), transparent 60%),
+    radial-gradient(ellipse 600px 360px at 6% 30%, rgba(25, 198, 216, 0.05), transparent 60%);
   background-attachment: fixed;
 }
 
 /* ---------- 顶栏 ---------- */
 .VPNav {
   border-bottom: 1px solid var(--pc-border);
-  background: rgba(10, 15, 30, 0.82) !important;
+  background: rgba(8, 26, 43, 0.82) !important;
   backdrop-filter: saturate(140%) blur(12px);
 }
 
@@ -79,14 +116,14 @@ body {
   color: var(--pc-brand-2);
 }
 .vp-doc a:hover {
-  color: var(--pc-sky);
+  color: var(--pc-cloud);
 }
 
 /* ---------- 代码块 ---------- */
 .vp-doc div[class*='language-'] {
   border: 1px solid var(--pc-border);
   border-radius: 10px;
-  background: #0b1322 !important;
+  background: #0a1e30 !important;
 }
 .vp-doc [class*='language-'] code {
   font-family: var(--vp-font-family-mono);
@@ -113,7 +150,7 @@ body {
   padding-bottom: 32px;
 }
 .VPHomeHero .name {
-  background: var(--pc-gradient);
+  background: linear-gradient(120deg, var(--pc-cloud) 0%, var(--pc-cyan) 100%);
   -webkit-background-clip: text;
   background-clip: text;
   color: transparent;
@@ -130,7 +167,7 @@ body {
   display: none;
 }
 .VPHomeHero img {
-  filter: drop-shadow(0 0 34px rgba(52, 211, 153, 0.35));
+  filter: drop-shadow(0 0 34px rgba(25, 198, 216, 0.35));
 }
 .VPHomeHero .actions {
   justify-content: center;
@@ -138,17 +175,17 @@ body {
 .VPHomeHero .actions .vp-button.brand {
   border: none;
   background: var(--pc-gradient);
-  color: #06231a;
+  color: #04141f;
   font-weight: 600;
 }
 .VPHomeHero .actions .vp-button.alt {
   border: 1px solid var(--pc-border-strong);
   color: var(--pc-brand-2);
-  background: rgba(16, 185, 129, 0.06);
+  background: rgba(25, 198, 216, 0.06);
 }
 .VPHomeHero .actions .vp-button.alt:hover {
   border-color: var(--pc-brand-2);
-  background: rgba(16, 185, 129, 0.14);
+  background: rgba(25, 198, 216, 0.14);
 }
 
 /* ============================================================
@@ -201,7 +238,7 @@ body {
 
 .pc-card {
   position: relative;
-  background: linear-gradient(160deg, rgba(17, 26, 46, 0.92), rgba(13, 21, 38, 0.92));
+  background: linear-gradient(160deg, rgba(16, 36, 58, 0.92), rgba(12, 30, 48, 0.92));
   border: 1px solid var(--pc-border);
   border-radius: 14px;
   padding: 22px 20px 18px;
@@ -212,7 +249,7 @@ body {
   content: '';
   position: absolute;
   inset: 0;
-  background: radial-gradient(340px 160px at 20% 0%, rgba(16, 185, 129, 0.12), transparent 70%);
+  background: radial-gradient(340px 160px at 20% 0%, rgba(25, 198, 216, 0.12), transparent 70%);
   opacity: 0;
   transition: opacity 0.3s ease;
   pointer-events: none;
@@ -233,8 +270,8 @@ body {
   display: flex;
   align-items: center;
   justify-content: center;
-  background: rgba(16, 185, 129, 0.1);
-  border: 1px solid rgba(52, 211, 153, 0.28);
+  background: rgba(25, 198, 216, 0.1);
+  border: 1px solid rgba(25, 198, 216, 0.28);
   color: var(--pc-brand-2);
   margin-bottom: 14px;
 }
@@ -259,8 +296,8 @@ body {
   margin-top: 12px;
   font-size: 11.5px;
   color: var(--pc-brand-2);
-  background: rgba(16, 185, 129, 0.1);
-  border: 1px solid rgba(52, 211, 153, 0.24);
+  background: rgba(25, 198, 216, 0.1);
+  border: 1px solid rgba(25, 198, 216, 0.24);
   border-radius: 999px;
   padding: 2px 10px;
 }
@@ -278,7 +315,7 @@ body {
   justify-content: space-between;
   padding: 12px 18px;
   border-bottom: 1px solid var(--pc-border);
-  background: rgba(13, 21, 38, 0.9);
+  background: rgba(12, 30, 48, 0.9);
 }
 .pc-stack .pc-stack-head strong {
   font-size: 14px;
@@ -296,14 +333,14 @@ body {
   gap: 12px;
   align-items: center;
   padding: 13px 18px;
-  border-top: 1px dashed rgba(148, 163, 184, 0.14);
+  border-top: 1px dashed rgba(244, 248, 252, 0.14);
   transition: background 0.2s ease;
 }
 .pc-stack .pc-layer:first-of-type {
   border-top: none;
 }
 .pc-stack .pc-layer:hover {
-  background: rgba(16, 185, 129, 0.04);
+  background: rgba(25, 198, 216, 0.04);
 }
 .pc-stack .pc-layer .pc-l-name {
   font-size: 14px;
@@ -325,18 +362,18 @@ body {
 }
 .pc-stack .pc-l-status.shipped {
   color: var(--pc-brand-2);
-  background: rgba(16, 185, 129, 0.12);
-  border: 1px solid rgba(52, 211, 153, 0.3);
+  background: rgba(25, 198, 216, 0.12);
+  border: 1px solid rgba(25, 198, 216, 0.3);
 }
 .pc-stack .pc-l-status.planned {
-  color: var(--pc-sky);
-  background: rgba(56, 189, 248, 0.1);
-  border: 1px solid rgba(56, 189, 248, 0.28);
+  color: var(--pc-cloud);
+  background: rgba(0, 126, 138, 0.16);
+  border: 1px solid rgba(0, 126, 138, 0.45);
 }
 .pc-stack .pc-l-status.core {
-  color: #c4b5fd;
-  background: rgba(139, 92, 246, 0.1);
-  border: 1px solid rgba(139, 92, 246, 0.3);
+  color: #f4f8fc;
+  background: rgba(244, 248, 252, 0.1);
+  border: 1px solid rgba(244, 248, 252, 0.3);
 }
 @media (max-width: 720px) {
   .pc-stack .pc-layer {
@@ -374,7 +411,7 @@ body {
   height: 28px;
   border-radius: 8px;
   background: var(--pc-gradient);
-  color: #06231a;
+  color: #04141f;
   font-weight: 700;
   font-size: 14px;
   margin-bottom: 12px;
@@ -395,7 +432,7 @@ body {
   font-family: var(--vp-font-family-mono);
   font-size: 12px;
   color: var(--pc-brand-2);
-  background: rgba(16, 185, 129, 0.1);
+  background: rgba(25, 198, 216, 0.1);
   border-radius: 5px;
   padding: 1px 6px;
 }
@@ -461,7 +498,7 @@ body {
   text-decoration: none;
 }
 .pc-dl-card li a:hover {
-  color: var(--pc-sky);
+  color: var(--pc-cloud);
 }
 
 /* ---------- CTA 横幅 ---------- */
@@ -476,8 +513,8 @@ body {
   border: 1px solid var(--pc-border-strong);
   border-radius: 18px;
   background:
-    radial-gradient(560px 220px at 12% 0%, rgba(16, 185, 129, 0.16), transparent 65%),
-    radial-gradient(520px 240px at 92% 100%, rgba(56, 189, 248, 0.1), transparent 65%),
+    radial-gradient(560px 220px at 12% 0%, rgba(25, 198, 216, 0.16), transparent 65%),
+    radial-gradient(520px 240px at 92% 100%, rgba(0, 126, 138, 0.1), transparent 65%),
     var(--pc-panel-2);
   padding: 36px 36px 32px;
   text-align: center;
@@ -509,7 +546,7 @@ body {
 }
 .pc-cta .pc-cta-actions a.primary {
   background: var(--pc-gradient);
-  color: #06231a;
+  color: #04141f;
 }
 .pc-cta .pc-cta-actions a.primary:hover {
   filter: brightness(1.08);
@@ -519,7 +556,7 @@ body {
   color: var(--pc-brand-2);
 }
 .pc-cta .pc-cta-actions a.ghost:hover {
-  background: rgba(16, 185, 129, 0.12);
+  background: rgba(25, 198, 216, 0.12);
 }
 
 /* ---------- 合规亮点徽章行 ---------- */
@@ -545,7 +582,7 @@ body {
   height: 6px;
   border-radius: 50%;
   background: var(--pc-brand-2);
-  box-shadow: 0 0 8px rgba(52, 211, 153, 0.7);
+  box-shadow: 0 0 8px rgba(25, 198, 216, 0.7);
 }
 
 /* ---------- 页脚 ---------- */
@@ -566,11 +603,11 @@ body {
   height: 10px;
 }
 ::-webkit-scrollbar-thumb {
-  background: rgba(148, 163, 184, 0.25);
+  background: rgba(244, 248, 252, 0.25);
   border-radius: 8px;
 }
 ::-webkit-scrollbar-thumb:hover {
-  background: rgba(52, 211, 153, 0.4);
+  background: rgba(25, 198, 216, 0.4);
 }
 ::-webkit-scrollbar-track {
   background: transparent;

@@ -1,11 +1,11 @@
 # Picket Code 官网 / 文档站
 
-面向 AI 编码 agent 的加固版 VS Code 发行版 [Picket Code](https://github.com/dantesun/picket-code) 的官网与文档站，基于 [VitePress](https://vitepress.dev) 构建。
+面向 AI 编码 agent 的加固版 Code-OSS 发行版 [Picket Code](https://github.com/noware-cn/picket-code) 的官网与文档站，基于 [VitePress](https://vitepress.dev) 构建。
 
 ## 技术栈
 
 - **VitePress**（Vue 生态静态站点生成器）
-- 暗色安全主题 + 翠绿 / 天蓝品牌渐变，纯 CSS 定制，无额外 UI 依赖
+- Night Navy 底 + Signal Cyan 强调（`docs/brand-guidelines.md`），Geist / Geist Mono 可变字体，纯 CSS 定制，无额外 UI 依赖
 - 本地全文搜索、代码组 Tab、分层架构图（内联 HTML/CSS）
 
 ## 目录结构
@@ -22,6 +22,8 @@
 │   ├── architecture/         # 架构与安全：设计总览 / AgentHost / 合规
 │   └── project/              # 项目：路线图 / 许可
 ├── public/                   # 独立徽记 favicon.svg + 横版字标 logo.svg / logo-light.svg
+│                             # + 社交分享图 og-image.png + fonts/（Geist 可变字体，OFL）
+│                             # （docs/public 下为逐字节相同的副本）
 └── deploy/                   # Cloudflare Pages / R2 部署说明与示例
 ```
 

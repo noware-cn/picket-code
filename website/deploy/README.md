@@ -2,7 +2,7 @@
 
 Picket Code 官网是纯静态站点（VitePress 构建产物），托管在 **Cloudflare Pages**，域名 **`picket-code.noware.cn`**，构建由 **GitHub** 触发。发行包等大文件放 **Cloudflare R2**，通过 R2 桶的自定义域名 **`download.noware.cn`** 直出。
 
-> **实际部署状态（2026-10-30）**：Pages 项目 `picket-code` 已接入 GitHub（`dantesun/picket-code`，production branch `main`），每次 push 到 `website/**` 自动构建上线；自定义域名 `picket-code.noware.cn` 已绑定并生效（active），SSL 由 Google Trust Services 签发（有效期至 2027-01-26）。构建配置：Root directory `website`，Build command `npm ci && npm run docs:build`，Output directory `docs/.vitepress/dist`。下载域名 `download.noware.cn` 为 R2 桶 `picket-releases` 的自定义域名。
+> **实际部署状态（2026-10-30）**：Pages 项目 `picket-code` 已接入 GitHub（仓库原为 `dantesun/picket-code`，现已迁移到 `noware-cn/picket-code`，production branch `main`；迁移后请在 Pages 设置里确认仍指向新地址），每次 push 到 `website/**` 自动构建上线；自定义域名 `picket-code.noware.cn` 已绑定并生效（active），SSL 由 Google Trust Services 签发（有效期至 2027-01-26）。构建配置：Root directory `website`，Build command `npm ci && npm run docs:build`，Output directory `docs/.vitepress/dist`。下载域名 `download.noware.cn` 为 R2 桶 `picket-releases` 的自定义域名。
 
 ## 总体架构
 
@@ -31,7 +31,7 @@ GitHub（源码 + website/ 站点）
 
 ## 一、把站点放进仓库
 
-把本 `website/`（或本目录内容）放入 `dantesun/picket-code` 仓库根目录，提交后推送：
+把本 `website/`（或本目录内容）放入 `noware-cn/picket-code` 仓库根目录，提交后推送：
 
 ```bash
 # 在仓库根目录（示例：放到 website/ 子目录）
@@ -43,7 +43,7 @@ git push
 ## 二、Cloudflare Pages 接入
 
 1. 打开 Cloudflare Dashboard → **Workers & Pages → Create → Pages → Connect to Git**；
-2. 选择 `dantesun/picket-code` 仓库；
+2. 选择 `noware-cn/picket-code` 仓库；
 3. 构建配置：
 
 | 配置项 | 值 |
