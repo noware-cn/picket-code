@@ -10584,6 +10584,180 @@ index 00000000..093514e6
 +	assert.strictEqual(engineMinimum('*'), undefined);
 +	assert.strictEqual(engineMinimum(undefined), undefined);
 +});
+diff --git a/test/smoke/src/areas/wsl/remote.test.ts b/test/smoke/src/areas/wsl/remote.test.ts
+new file mode 100644
+index 00000000..2be699f1
+--- /dev/null
++++ b/test/smoke/src/areas/wsl/remote.test.ts
+@@ -0,0 +1,168 @@
++/*---------------------------------------------------------------------------------------------
++ *  Copyright (c) Microsoft Corporation. All rights reserved.
++ *  Licensed under the MIT License. See License.txt in the project root for license information.
++ *--------------------------------------------------------------------------------------------*/
++
++import * as fs from 'fs';
++import * as os from 'os';
++import * as path from 'path';
++import { Application, ApplicationOptions, Logger } from '../../../../automation';
++import { createApp, installAppAfterHandler, installDiagnosticsHandler, suiteCrashPath, suiteLogsPath } from '../../utils';
++
++/**
++ * Layer 4 (UI smoke) coverage for the WSL remote window, driven through the
++ * stand-in `wsl.exe` (`test/wsl-harness/fake-wsl.mjs`) and the real server
++ * payload (see `docs/wsl-verification.md` and `build/wsl/acceptance.sh`).
++ *
++ * The suite is opt-in via environment so the shared smoke matrix is unaffected:
++ * acceptance.sh exports PICKET_WSL_DISTRO / PICKET_WSL_FAKE_HOME /
++ * PICKET_WSL_RUNNER; without them the suite skips before launching Electron.
++ * Behaviour inside the remote extension host (folder identity, login shell,
++ * watcher, 10 MB round trip) lives in the harness extension
++ * (`test/wsl-harness/remote/`); this area asserts what only the UI can see:
++ * the `WSL 目标` view, the distro node from a real listing, and a title bar
++ * branded `WSL` instead of the raw authority.
++ *
++ * Suite title carries a lowercase `wsl` token on purpose: the smoke runner maps
++ * `-f` onto mocha's `grep` (case-sensitive, full nested title), so
++ * `node test/index.js -f wsl` selects exactly this suite.
++ */
++
++// `out/areas/wsl/remote.test.js` → the picket-code repository root.
++const REPO_ROOT = path.resolve(__dirname, '..', '..', '..', '..', '..', '..');
++const DOWNLOAD_DIR = path.join(REPO_ROOT, 'build', 'wsl', 'download');
++
++const DISTRO = process.env.PICKET_WSL_DISTRO ?? '';
++const FAKE_HOME = process.env.PICKET_WSL_FAKE_HOME ?? '';
++const FAKE_WSL = process.env.PICKET_WSL_RUNNER ?? '';
++const ACCEPT_HOME = process.env.PICKET_WSL_ACCEPT_HOME ?? path.join(os.tmpdir(), 'picket-wsl-smoke');
++const FOLDER = path.join(FAKE_HOME, '我的 项目');
++
++function findPayloadTarball(): string | undefined {
++	try {
++		return fs.readdirSync(DOWNLOAD_DIR)
++			.filter(name => /^picket-code-server-.+-linux-x64\.tar\.gz$/.test(name))
++			.map(name => path.join(DOWNLOAD_DIR, name))[0];
++	} catch {
++		return undefined;
++	}
++}
++
++/**
++ * The dev workbench scans `extensions/` and loads the in-tree extension with
++ * the placeholder (empty) catalog. Loading a staged copy with the real catalog
++ * through `--extensionDevelopmentPath` shadows it, which is also how the
++ * release acceptance run works.
++ */
++function stageExtensionWithRealCatalog(): string | undefined {
++	const tarball = findPayloadTarball();
++	const catalog = path.join(DOWNLOAD_DIR, 'catalog.json');
++	if (!tarball || !fs.existsSync(catalog)) {
++		return undefined;
++	}
++	const staging = path.join(ACCEPT_HOME, 'ext');
++	fs.rmSync(staging, { recursive: true, force: true });
++	fs.cpSync(path.join(REPO_ROOT, 'vscode', 'extensions', 'picket-remote-wsl'), staging, { recursive: true });
++	fs.copyFileSync(catalog, path.join(staging, 'payloads', 'catalog.json'));
++	// The 目标 view is declared `when: isWindows`; this suite drives the
++	// stand-in wsl.exe on Linux, where an empty Remote Explorer container would
++	// hide itself and leave nothing to assert. Drop the gate on the copy only.
++	const manifestFile = path.join(staging, 'package.json');
++	const manifest = JSON.parse(fs.readFileSync(manifestFile, 'utf8'));
++	delete manifest.contributes.views.remote[0].when;
++	fs.writeFileSync(manifestFile, JSON.stringify(manifest, null, '\t') + '\n');
++	return staging;
++}
++
++export function setup(logger: Logger): void {
++
++	let staging: string | undefined;
++
++	describe('WSL remote window (wsl)', () => {
++
++		before(function () {
++			if (process.platform !== 'linux') {
++				logger.log('Skipping WSL area: the stand-in wsl.exe path is exercised on Linux; Windows acceptance runs the manual checklist (docs/wsl-verification.md).');
++				this.skip();
++			}
++			if (!DISTRO || !FAKE_HOME || !FAKE_WSL) {
++				logger.log('Skipping WSL area: PICKET_WSL_DISTRO / PICKET_WSL_FAKE_HOME / PICKET_WSL_RUNNER are not set (run build/wsl/acceptance.sh).');
++				this.skip();
++			}
++			staging = stageExtensionWithRealCatalog();
++			if (!staging) {
++				logger.log(`Skipping WSL area: payload tarball or catalog.json not found under ${DOWNLOAD_DIR} (run build/wsl/fetch-payload.sh).`);
++				this.skip();
++			}
++			fs.mkdirSync(FOLDER, { recursive: true });
++		});
++
++		installDiagnosticsHandler(logger);
++
++		before(async function () {
++			this.timeout(5 * 60 * 1000); // resolver: payload install + server start + connect
++			const suiteName = this.test?.parent?.title ?? 'unknown';
++			const defaultOptions: ApplicationOptions = {
++				...this.defaultOptions,
++				logsPath: suiteLogsPath(this.defaultOptions, suiteName),
++				crashesPath: suiteCrashPath(this.defaultOptions, suiteName),
++			};
++
++			this.app = createApp(defaultOptions, opts => ({
++				...opts,
++				remote: true,
++				remoteAuthority: `picket-wsl+${DISTRO}`,
++				// The folder the authority points at must exist in the distro
++				// before the window opens (the folder dialog flow is manual).
++				workspacePath: FOLDER,
++				extensionDevelopmentPath: staging,
++				// Isolated user data dir: the settings seeded below must not leak
++				// into the shared smoke profile other suites run against.
++				userDataDir: fs.mkdtempSync(path.join(os.tmpdir(), 'vscode-wsl-smoke-')),
++				// The activity-bar label A5 clicks comes from the workbench NLS, so
++				// pin the language instead of depending on the machine's locale.
++				extraArgs: ['--locale=en'],
++				extraEnv: {
++					...(opts.extraEnv ?? {}),
++					PICKET_WSL_RUNNER: FAKE_WSL,
++					PICKET_WSL_FAKE_HOME: FAKE_HOME,
++				},
++			}));
++
++			// The payload source must come from the verified tarball trio; the
++			// dev catalog copy in the staged extension only carries the tag.
++			const userDataDir = (this.app as Application).userDataPath;
++			const tarball = findPayloadTarball();
++			if (userDataDir && tarball) {
++				fs.mkdirSync(path.join(userDataDir, 'User'), { recursive: true });
++				fs.writeFileSync(path.join(userDataDir, 'User', 'settings.json'), JSON.stringify({
++					'picket.wsl.serverPayloadPath': tarball,
++					'picket.wsl.icodePath': '',
++				}, null, 2));
++			}
++
++			await (this.app as Application).start();
++		});
++
++		installAppAfterHandler();
++
++		it('renders the WSL targets view with the distro from a real listing (A5, B1)', async function () {
++			const app = this.app as Application;
++
++			// `workbench.view.remote` is a view container id, not a command, so
++			// open the container the way a user does: click its activity bar icon.
++			await app.code.waitAndClick('.activitybar .action-label[aria-label^="Remote Explorer"]');
++			await app.code.waitForElements('.monaco-pane-view .pane-header .title', true,
++				elements => elements.some(element => (element.textContent ?? '').includes('WSL 目标')));
++			await app.code.waitForElements('.monaco-list-row .monaco-tl-contents', true,
++				elements => elements.some(element => (element.textContent ?? '').includes(DISTRO)));
++		});
++
++		it('brands the window title as WSL, not the raw authority (A6)', async function () {
++			const app = this.app as Application;
++
++			await app.code.waitForTitle(title =>
++				/WSL/.test(title) && !title.includes('picket-wsl+'));
++		});
++	});
++}
 diff --git a/test/wsl-harness/conflict/extension.js b/test/wsl-harness/conflict/extension.js
 new file mode 100644
 index 00000000..794a14a6
