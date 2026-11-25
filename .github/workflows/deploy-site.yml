@@ -1,0 +1,63 @@
+# Publish the documentation site to Cloudflare Pages.
+#
+# Manual only, on purpose: the Pages project is not wired to this repository's
+# webhooks, so a push to main does not rebuild it by itself. Run this workflow
+# ("Actions → Deploy site → Run workflow") after anything under website/ lands
+# on main. It builds the site exactly as the Pages project would and uploads
+# the result as the production deployment.
+#
+# Credentials: CF_PAGES_TOKEN (Account → Cloudflare Pages → Edit) and
+# CF_ACCOUNT_ID (repository variable). CF_API_TOKEN is the R2 mirror token and
+# has no Pages permission, so it is only a fallback if the dedicated token is
+# missing.
+name: Deploy site
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Git ref to build (default: the branch the run starts from)"
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy-site
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: Build and upload website/
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: website/package-lock.json
+
+      - name: Build the site
+        working-directory: website
+        run: |
+          npm ci --no-audit --no-fund
+          npm run docs:build
+
+      # Cloudflare Pages resolves /guide/wsl from the .html files VitePress
+      # emits, so the upload carries the raw dist tree unchanged.
+      - name: Upload to Pages
+        working-directory: website
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CF_PAGES_TOKEN || secrets.CF_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ vars.CF_ACCOUNT_ID }}
+        run: |
+          npx --yes wrangler@4 pages deploy docs/.vitepress/dist \
+            --project-name=picket-code \
+            --branch=main \
+            --commit-dirty=true
