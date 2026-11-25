@@ -1,0 +1,50 @@
+# Print the Pages project's wiring so a broken deploy can be diagnosed without
+# the dashboard: which repository and branch it builds, whether Git builds are
+# enabled, which environment variables exist, and what the last deployments did.
+#
+# Read-only. Needs CF_PAGES_TOKEN (Account → Cloudflare Pages → Edit) and
+# CF_ACCOUNT_ID, the same credentials the Deploy site workflow uses. Variable
+# values are never printed, only their names.
+name: Pages info
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  info:
+    name: Dump picket-code project state
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CF_PAGES_TOKEN || secrets.CF_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ vars.CF_ACCOUNT_ID }}
+    steps:
+      - name: Project
+        run: |
+          set -euo pipefail
+          api="https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID/pages/projects/picket-code"
+          curl -sS "$api" -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" > project.json
+          jq -e '.success' project.json >/dev/null || { jq . project.json; exit 1; }
+          jq '{
+            name: .result.name,
+            domains: .result.domains,
+            production_branch: .result.production_branch,
+            source: (.result.source // "none — Direct Upload project"),
+            build_config: .result.build_config,
+            git_builds_enabled: (.result.source != null),
+            env_var_names: {
+              production: (.result.deployment_configs.production.env_vars // {} | keys),
+              preview: (.result.deployment_configs.preview.env_vars // {} | keys)
+            },
+            node_version: .result.deployment_configs.production.env_vars.NODE_VERSION.value
+          }' project.json
+
+      - name: Last deployments
+        run: |
+          set -euo pipefail
+          api="https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID/pages/projects/picket-code/deployments"
+          curl -sS "$api?per_page=5" -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" > deployments.json
+          jq -r '.result[] | "\(.created_on) env=\(.environment) \(.url)\n    \(.deployment_trigger.type) \(.deployment_trigger.metadata.branch // .deployment_trigger.metadata.commit_hash // "") latest=\(.latest_stage.name)/\(.latest_stage.status)"' deployments.json
