@@ -65,9 +65,9 @@
 - 白名单策略：受控市场 + 扩展签名校验；
 - 恢复某扩展：从 `build/extensions-remove.list` 删除对应行后重建，或从受控市场按需安装。
 
-## 例外：WSL 远程开发
+## WSL 远程开发
 
-在 WSL2 发行版里做远程开发需要微软的 Remote-WSL 扩展，它不在内置集里、也不由本发行版分发——侧载步骤与许可边界见[在 WSL 中使用](/guide/wsl)。
+WSL2 远程开发由内置扩展 `noware.picket-remote-wsl` 提供，服务端是我们自己构建的 Linux 载荷，不依赖也不分发微软的 Remote-WSL 扩展——**反过来，官方扩展必须卸载**，否则两边抢同一个 authority。用法、载荷来源与排错见[在 WSL 中使用](/guide/wsl)。
 
 ## 机制
 
