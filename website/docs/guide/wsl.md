@@ -1,106 +1,128 @@
-# 在 WSL 中使用（旧方法，已不再需要）
+# 在 WSL 中使用
 
-::: tip 本发行版已内置 WSL 支持
-从 v1.143.1 起，Picket Code 自带 WSL 支持（内置扩展 + 自有服务器载荷），**不需要**
-侧载微软 Remote-WSL、也不需要手工预置 VS Code Server。用法见
-[`docs/wsl.md`](https://github.com/noware-cn/picket-code/blob/main/docs/wsl.md)。
+Picket Code 自带 WSL 支持：一个内置扩展（`noware.picket-remote-wsl`）加一份**我们自己的 Linux 服务端载荷**。不需要侧载微软 Remote-WSL，也不需要手工预置 VS Code Server——首次连接时客户端自己把载荷装进目标发行版，之后每次开窗口都复用它。
 
-下面这份文档保留作为历史方案与合规分析的对照：它是内置方案出现之前，"个人自用、
-自备微软组件"的走法，以及为什么当时只能这么做（Remote Development 许可的限制）。
-:::
+> 官方 `ms-vscode-remote.remote-wsl` **必须卸载**。两个扩展抢同一个 `wsl+` authority、同一个 `~/.vscode-server` 树和同一个服务器端口，先解析到的那个独占文件夹。只要官方扩展还装着（启用、禁用、未激活都算），本扩展的所有 WSL 功能一律关闭。卸载**不会**删你的服务器数据，见[卸载官方扩展](#卸载官方扩展)。
 
-用 Picket Code 打开 WSL 发行版里的工程，靠的是**微软的 Remote-WSL 扩展 + 微软的 VS Code Server**。这两样都不随本发行版分发，需要自己在机器上补。它在本发行版上能跑通，前提是三个条件同时成立，缺一个就会卡在扩展激活、会话创建或握手校验上。
+## 前提
 
-::: warning 适用范围
-仅在**个人自用**、自备微软组件的前提下可行。发行版不内置、不镜像、不提供一键安装器——把这两样东西打进去或对外提供都违反微软的 Remote Development 许可。判断依据与条款原文见仓库文档 [手工安装 Remote-WSL 与 VS Code Server](https://github.com/noware-cn/picket-code/blob/main/docs/manual-remote-wsl.md) 第九节。
-:::
-
-## 三个前提
-
-| 前提 | 为什么 |
+| 项目 | 要求 |
 |---|---|
-| Picket Code **v1.143.1 及以后** | `product.json` 需含 `extensionEnabledApiProposals`，为 `ms-vscode-remote.remote-wsl` 放行 `resolvers`、`contribRemoteHelp`、`contribViewsRemote`、`telemetry`。缺了它扩展激活即报 `CANNOT use API proposal: resolvers` |
-| 手工侧载 Remote-WSL（当前 `1.104.7`） | 扩展不在市场里对你的发行版可见；侧载时**不能改** `package.json` 的 `engines.vscode` |
-| 手工预置服务端载荷 | 发行版的 `commit` 与微软 CDN 上的 `stable` 不同，扩展的自动下载按 `product.json` 的 `quality` 拼 URL，取不到对应版本 |
+| 宿主 | Windows 10 1903+ 或 Windows 11（需要 `\\wsl.localhost` 共享） |
+| WSL | WSL2 + 至少一个发行版；`wsl -l -v` 能看到 |
+| 客户端 | Picket Code **Windows x64** 包；WSL 支持不出现在 Linux/macOS 包与 Web 版里 |
+| 官方扩展 | 已卸载（下面三条命令都能处理） |
 
-版本号必须是裸的 `X.Y.Z`：
+WSL1、ARM64 发行版、Alpine 暂不支持。
 
-```bash
-"<Picket Code>/bin/picket-code" --version     # 期望 1.143.1
-```
+## 首次连接
 
-带 `+p` 或一段 commit 的旧构建装不了任何扩展，先换包。
+三条入口等价，任选一条：
 
-## 步骤
+1. **WSL 目标视图**：左侧「远程资源管理器」→ **WSL 目标**，点发行版上的打开图标；
+2. **命令面板** → `Picket: Open Folder in WSL…` → 选发行版 → 在弹出的对话框里选文件夹（对话框直接落在该发行版的 `$HOME`，走 `\\wsl.localhost\<发行版>\...`）；
+3. 已经用「文件 → 打开文件夹」打开了 `\\wsl.localhost\<发行版>\...`，再执行 **`Picket: Reopen Folder in WSL`**。
 
-### 1. 装扩展
+第一次连某个发行版时，客户端会问「WSL 里还没有服务器组件。从哪里获取？」，三选一：
 
-```powershell
-& "<Picket Code>\code.exe" --install-extension .\ms-vscode-remote.remote-wsl-1.104.7.vsix
-& "<Picket Code>\code.exe" --list-extensions      # 确认已列出
-```
-
-GUI 等价操作：扩展面板 → `···` → 从 VSIX 安装。
-
-### 2. 补客户端 `vsda` 桩
-
-扩展激活时会用 `vsda` 做一次"是否微软正版"的技术判定。在应用目录放一个同名空实现即可让探测通过——它**改动的是应用目录，换包即失效**，不会跟着发行版走：
-
-```powershell
-$vsda = "<Picket Code>\resources\app\node_modules\vsda"
-New-Item -ItemType Directory -Force $vsda | Out-Null
-'{ "name": "vsda", "version": "0.0.0", "main": "index.js" }' | Set-Content "$vsda\package.json"
-'module.exports = { signer: 1, validator: 1 };'        | Set-Content "$vsda\index.js"
-```
-
-导出值故意不是构造函数，核心的 `sign()` / `validate()` 会落进既有的 `try{…}catch{}`，退化为"不签名"——与当前缺少 `vsda` 时的行为一致。
-
-`VSCODE_DEV=1` 这条路在压缩构建上**走不通**：NLS 消息表不再装载，启动即抛 `!!! NLS MISSING`。
-
-### 3. 预置服务端载荷
-
-在**目标发行版内部**执行（写的是 `$HOME`，多发行版各跑一遍）：
-
-```bash
-# 在线：从 Windows 安装里读 commit / quality
-bash build/manual-wsl-server.sh \
-  --product-json /mnt/d/Downloads/picket-code-win32-x64/resources/app/product.json
-
-# 离线：两段归档已在本地
-bash build/manual-wsl-server.sh --commit <40 位 sha> \
-  --cli-tar /mnt/d/vscode_cli_linux_x64_cli.tar.gz \
-  --server-tar /mnt/d/vscode-server-linux-x64.tar.gz
-```
-
-脚本做四件事：`code` 改名为 `code-cli`、server 用 `--strip-components 1` 解开、补 `bin/picket-code-server` 入口、把载荷 `product.json` 改成本项目的值。**最后一步不能省**——数据目录由 server 自己的 `product.json`（`serverDataFolderName`）决定，`wslServer.sh` 的第 4 个参数只用于定位 `bin/`，从不传给 server；不改就会写进 `~/.vscode-server`，与已装的 VS Code 共用 logs、globalStorage 和扩展。
-
-## 验证
-
-打开 WSL 窗口后看 `Remote-WSL: Show Log`，按顺序出现即可：
-
-```
-authorityHierarchy: wsl+ubuntu
-WSL extension activating for a local WSL instance
-… Probing if server is already installed … install-found x86_64
-```
-
-在 WSL 里独立交叉验证：
-
-```bash
-pgrep -af "out/server-main.js"        # 应有 --port=… --connection-token=…
-ls ~/.picket-code-server/data/logs    # 时间戳目录应在这里，而不是 ~/.vscode-server
-```
-
-## 常见卡点
-
-| 现象 | 原因 |
+| 选项 | 用在哪 |
 |---|---|
-| `CANNOT use API proposal: resolvers` | `product.json` 缺提案白名单（v1.143.1 之前） |
-| `command 'remote-wsl.openFolder' not found` | 扩展激活失败，往上翻第一条 `ERR` |
-| `Wsl/Service/E_UNEXPECTED` | WSL 会话层故障，与扩展无关：`wsl --shutdown` 后重试 |
-| 日志里出现 `Downloading VS Code Server` | 服务端载荷没被认出，检查 `bin/<commit>` 与 `bin-cli/<commit>` 是否都在 |
-| WebSocket 建连成功、`5/6` 后 `Unauthorized client refused` | 服务端载荷里的 `vsda` 没移开——客户端是桩、签不出真签名，只有服务端没有校验器时才放行（脚本已自动重命名为 `vsda.disabled`） |
+| **自动下载** | 能出网时最省事；需要先配置 `picket.wsl.serverPayloadBaseUrl`（公开版默认不带下载地址） |
+| **从文件安装…** | 内网、气隙、镜像被拦时：选官方的 `picket-code-<tag>-offline-wsl.zip` 或里面的 `picket-code-server-<version>-linux-x64.tar.gz` |
+| **取消** | 什么都不做，窗口不会开 |
 
-## 不想装扩展的话
+装好之后窗口自动打开，之后再连同一发行版不再询问。
 
-目的只是"在 Windows 上编辑 WSL 里的工程"时，可以直接打开 `\\wsl.localhost\Ubuntu\home\<user>\...`，或在 WSL 内启动 `picket-code .` 走 WSLg 显示。代价是文件监听与端口转发要自己处理。
+## 服务器载荷
+
+载荷是 `picket-code-server-<server 版本>-linux-x64.tar.gz`（约 88 MB，扁平 tar，含 `bin/`、`out/`、`product.json`）。来源优先级：
+
+1. `picket.wsl.serverPayloadPath` 指向的本地文件；
+2. 构建内嵌的载荷（内网正式版才有，首次零交互）；
+3. `picket.wsl.serverPayloadBaseUrl` 下的同名文件。
+
+无论哪种来源，都按**客户端自带 catalog** 的 `size` + `sha256` 双重校验：校验不过就拒绝安装，不会把半份东西塞进你的目录。因此**跨版本混用一定失败**——用与客户端同一个 tag 的离线包。
+
+### 离线组件包
+
+发行页的 `picket-code-<tag>-offline-wsl.zip` 里是三样东西：
+
+```
+picket-code-server-1.143.1-linux-x64.tar.gz   载荷本体
+SHA256SUMS                                    载荷摘要
+catalog.json                                  载荷的版本/大小/摘要清单
+```
+
+用法二选一：
+
+- **首次连接时**在弹窗里选「从文件安装…」，直接选这个 **zip**（不必解压）；
+- **已经装过想换**：把 zip 里的 `tar.gz` 解出来，设 `picket.wsl.serverPayloadPath` 指向它，再执行 `Picket: 组件…` → 选 `wsl-server` → **重新安装**。
+
+内网镜像只要保证 `<base>/picket-code-server-<version>-linux-x64.tar.gz` 可取即可；自签 HTTPS 用 `picket.wsl.caFile`，需要沿用 VS Code 代理时保持 `picket.wsl.useProxy`（默认开）。
+
+### 装到哪
+
+| 内容 | 位置（在**目标发行版**里） |
+|---|---|
+| 载荷 | `~/.vscode-server/bin/picket-<server 版本>/`，同目录有 `.picket-payload.json` 记录来源与摘要，安装锁是 `.picket-install` |
+| 运行时状态 | `~/.picket-code-server/runtime/<发行版>.json`（跨窗口复用同一个服务器，不做退出即杀） |
+| 服务器数据 | `~/.vscode-server`（与官方 Remote-WSL 同一数据根，所以卸载官方扩展后扩展、设置、历史都还在） |
+| 命令行 | `~/.local/bin/picket-code`，链接到载荷里的 `bin/picket-code` |
+
+多发行版各装各的，互不共享。
+
+## iCode
+
+装了 iCode 的发行版可以顺带把它接成 agent：设置 `picket.wsl.icodePath` 指向可执行文件；留空则在发行版的 `PATH` 里找 `icode`。找不到不会阻塞窗口，只是没有 agent。
+
+## 连接方式
+
+`picket.wsl.tunnelMode`：
+
+| 值 | 行为 |
+|---|---|
+| `auto`（默认） | 读 `%USERPROFILE%\.wslconfig`：`[wsl2] localhostForwarding=false` 或 `networkingMode=mirrored` 时走 stdio 隧道，其余直连 `127.0.0.1` |
+| `direct` | 强制直连转发端口 |
+| `stdio` | 强制每个窗口一条本地管道隧道（跨窗口共享、不依赖端口转发） |
+
+服务器启动 90 秒内没有输出会被判失败（`picket.wsl.startTimeoutSeconds`）；想固定用登录 shell 启动可设 `picket.wsl.shell`。
+
+## 常用命令
+
+| 命令 | 作用 |
+|---|---|
+| `Picket: Open Folder in WSL…` | 选发行版 + 文件夹，连接并开窗口 |
+| `Picket: Reopen Folder in WSL` / `… in Windows` | 在 WSL 窗口与 Windows 窗口之间来回切 |
+| `Picket: Show WSL Log` | 打开扩展日志（也落盘在 `%APPDATA%\picket-code\logs\<会话>\window*\exthost\noware.picket-remote-wsl\picket-wsl.log`） |
+| `Picket: 组件…` | 查看/安装/重装/清理服务器载荷，显示当前状态与来源 |
+| `Picket: 诊断 WSL 支持` | 一次性报告：发行版、载荷、运行时、端口、官方扩展拦截、iCode 探测 |
+| `Picket: Stop WSL Server` | 阶梯停止目标发行版里的服务器（先 SIGTERM，再 SIGKILL） |
+| `Picket: 在 WSL 中安装命令行…` / `从 WSL 中移除命令行` | 管理 `~/.local/bin/picket-code` |
+| `Picket: 添加发行版…` / `设为默认发行版` / `删除发行版…` | 发行版管理（删除只清载荷与运行时记录） |
+| `Picket: 选择扩展市场来源` / `从 VSIX 安装扩展…` | 内网环境下的扩展来源 |
+
+## 卸载官方扩展
+
+扩展一装上，本扩展就会在 WSL 目标视图里提示拦截。处理方式：
+
+- `Picket: 卸载官方 Remote-WSL 扩展（保留数据）` —— 直接卸载扩展，**不碰** `~/.vscode-server` 里的服务器数据、扩展、设置与历史；
+- `Picket: 如何卸载官方 Remote-WSL 扩展` —— 打印手工卸载步骤（扩展面板 → 齿轮 → 卸载，或 `picket-code.exe --uninstall-extension ms-vscode-remote.remote-wsl`）。
+
+两个扩展不能共存是硬约束，不是偏好。
+
+## 常见问题
+
+| 现象 | 原因与处理 |
+|---|---|
+| `File system provider for vscode-remote://picket-wsl%2Bubuntu/home/… is not available.` | **rc.8 的已知缺陷**：`Open Folder in WSL…` 用远端 URI 作为对话框默认目录，而那时还没有远端文件系统。修复在后续 RC。rc.8 上的变通：先用「文件 → 打开文件夹」打开 `\\wsl.localhost\<发行版>\home\<用户>`（这是本地文件夹），再执行 `Picket: Reopen Folder in WSL` |
+| `Size mismatch for …: expected …, got …` | 选错了文件（例如把 iCode 的离线包当成载荷），或跨版本混用。用与客户端同一 tag 的载荷/离线包；下次报错会直接打印被读到的文件路径 |
+| `Checksum mismatch for …` | 文件被截断或改过；重新下载并验证 `SHA256SUMS` |
+| `这个构建没有 WSL 服务器组件` | `payloads/catalog.json` 缺失或被裁剪，重装客户端 |
+| 弹窗一直要求下载 | 装到了另一个发行版（载荷按 `$HOME` 隔离），或 `serverDataFolderName` 被改 |
+| `Failed to connect to the remote extension host server` | 服务器起来了但握手失败：看 `Picket: Show WSL Log` 与发行版内 `~/.vscode-server/data/logs/<时间戳>/`；先 `Picket: Stop WSL Server` 再重连 |
+| WSL 目标为空 | `wsl -l -v` 无输出 → 先装 WSL；有输出但视图空 → 执行 `Picket: 刷新 WSL 目标`、看 `Picket: 诊断 WSL 支持` |
+| 所有 WSL 命令都提示被禁用 | 官方 Remote-WSL 还装着，见[卸载官方扩展](#卸载官方扩展) |
+
+## 不用远程连接也行
+
+只想在 Windows 侧编辑 WSL 里的文件时，可以直接打开 `\\wsl.localhost\<发行版>\home\<用户>\...`（文件监听与端口转发要自己处理），或在 WSL 里用 WSLg 启动 `picket-code .`。

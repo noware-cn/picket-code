@@ -14,15 +14,11 @@
 - **上游 VS Code（Code - OSS）**：MIT；
 - 内置扩展与依赖遵循各自上游许可。
 
-## 不随发行版分发的微软组件
+## WSL 支持与微软组件
 
-[在 WSL 中使用](/guide/wsl) 需要微软的 **Remote-WSL 扩展**与 **VS Code Server**。这两样受微软 *Visual Studio Code Remote Development Extensions* 许可约束，本发行版**不内置、不镜像、不提供安装器**：
+[在 WSL 中使用](/guide/wsl) 不需要微软的 Remote-WSL 扩展或微软 CDN 上的 VS Code Server：客户端是本项目自研的内置扩展，服务端由上游 MIT 源码自行构建并随发行页分发载荷。官方扩展反而要求**卸载**——两个扩展抢同一个 authority，无法共存。
 
-- 自行获取、自行安装，且仅限**个人自用**——条款把使用场景绑在微软 VS Code 上，本发行版加载该扩展即已超出授权范围；
-- 打进发行版、对外镜像、做成一键安装器均属明确禁止；
-- 想做成产品能力，客户端需换 MIT 实现（如 `open-remote-wsl`），服务端需用上游 MIT 源码自建 reh server，命名避开微软商标。
-
-条款原文与逐条判断见 [手工安装 Remote-WSL 与 VS Code Server](https://github.com/noware-cn/picket-code/blob/main/docs/manual-remote-wsl.md) 第九节。
+这条路是怎么选出来的（微软 *Visual Studio Code Remote Development Extensions* 条款限制了什么、为什么不侧载官方扩展也不重新打包它）见 [手工安装 Remote-WSL 与 VS Code Server](https://github.com/noware-cn/picket-code/blob/main/docs/manual-remote-wsl.md) 第九节——那份文档现在只作为合规分析保留，不再是使用步骤。
 
 ## 商标声明
 
