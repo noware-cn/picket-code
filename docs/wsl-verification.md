@@ -54,7 +54,7 @@ shim 的写链路有 L2 argv 断言，但只有真实的 Windows 客户端能证
 
 ## 5. 卸载官方扩展后：数据接管与旧链接
 
-`acceptance.sh --takeover` 与 `--legacy-uri` 用的是夹具数据；这一步证明真实用户的历史数据也在。
+`acceptance.sh --isolation` 与 `--legacy-uri` 用的是夹具数据；这一步证明真实用户的 VS Code 数据不被读写、旧载荷会被迁移。
 
 摆现场：接第 4 项，在禁用提示上点「卸载（保留数据）」→ 重载窗口 → 打开任意发行版。
 另用一个存着 `vscode-remote://wsl+<发行版>/home/…` 的旧工作区文件（或用

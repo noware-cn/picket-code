@@ -8,10 +8,10 @@
 #
 #   bash build/wsl/acceptance.sh --all
 #   bash build/wsl/acceptance.sh --l2 --remote --tunnel --ui --lifecycle --icode
-#   bash build/wsl/acceptance.sh --conflict --takeover --legacy-uri
+#   bash build/wsl/acceptance.sh --conflict --isolation --legacy-uri
 #
-# --conflict / --takeover / --legacy-uri cover the official-extension handover:
-# the blocked window, the shared ~/.vscode-server taken over unchanged, and a
+# --conflict / --isolation / --legacy-uri cover the official-extension handover:
+# the blocked window, VS Code's own tree left untouched, and a
 # workspace opened through the legacy `wsl+<distro>` authority.
 #
 # Everything except --l2 needs a desktop session (Electron) and the payload
@@ -53,7 +53,7 @@ payload() {
 server_pids() {
 	# bin/picket-code-server is a sh wrapper that runs node as a child, so the
 	# server itself is the server-main.js process (matching both would double count).
-	pgrep -f "out/server-main.js .*user-data-dir=$SCRATCH/home/.vscode-server/data" || true
+	pgrep -f "out/server-main.js .*user-data-dir=$SCRATCH/home/.picket-code-server/data" || true
 }
 
 launch_window() { # $1 = log file
@@ -139,7 +139,7 @@ export_accept_env() {
 	export PICKET_WSL_ACCEPT_HOME="$SCRATCH"
 	# Per-stage expectations are opt-in: a stage that exported one would otherwise
 	# leak it into every later stage, which then fails an assertion it never set up
-	# (a stage without a preseeded server-env-setup fails the takeover hook).
+	# (a stage without a preseeded server-env-setup fails the hook stage).
 	unset WSL_HARNESS_EXPECT_ICODE_MISSING WSL_HARNESS_EXPECT_HOOK WSL_HARNESS_EXPECT_LEGACY
 	# fake-wsl mimics wsl.exe: the distro side only sees the vars listed here.
 	export WSLENV="WSL_HARNESS_FOLDER:WSL_HARNESS_EXPECT_ICODE_MISSING:WSL_HARNESS_EXPECT_HOOK:WSL_HARNESS_EXPECT_LEGACY"
@@ -155,10 +155,10 @@ folder_uri_for() { # $1 = authority prefix (picket-wsl or the legacy wsl)
 
 stage_window() { # $1 payload path, $2 configured icodePath, $3 tunnelMode
 	local payload="$1" icode="${2:-}" tunnel="${3:-auto}"
-	pkill -KILL -f "user-data-dir=$SCRATCH/home/.vscode-server/data" 2>/dev/null || true
+	pkill -KILL -f "user-data-dir=$SCRATCH/home/.picket-code-server/data" 2>/dev/null || true
 	pkill -KILL -f "user-data-dir=$USER_DATA" 2>/dev/null || true
 	rm -rf "$SCRATCH/home" "$SCRATCH/user-data" "$SCRATCH/ext"
-	mkdir -p "$SCRATCH/home/.picket-code-server" "$SCRATCH/home/.vscode-server" "$SCRATCH/user-data/User" "$SCRATCH/user-data/extensions" "$SCRATCH/logs" "$FOLDER" "$STAGING"
+	mkdir -p "$SCRATCH/home/.picket-code-server" "$SCRATCH/user-data/User" "$SCRATCH/user-data/extensions" "$SCRATCH/logs" "$FOLDER" "$STAGING"
 	echo '# acceptance profile marker (proves the server runs under the login shell)' > "$SCRATCH/home/.profile"
 	echo 'export PICKET_ACCEPT_PROFILE_MARKER=from-login-shell' >> "$SCRATCH/home/.profile"
 	if ! cp -r "$ROOT/vscode/extensions/picket-remote-wsl/." "$STAGING"; then
@@ -181,8 +181,8 @@ stage_window() { # $1 payload path, $2 configured icodePath, $3 tunnelMode
 	' "$STAGING/package.json" || { ko stage "could not rewrite the staged manifest"; return 1; }
 	# The harness asserts from inside the remote extension host, so it has to be
 	# installed into the distro-side extensions dir the server scans.
-	mkdir -p "$SCRATCH/home/.vscode-server/extensions"
-	if ! cp -r "$HARNESS" "$SCRATCH/home/.vscode-server/extensions/picket.picket-wsl-harness-0.0.0"; then
+	mkdir -p "$SCRATCH/home/.picket-code-server/extensions"
+	if ! cp -r "$HARNESS" "$SCRATCH/home/.picket-code-server/extensions/picket.picket-wsl-harness-0.0.0"; then
 		ko stage "could not install the harness extension"
 		return 1
 	fi
@@ -402,78 +402,70 @@ run_conflict() {
 	ok conflict
 }
 
-run_takeover() {
-	echo "--- takeover: the official server's ~/.vscode-server survives intact"
+run_isolation() {
+	echo "--- isolation: VS Code's ~/.vscode-server is nobody's data directory"
 	local payload
-	payload=$(payload) || { ko takeover "payload tarball or catalog.json missing under build/wsl/download (run build/wsl/fetch-payload.sh)"; return; }
+	payload=$(payload) || { ko isolation "payload tarball or catalog.json missing under build/wsl/download (run build/wsl/fetch-payload.sh)"; return; }
 	stage_window "$payload" || return
 
-	local root="$SCRATCH/home/.vscode-server"
-	mkdir -p "$root/data/User" "$root/extensions"
-	printf '{\n\t"editor.fontSize": 15\n}\n' > "$root/data/User/settings.json"
-	printf 'export PICKET_OFFICIAL_HOOK=kept\n' > "$root/server-env-setup"
+	# A full VS Code tree: user settings, an extension in extensions.json, a hook
+	# file and a payload left by an earlier build of this client.
+	local legacy="$SCRATCH/home/.vscode-server"
+	mkdir -p "$legacy/data/User" "$legacy/extensions/carried-1.0.0" "$legacy/bin/picket-marker-0.0.1/bin"
+	printf '{\n\t"editor.fontSize": 15\n}\n' > "$legacy/data/User/settings.json"
+	printf 'export PICKET_OFFICIAL_HOOK=kept\n' > "$legacy/server-env-setup"
+	printf '#!/bin/sh\nexit 0\n' > "$legacy/bin/picket-marker-0.0.1/bin/picket-code-server"
 	if ! node -e '
 		const fs = require("fs");
 		const [root] = process.argv.slice(1);
 		const dir = root + "/extensions/carried-1.0.0";
-		fs.mkdirSync(dir, { recursive: true });
 		fs.writeFileSync(dir + "/package.json", JSON.stringify({
 			name: "carried", publisher: "legacy", version: "1.0.0",
 			engines: { vscode: "^1.60.0" }, main: "./extension.js", private: true
 		}, null, "\t") + "\n");
 		fs.writeFileSync(dir + "/extension.js", "exports.activate = () => { };\n");
-		// The cache is authoritative: a folder the server does not find listed here
-		// is not scanned, and the harness (installed by the driver) would never run.
-		const harness = "picket.picket-wsl-harness-0.0.0";
 		fs.writeFileSync(root + "/extensions/extensions.json", JSON.stringify([{
 			identifier: { id: "legacy.carried" }, version: "1.0.0",
 			location: { $mid: 1, path: dir, scheme: "file" },
 			relativeLocation: "carried-1.0.0"
-		}, {
-			identifier: { id: "picket.picket-wsl-harness" }, version: "0.0.0",
-			location: { $mid: 1, path: root + "/extensions/" + harness, scheme: "file" },
-			relativeLocation: harness
 		}], null, "\t") + "\n");
-	' "$root"; then
-		ko takeover "could not preseed the shared server tree"; return
+	' "$legacy"; then
+		ko isolation "could not preseed the VS Code tree"; return
 	fi
-	local hook_before settings_before
-	hook_before=$(sha256sum "$root/server-env-setup" | cut -d" " -f1)
-	settings_before=$(sha256sum "$root/data/User/settings.json" | cut -d" " -f1)
+	# Everything except a payload an earlier build left there must survive byte
+	# for byte; that payload is the one thing this client may move out.
+	fingerprint() { (cd "$legacy" && find . -type f -not -path "./bin/picket-*" -exec sha256sum {} + | sort | sha256sum | cut -d" " -f1); }
+	local before
+	before=$(fingerprint)
+	[ -n "$before" ] || { ko isolation "could not fingerprint the VS Code tree"; return; }
 
-	# The hook is the proof that takeover reads the old tree instead of replacing
-	# it: it is sourced by the launch and must reach the remote extension host.
+	# The hook lives in our tree now: prove the launch still sources it.
+	printf 'export PICKET_OFFICIAL_HOOK=kept\n' > "$SCRATCH/home/.picket-code-server/server-env-setup"
 	export WSL_HARNESS_EXPECT_HOOK=1
-	local log="$SCRATCH/logs/takeover.log" pid
+	local log="$SCRATCH/logs/isolation.log" pid
 	pid=$(launch_window "$log")
 	if ! await_results "$REMOTE_DEADLINE"; then
 		kill_window "$pid"
-		ko takeover "window never connected (log: $log)"; return
+		ko isolation "window never connected (log: $log)"; return
 	fi
-	snapshot_results takeover
+	snapshot_results isolation
 	kill_window "$pid"
 
-	if [ "$(sha256sum "$root/server-env-setup" | cut -d" " -f1)" != "$hook_before" ]; then
-		ko takeover "server-env-setup was rewritten"; return
+	if ! grep -q "user-data-dir=$SCRATCH/home/.picket-code-server/data" "$log"; then
+		ko isolation "the server did not run on our own data directory"; return
 	fi
-	if [ "$(sha256sum "$root/data/User/settings.json" | cut -d" " -f1)" != "$settings_before" ]; then
-		ko takeover "the server's user settings were rewritten"; return
+	# The only thing isolation may remove from the old tree is a payload an
+	# earlier build installed there; everything else must be byte-identical.
+	if [ "$(fingerprint)" != "$before" ]; then
+		ko isolation "the VS Code tree changed while we ran"; return
 	fi
-	local carried
-	carried=$(node -e '
-		const fs = require("fs");
-		const raw = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
-		const list = Array.isArray(raw) ? raw : (raw.extensions || []);
-		const hit = list.find(e => (e.identifier && e.identifier.id) === "legacy.carried");
-		process.stdout.write(hit ? "ok" : "fail: legacy.carried disappeared from extensions.json");
-	' "$root/extensions/extensions.json" 2>&1)
-	[ "$carried" = ok ] || { ko takeover "$carried"; return; }
-	local stray
-	stray=$(find "$root/bin" -maxdepth 1 -mindepth 1 -printf '%f\n' 2>/dev/null | grep -vE '^picket-' || true)
-	if [ -n "$stray" ]; then
-		ko takeover "unexpected entries under ~/.vscode-server/bin: $stray"; return
+	if [ -f "$legacy/bin/picket-marker-0.0.1/bin/picket-code-server" ]; then
+		ko isolation "the payload left in the VS Code tree was not migrated"; return
 	fi
-	if print_results b2 b3 b4 b5 hook; then ok takeover; else ko takeover "harness checks failed (log: $log)"; fi
+	if [ ! -x "$SCRATCH/home/.picket-code-server/bin/picket-marker-0.0.1/bin/picket-code-server" ]; then
+		ko isolation "the migrated payload is not under ~/.picket-code-server/bin"; return
+	fi
+	if print_results b2 b3 b4 b5 hook; then ok isolation; else ko isolation "harness checks failed (log: $log)"; fi
 }
 
 run_legacy_uri() {
@@ -496,12 +488,12 @@ run_legacy_uri() {
 }
 
 usage() {
-	echo "usage: bash build/wsl/acceptance.sh [--l2] [--remote] [--tunnel] [--ui] [--lifecycle] [--icode] [--conflict] [--takeover] [--legacy-uri] [--all]"
+	echo "usage: bash build/wsl/acceptance.sh [--l2] [--remote] [--tunnel] [--ui] [--lifecycle] [--icode] [--conflict] [--isolation] [--legacy-uri] [--all]"
 }
 
 main() {
 	[ $# -eq 0 ] && { usage; exit 2; }
-	local l2=0 remote=0 tunnel=0 ui=0 lifecycle=0 icode=0 conflict=0 takeover=0 legacy=0
+	local l2=0 remote=0 tunnel=0 ui=0 lifecycle=0 icode=0 conflict=0 isolation=0 legacy=0
 	while [ $# -gt 0 ]; do
 		case "$1" in
 			--l2) l2=1 ;;
@@ -511,9 +503,9 @@ main() {
 			--lifecycle) lifecycle=1 ;;
 			--icode) icode=1 ;;
 			--conflict) conflict=1 ;;
-			--takeover) takeover=1 ;;
+			--isolation) isolation=1 ;;
 			--legacy-uri) legacy=1 ;;
-			--all) l2=1 remote=1 tunnel=1 ui=1 lifecycle=1 icode=1 conflict=1 takeover=1 legacy=1 ;;
+			--all) l2=1 remote=1 tunnel=1 ui=1 lifecycle=1 icode=1 conflict=1 isolation=1 legacy=1 ;;
 			*) usage; exit 2 ;;
 		esac
 		shift
@@ -521,7 +513,7 @@ main() {
 
 	# A window left behind by an interrupt would hold the display and the
 	# scratch directory the next stage wipes.
-	trap 'pkill -KILL -f "user-data-dir=$USER_DATA" 2>/dev/null; pkill -KILL -f "out/server-main.js .*user-data-dir=$SCRATCH/home/.vscode-server/data" 2>/dev/null; true' EXIT
+	trap 'pkill -KILL -f "user-data-dir=$USER_DATA" 2>/dev/null; pkill -KILL -f "out/server-main.js .*user-data-dir=$SCRATCH/home/.picket-code-server/data" 2>/dev/null; true' EXIT
 
 	[ $l2 -eq 1 ] && run_l2
 	[ $remote -eq 1 ] && run_remote
@@ -530,7 +522,7 @@ main() {
 	[ $lifecycle -eq 1 ] && run_lifecycle
 	[ $icode -eq 1 ] && run_icode
 	[ $conflict -eq 1 ] && run_conflict
-	[ $takeover -eq 1 ] && run_takeover
+	[ $isolation -eq 1 ] && run_isolation
 	[ $legacy -eq 1 ] && run_legacy_uri
 
 	if [ "$FAILED" -eq 0 ]; then

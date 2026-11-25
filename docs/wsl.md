@@ -19,7 +19,7 @@ Remote-WSL 扩展已卸载**（它装在本产品上时，WSL 功能整体关闭
 ## 与官方 Remote-WSL 扩展的关系
 
 本扩展与微软官方 `ms-vscode-remote.remote-wsl` 是**替代关系，不能共存**：两者抢同一个
-`wsl+` 授权前缀、同一份 `~/.vscode-server` 目录、同一个服务端口，允许"同时装着、只用一个"
+`wsl+` 授权前缀与同一个服务端口；数据根是分开的（本客户端用 `~/.picket-code-server`），所以"同时装着、只用一个"
 只会让用户在两次窗口重载之间得到随机结果。所以官方扩展**只要装着**（启用、禁用、是否激活
 都算），本产品的 WSL 功能就整体关闭：
 
@@ -28,7 +28,7 @@ Remote-WSL 扩展已卸载**（它装在本产品上时，WSL 功能整体关闭
   `如何卸载官方 Remote-WSL 扩展`（也就是出去的那条路）；
 - 用 `picket-wsl+<发行版>` 或 `wsl+<发行版>` 打开文件夹会失败。
 
-**卸载不会删除任何数据**——`~/.vscode-server` 里的服务器、扩展、设置、钩子，Windows 侧的
+**卸载不会删除任何数据**——VS Code 自己的 `~/.vscode-server` 与本客户端的 `~/.picket-code-server`，Windows 侧的
 用户设置与下载缓存全部保留，本产品接管后直接使用（`wsl+<发行版>` 的旧工作区地址也会被自动
 规范化）。三种卸载方式（禁用提示一键卸载 / 扩展视图 / 命令行）、保留清单与确认方法见
 [`docs/uninstall-official-remote-wsl.md`](uninstall-official-remote-wsl.md)，扩展内也有
@@ -109,13 +109,13 @@ VS Code 的代理设置：
 装在不常见的位置时用 `picket.wsl.icodePath` 指定绝对路径；指错了不会阻塞窗口，只是
 这一项不生效（`Picket: 诊断 WSL 支持` 会显示实际结果）。
 
-需要额外的初始化钩子：在发行版里建 `~/.vscode-server/server-env-setup`（普通
+需要额外的初始化钩子：在发行版里建 `~/.picket-code-server/server-env-setup`（普通
 shell 脚本），服务器启动前会被 source。
 
 ## 命令行
 
 `Picket: 在 WSL 中安装命令行…` 在发行版里放一个 `picket-code` shim（脚本在
-`~/.vscode-server/bin/picket-<版本>/bin/picket-code`，链接在 `~/.local/bin/picket-code`）。
+`~/.picket-code-server/bin/picket-<版本>/bin/picket-code`，链接在 `~/.local/bin/picket-code`）。
 如果 `~/.local/bin/code` **还是空的**，会顺手链一份 `code` 别名；已经存在（比如官方 Remote-WSL
 装的那个，或者你自己装的）就不动它——要用哪个名字都会明确告诉你。`~/.local/bin`
 必须在该发行版的 `PATH` 里——绝大多数发行版默认如此，若提示 `command not found` 就往
@@ -156,35 +156,37 @@ Open VSX / 自定义地址 / 关闭。
 
 ## 磁盘布局
 
-全在发行版里，不写 Windows 侧。数据根是 **`~/.vscode-server`**——和官方 Remote-WSL 用的
-是同一个目录，这正是"卸载官方扩展不丢任何东西"的原因：
+全在发行版里，不写 Windows 侧。数据根是 **`~/.picket-code-server`**，与 VS Code 完全分开：
+VS Code 的 `~/.vscode-server` 我们一个字节都不读也不写。
 
 ```
-~/.vscode-server/
+~/.picket-code-server/
 ├── bin/picket-<服务器版本>/     载荷（node、out/、bin/picket-code-server、remote-cli）
-├── bin/<官方 commit>/           官方扩展装的那份服务器（接管后保留但不再使用）
-├── data/                        服务器 user-data（日志在 data/logs/<时间戳>/），与官方共用
-├── extensions/                  发行版侧扩展，与官方共用
-└── server-env-setup             可选：服务器启动前的钩子脚本，与官方共用
-
-~/.picket-code-server/           本产品私有的运行状态
+├── data/                        服务器 user-data（日志在 data/logs/<时间戳>/）
+├── data/Machine/settings.json   可选：从 VS Code 导入的 machine 设置
+├── extensions/                  发行版侧扩展（首次连接可一次性从 VS Code 导入）
+├── server-env-setup             可选：服务器启动前的钩子脚本
 ├── runtime/<发行版>.json        当前服务器的 port/token/pid/版本/tunnelMode
-└── runtime/<发行版>.json.lock   启动锁（启动中窗口持有）
+├── runtime/<发行版>.json.lock   启动锁（启动中窗口持有）
+├── logs/                        Picket 自己的日志
+└── .imported                    已经回答过"要不要从 VS Code 导入"
 ```
 
-只有 `~/.picket-code-server/` 是本产品私有的；其余位置与官方扩展重叠，所以两者不能同时工作。
-旧的载荷版本不会自动删；`Picket: 组件…` → 「清理旧版本」只保留当前版本，或直接
-`rm -rf ~/.vscode-server/bin/picket-<旧版本>`（别删 `bin/<40 位 commit>` 目录，那是官方
-服务器，删了不影响本产品，但会让"装回官方扩展"重新下载一次）。
+早期版本把载荷装在 `~/.vscode-server/bin/picket-*`；首次连接会自动迁移到
+`~/.picket-code-server/bin/`（复制、校验、删旧），不需要重新下载。旧的载荷版本不会自动删；
+`Picket: 组件…` → 「清理旧版本」只保留当前版本。
+
+**导入 VS Code 的数据**：首次连到一个"VS Code 用过"的发行版会问一次（全新开始 / 导入
+扩展 / 只导入设置）。导入是**复制**，`ms-vscode-remote.*` 与 Copilot 系列刻意跳过（抢
+authority 或已被裁掉）。随时可以重跑 `Picket: 从 VS Code 导入 WSL 扩展与设置…`。
 
 ## 停止与清理
 
 - `Picket: Stop WSL Server`：停止该发行版的服务器。窗口关掉**不会**停服务器（重开
   窗口直接复用，这正是「一个发行版一个服务器」的实现方式）。
-- 彻底清理：先在每个窗口执行 Stop，再 `rm -rf ~/.picket-code-server ~/.vscode-server`。
-  **注意** `~/.vscode-server` 是共用的：这一步会连在 WSL 里装的扩展、设置与日志一起删掉，
-  官方扩展装回来也要重新下载服务器。只想清本产品的部分，就只删
-  `~/.picket-code-server` 与 `~/.vscode-server/bin/picket-*`。
+- 彻底清理本产品：先在每个窗口执行 Stop，再 `rm -rf ~/.picket-code-server`。
+  VS Code 的 `~/.vscode-server` 不受影响；如果早期版本在那里留过载荷，
+  `rm -rf ~/.vscode-server/bin/picket-*` 即可（别删 `bin/<40 位 commit>`，那是官方服务器）。
 
 ## 已知限制
 

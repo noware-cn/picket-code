@@ -61,9 +61,25 @@
 
 ## 受控市场（P0-3 规划）
 
-- 默认市场：**Open VSX**，可指向自建镜像；
-- 白名单策略：受控市场 + 扩展签名校验；
+- 默认市场：**Open VSX**，可指向自建镜像（`Picket: 选择扩展市场来源`）；
+- 白名单策略：受控市场 + 扩展来源审查；**签名校验当前构建未启用**（载荷未带 `@vscode/vsce-sign`，安装时会记一条 `Signature verification was not executed`，扩展仍会装上）；
 - 恢复某扩展：从 `build/extensions-remove.list` 删除对应行后重建，或从受控市场按需安装。
+
+## 想用微软市场？可以配，但不建议
+
+微软 MarketPlace 的使用条款把 API 访问限定给 Visual Studio Code 本身，其它客户端调用它属于**违约**（与版权无关）。我们**不预置**这个地址，也不代理、不镜像它的下载；下面只是"用户自担风险"的配置方法，出事与本产品无关：
+
+1. 命令面板 → `Picket: 选择扩展市场来源` → 选"自定义"；
+2. 填 `https://marketplace.visualstudio.com/_apis/public/gallery`；
+3. 重载窗口后搜索安装。
+
+风险清单：
+
+- **条款风险**：可能被判违约，账号或 IP 被限流/封禁；企业环境请先问法务；
+- **扩展许可风险**：专有扩展（Pylance、C# / C# Dev Kit、Copilot、Remote-SSH/Containers/WSL）把"只能配合 VS Code 使用"写进许可，装到这里属于超出授权；我们不内置、不推荐、不提供一键安装；
+- **升级风险**：微软市场会推 `engines.vscode` 高于本版的版本，装上后可能不激活；本客户端 1.143.1 的 API 面与官方同版本一致，但内置扩展被裁过，依赖它们的扩展会降级（见下文"WSL 远程开发"与 GitHub 认证一条）。
+
+**合法的替代路径**（同等能力，可分发）：Python 用 BasedPyright / Pyright，C# 用 OmniSharp，C/C++ 用 clangd + CodeLLDB，AI 补全用 iCode，远程开发用内置的 `picket-remote-wsl`。
 
 ## WSL 远程开发
 

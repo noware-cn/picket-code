@@ -2,7 +2,7 @@
 
 Picket Code 自带 WSL 支持：一个内置扩展（`noware.picket-remote-wsl`）加一份**我们自己的 Linux 服务端载荷**。不需要侧载微软 Remote-WSL，也不需要手工预置 VS Code Server——首次连接时客户端自己把载荷装进目标发行版，之后每次开窗口都复用它。
 
-> 官方 `ms-vscode-remote.remote-wsl` **必须卸载**。两个扩展抢同一个 `wsl+` authority、同一个 `~/.vscode-server` 树和同一个服务器端口，先解析到的那个独占文件夹。只要官方扩展还装着（启用、禁用、未激活都算），本扩展的所有 WSL 功能一律关闭。卸载**不会**删你的服务器数据，见[卸载官方扩展](#卸载官方扩展)。
+> 官方 `ms-vscode-remote.remote-wsl` **必须卸载**。两个扩展抢同一个 `wsl+` authority 和同一个服务器端口，先解析到的那个独占文件夹。只要官方扩展还装着（启用、禁用、未激活都算），本扩展的所有 WSL 功能一律关闭。Picket Code 使用**独立数据根** `~/.picket-code-server`（不与 VS Code 共用），所以卸载官方扩展既不会删你的 VS Code 数据，也不影响本客户端自己的数据。
 
 ## 前提
 
@@ -64,9 +64,9 @@ catalog.json                                  载荷的版本/大小/摘要清�
 
 | 内容 | 位置（在**目标发行版**里） |
 |---|---|
-| 载荷 | `~/.vscode-server/bin/picket-<server 版本>/`，同目录有 `.picket-payload.json` 记录来源与摘要，安装锁是 `.picket-install` |
+| 载荷 | `~/.picket-code-server/bin/picket-<server 版本>/`，同目录有 `.picket-payload.json` 记录来源与摘要，安装锁是 `.picket-install` |
 | 运行时状态 | `~/.picket-code-server/runtime/<发行版>.json`（跨窗口复用同一个服务器，不做退出即杀） |
-| 服务器数据 | `~/.vscode-server`（与官方 Remote-WSL 同一数据根，所以卸载官方扩展后扩展、设置、历史都还在） |
+| 服务器数据 | `~/.picket-code-server`（**独立数据根**：VS Code 的 `~/.vscode-server` 不被读写；旧版本装在那里的载荷会在首次连接时自动迁移过来） |
 | 命令行 | `~/.local/bin/picket-code`，链接到载荷里的 `bin/picket-code` |
 
 多发行版各装各的，互不共享。
@@ -105,7 +105,7 @@ catalog.json                                  载荷的版本/大小/摘要清�
 
 扩展一装上，本扩展就会在 WSL 目标视图里提示拦截。处理方式：
 
-- `Picket: 卸载官方 Remote-WSL 扩展（保留数据）` —— 直接卸载扩展，**不碰** `~/.vscode-server` 里的服务器数据、扩展、设置与历史；
+- `Picket: 卸载官方 Remote-WSL 扩展（保留数据）` —— 直接卸载扩展，**不碰**任何数据目录（本客户端本来就不写 VS Code 的 `~/.vscode-server`）；
 - `Picket: 如何卸载官方 Remote-WSL 扩展` —— 打印手工卸载步骤（扩展面板 → 齿轮 → 卸载，或 `picket-code.exe --uninstall-extension ms-vscode-remote.remote-wsl`）。
 
 两个扩展不能共存是硬约束，不是偏好。
@@ -119,7 +119,7 @@ catalog.json                                  载荷的版本/大小/摘要清�
 | `Checksum mismatch for …` | 文件被截断或改过；重新下载并验证 `SHA256SUMS` |
 | `这个构建没有 WSL 服务器组件` | `payloads/catalog.json` 缺失或被裁剪，重装客户端 |
 | 弹窗一直要求下载 | 装到了另一个发行版（载荷按 `$HOME` 隔离），或 `serverDataFolderName` 被改 |
-| `Failed to connect to the remote extension host server` | 服务器起来了但握手失败：看 `Picket: Show WSL Log` 与发行版内 `~/.vscode-server/data/logs/<时间戳>/`；先 `Picket: Stop WSL Server` 再重连 |
+| `Failed to connect to the remote extension host server` | 服务器起来了但握手失败：看 `Picket: Show WSL Log` 与发行版内 `~/.picket-code-server/data/logs/<时间戳>/`；先 `Picket: Stop WSL Server` 再重连 |
 | WSL 目标为空 | `wsl -l -v` 无输出 → 先装 WSL；有输出但视图空 → 执行 `Picket: 刷新 WSL 目标`、看 `Picket: 诊断 WSL 支持` |
 | 所有 WSL 命令都提示被禁用 | 官方 Remote-WSL 还装着，见[卸载官方扩展](#卸载官方扩展) |
 

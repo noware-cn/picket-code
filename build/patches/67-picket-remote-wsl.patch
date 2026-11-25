@@ -330,10 +330,10 @@ index 00000000..7c32d5b2
 +module.exports = { activate, deactivate };
 diff --git a/extensions/picket-remote-wsl/package.json b/extensions/picket-remote-wsl/package.json
 new file mode 100644
-index 00000000..4d588c3b
+index 00000000..07e31c2f
 --- /dev/null
 +++ b/extensions/picket-remote-wsl/package.json
-@@ -0,0 +1,364 @@
+@@ -0,0 +1,373 @@
 +{
 +	"name": "picket-remote-wsl",
 +	"displayName": "Picket Remote - WSL",
@@ -434,6 +434,11 @@ index 00000000..4d588c3b
 +				"category": "Picket"
 +			},
 +			{
++				"command": "picket.wsl.importFromVSCode",
++				"title": "从 VS Code 导入 WSL 扩展与设置…",
++				"category": "Picket"
++			},
++			{
 +				"command": "picket.wsl.refreshTargets",
 +				"title": "刷新 WSL 目标",
 +				"category": "Picket"
@@ -505,6 +510,10 @@ index 00000000..4d588c3b
 +				},
 +				{
 +					"command": "picket.wsl.removeCli",
++					"when": "isWindows && !isWeb && !picketWsl.blocked"
++				},
++				{
++					"command": "picket.wsl.importFromVSCode",
 +					"when": "isWindows && !isWeb && !picketWsl.blocked"
 +				},
 +				{
@@ -922,10 +931,10 @@ index 00000000..45983e00
 +module.exports = { loadCatalog };
 diff --git a/extensions/picket-remote-wsl/src/commands.js b/extensions/picket-remote-wsl/src/commands.js
 new file mode 100644
-index 00000000..e5d659d6
+index 00000000..8148fe9e
 --- /dev/null
 +++ b/extensions/picket-remote-wsl/src/commands.js
-@@ -0,0 +1,553 @@
+@@ -0,0 +1,609 @@
 +'use strict';
 +
 +const { listDistros, distroHome, visibleDistros } = require('./distro.js');
@@ -936,6 +945,7 @@ index 00000000..e5d659d6
 +const { unpackOfflineBundle, removeBundle } = require('./offline.js');
 +const { installShim, removeShim } = require('./shim.js');
 +const { uninstallOfficialExtension } = require('./uninstall.js');
++const { detectLegacy, importLegacy, markAnswered, prepareHome } = require('./isolate.js');
 +
 +const LAST_DISTRO = 'picket.wsl.lastDistro';
 +const SERVER_COMPONENT = 'wsl-server';
@@ -1138,10 +1148,63 @@ index 00000000..e5d659d6
 +	}
 +
 +	/** @param {string} distro @param {string} posixPath @param {string} home */
++	/**
++	 * Isolation gives the user an empty tree: none of their VS Code extensions
++	 * or machine settings are there. Ask once per distro and copy what they
++	 * choose — the VS Code tree is read, never written.
++	 * @param {{ distro: string, home: string, force?: boolean }} target
++	 */
++	async function offerImport(target) {
++		const legacy = await detectLegacy({ runner, distro: target.distro, home: target.home });
++		if (!legacy) {
++			if (target.force) {
++				await host.showInformationMessage('这个发行版里没有可导入的 VS Code 数据，或者已经导入过了。');
++			}
++			return;
++		}
++		const choice = await host.showInformationMessage(
++			`检测到 VS Code 在此发行版里有 ${legacy.extensions} 个扩展。Picket Code 使用独立的 ~/.picket-code-server，不会改动 VS Code 的目录。要导入吗？`,
++			'导入扩展与设置', '只导入扩展', '只导入设置', '全新开始'
++		);
++		if (!choice || choice === '全新开始') {
++			await markAnswered({ runner, distro: target.distro, home: target.home });
++			return;
++		}
++		const withExtensions = choice !== '只导入设置';
++		const withSettings = choice !== '只导入扩展';
++		try {
++			const result = await importLegacy({ runner, distro: target.distro, home: target.home, extensions: withExtensions, settings: withSettings });
++			const bits = [];
++			if (withExtensions) {
++				bits.push(`${result.copied.length} 个扩展`);
++			}
++			if (result.settings) {
++				bits.push('Machine 设置');
++			}
++			await host.showInformationMessage(bits.length > 0
++				? `已从 VS Code 导入 ${bits.join(' 与 ')}。云端助理类扩展（Remote 系列、Copilot 系列）刻意跳过。`
++				: '没有可导入的内容。');
++			options.log?.info(`Imported from ~/.vscode-server: ${result.copied.length} extensions, settings=${result.settings}`);
++		} catch (error) {
++			await host.showErrorMessage(`导入 VS Code 数据失败：${error.message}`);
++		}
++	}
++
++	async function importFromVSCode() {
++		const distro = await targetDistro('选择要从哪个发行版导入 VS Code 数据');
++		if (!distro) {
++			return;
++		}
++		const home = await distroHomeOf(runner, distro);
++		await prepareHome({ runner, distro, home, log: options.log });
++		await offerImport({ distro, home, force: true });
++	}
++
 +	async function connect(distro, posixPath, home) {
 +		if (!await ensureComponentInteractive({ distro, home })) {
 +			return;
 +		}
++		await offerImport({ distro, home });
 +		await host.openFolder(
 +			host.uriFor({ scheme: 'vscode-remote', authority: `${AUTHORITY_PREFIX}+${distro}`, path: posixPath }),
 +			{ forceNewWindow: true, remoteAuthority: `${AUTHORITY_PREFIX}+${distro}` }
@@ -1415,6 +1478,7 @@ index 00000000..e5d659d6
 +		installVsix: vsixCommand,
 +		installCli,
 +		removeCli,
++		importFromVSCode,
 +		ensureComponentInteractive,
 +		pickDistro
 +	};
@@ -1451,7 +1515,8 @@ index 00000000..e5d659d6
 +	'picket.wsl.selectGallery': (api) => () => api.selectGallery(),
 +	'picket.wsl.installVsix': (api) => () => api.installVsix(),
 +	'picket.wsl.installCli': (api) => () => api.installCli(),
-+	'picket.wsl.removeCli': (api) => () => api.removeCli()
++	'picket.wsl.removeCli': (api) => () => api.removeCli(),
++	'picket.wsl.importFromVSCode': (api) => () => api.importFromVSCode()
 +};
 +
 +/**
@@ -1481,16 +1546,17 @@ index 00000000..e5d659d6
 +module.exports = { createCommands, registerCommands, downloadFromSettings, COMMANDS, RESIDENT_COMMANDS, LAST_DISTRO };
 diff --git a/extensions/picket-remote-wsl/src/components.js b/extensions/picket-remote-wsl/src/components.js
 new file mode 100644
-index 00000000..1f6cdea3
+index 00000000..05b0de23
 --- /dev/null
 +++ b/extensions/picket-remote-wsl/src/components.js
-@@ -0,0 +1,323 @@
+@@ -0,0 +1,324 @@
 +'use strict';
 +
 +const { readFile, writeFile } = require('node:fs/promises');
 +const { acquireLock, releaseLock, lockAgeMs, touchLock } = require('./launch.js');
 +const { chooseSource, installPayload } = require('./payload.js');
 +const { compareVersions, normalizeWant, selectComponent, describeSelectionError } = require('./version.js');
++const { DATA_ROOT } = require('./isolate.js');
 +
 +/** @typedef {{ sha256: string, version: string, commit: string, source: string, installedAt: string }} IPayloadMarker */
 +/** @typedef {'absent' | 'installed' | 'outdated' | 'incompatible' | 'broken'} IPayloadState */
@@ -1530,7 +1596,7 @@ index 00000000..1f6cdea3
 + */
 +function createComponentManager(options) {
 +	const { catalog, runner, distro, home } = options;
-+	const payloadRoot = joinPath(home, '.vscode-server/bin');
++	const payloadRoot = joinPath(home, `${DATA_ROOT}/bin`);
 +	/** `mkdir` of this path is the install lock; `launch.js` owns the convention. */
 +	const installLock = joinPath(payloadRoot, INSTALL_LOCK_NAME);
 +
@@ -1810,10 +1876,10 @@ index 00000000..1f6cdea3
 +module.exports = { createComponentManager, markerPath };
 diff --git a/extensions/picket-remote-wsl/src/diagnose.js b/extensions/picket-remote-wsl/src/diagnose.js
 new file mode 100644
-index 00000000..965b4657
+index 00000000..5a520269
 --- /dev/null
 +++ b/extensions/picket-remote-wsl/src/diagnose.js
-@@ -0,0 +1,279 @@
+@@ -0,0 +1,280 @@
 +'use strict';
 +
 +const { readFile } = require('node:fs/promises');
@@ -1821,6 +1887,7 @@ index 00000000..965b4657
 +const { listDistros, defaultDistro, distroHome, wslStatus } = require('./distro.js');
 +const { readProduct } = require('./product.js');
 +const { detectIcode } = require('./icode.js');
++const { DATA_ROOT } = require('./isolate.js');
 +const { describeGallery } = require('./marketplace.js');
 +const { chooseTunnelMode, readWslConfigFile, wslConfigPath } = require('./preflight.js');
 +const { describeOfficialSettings } = require('./settings.js');
@@ -1833,17 +1900,17 @@ index 00000000..965b4657
 +const READ_MANIFESTS = 'for p in "$@"; do printf \'%s\\t\' "$p"; cat "$p/package.json" 2>/dev/null | tr -d \'\\r\\n\'; printf \'\\n\'; done';
 +
 +/**
-+ * The shared `~/.vscode-server` is what makes takeover work, and it is also what
-+ * carries the previous owner's extensions over: one built for the official server
-+ * may declare an `engines.vscode` this client cannot satisfy, and the only
-+ * symptom is that the extension quietly never activates. This section turns that
-+ * into a line someone can act on.
++ * Extensions live in our own tree, so what shows up here is what this client
++ * installed plus whatever the user chose to import from VS Code. An imported
++ * extension built for a newer server may declare an `engines.vscode` this
++ * client cannot satisfy, and the only symptom is that it quietly never
++ * activates; this section turns that into a line someone can act on.
 + * @param {{ runner: any, distro: string, home: string, productsVersion?: string }} options
 + * @returns {Promise<string[]>}
 + */
 +async function extensionLines(options) {
 +	const { runner, distro, home, productsVersion } = options;
-+	const root = `${home}/.vscode-server/extensions`;
++	const root = `${home}/${DATA_ROOT}/extensions`;
 +	const read = async (/** @type {string} */ path) => String((await runner.exec(['-d', distro, '-e', 'sh', '-c', 'cat "$1" 2>/dev/null || true', 'sh', path])).stdout);
 +
 +	const raw = (await read(`${root}/extensions.json`)).trim();
@@ -2752,15 +2819,212 @@ index 00000000..cf40b908
 +}
 +
 +module.exports = { detectIcode };
+diff --git a/extensions/picket-remote-wsl/src/isolate.js b/extensions/picket-remote-wsl/src/isolate.js
+new file mode 100644
+index 00000000..90915a88
+--- /dev/null
++++ b/extensions/picket-remote-wsl/src/isolate.js
+@@ -0,0 +1,190 @@
++'use strict';
++
++/**
++ * Picket Code keeps its WSL state in its own directory, never in the one
++ * Visual Studio Code owns. That is a deliberate reversal of the earlier
++ * "share `~/.vscode-server`" design: sharing handed the previous owner's
++ * extensions to a client whose `product.json` trims different built-ins, so a
++ * user upgrading from VS Code saw a screen of proposal and activation errors
++ * that had nothing to do with their own setup. Isolation makes those errors
++ * disappear by construction — VS Code's tree is not read, so nothing in it can
++ * be misinterpreted.
++ *
++ * The migration path keeps the two promises that isolation would otherwise
++ * break: an already installed payload is moved instead of re-downloaded, and a
++ * user who wants their VS Code extensions is asked once, then copied across.
++ */
++
++/** The one directory inside a distro that belongs to this client. */
++const DATA_ROOT = '.picket-code-server';
++
++/**
++ * Directories a VS Code tree must not hand over. The remote family contends for
++ * the same `wsl+` authority, and the Copilot family is trimmed from this build;
++ * copying either would produce exactly the confusing failures isolation exists
++ * to remove.
++ */
++const IMPORT_EXCLUDE = [
++	'ms-vscode-remote.remote-wsl',
++	'ms-vscode-remote.remote-ssh',
++	'ms-vscode-remote.remote-containers',
++	'GitHub.copilot',
++	'ms-vscode.copilot'
++];
++
++/**
++ * @param {string} home
++ */
++function homePaths(home) {
++	const root = `${home}/${DATA_ROOT}`;
++	return {
++		home,
++		root,
++		bin: `${root}/bin`,
++		data: `${root}/data`,
++		extensions: `${root}/extensions`,
++		logs: `${root}/logs`,
++		runtime: `${root}/runtime`,
++		marker: `${root}/.imported`,
++		legacyRoot: `${home}/.vscode-server`
++	};
++}
++
++/**
++ * Moves a payload installed by an earlier build from `~/.vscode-server/bin`
++ * into our own bin. Copy, verify by exit status, then remove: an interrupted
++ * migration leaves the old copy in place and the next start retries.
++ * @param {{ runner: any, distro: string, home: string }} options
++ * @returns {Promise<string[]>} the payload directory names that moved
++ */
++async function migratePayload(options) {
++	const { runner, distro, home } = options;
++	const paths = homePaths(home);
++	const script = [
++		'mkdir -p "$2" || exit 1',
++		'for d in "$1"/picket-*; do',
++		'  [ -d "$d" ] || continue',
++		'  n=${d##*/}',
++		'  [ -e "$2/$n" ] && continue',
++		'  cp -a "$d" "$2/$n.tmp-$$" && mv "$2/$n.tmp-$$" "$2/$n" || { rm -rf "$2/$n.tmp-$$"; continue; }',
++		'  printf "%s\\n" "$n"',
++		'  rm -rf "$d"',
++		'done'
++	].join('\n');
++	const result = await runner.exec(['-d', distro, '-e', 'sh', '-c', script, 'sh', `${paths.legacyRoot}/bin`, paths.bin]);
++	if (result.code !== 0) {
++		throw new Error(`Could not migrate the payload directory: ${String(result.stderr).trim()}`);
++	}
++	return lines(result.stdout);
++}
++
++/**
++ * Whether this distro holds a VS Code tree worth offering to import, and
++ * whether the question has already been answered here. Exit 3 means there is
++ * nothing to import (no VS Code tree), exit 4 means the user already chose.
++ * @param {{ runner: any, distro: string, home: string }} options
++ * @returns {Promise<{ extensions: number, settings: boolean } | undefined>}
++ */
++async function detectLegacy(options) {
++	const { runner, distro, home } = options;
++	const paths = homePaths(home);
++	const script = [
++		'[ -d "$1" ] || exit 3',
++		'[ -e "$2" ] && exit 4',
++		'c=$(find "$1/extensions" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l | tr -d " ")',
++		's=0',
++		'[ -f "$1/data/Machine/settings.json" ] && s=1',
++		'printf "%s %s\\n" "${c:-0}" "$s"'
++	].join('\n');
++	const result = await runner.exec(['-d', distro, '-e', 'sh', '-c', script, 'sh', paths.legacyRoot, paths.marker]);
++	if (result.code === 3 || result.code === 4) {
++		return undefined;
++	}
++	if (result.code !== 0) {
++		return undefined;
++	}
++	const [count, settings] = String(result.stdout).trim().split(/\s+/);
++	const extensions = Number(count);
++	if (!Number.isFinite(extensions)) {
++		return undefined;
++	}
++	return { extensions, settings: settings === '1' };
++}
++
++/**
++ * Copies the previous owner's extensions (minus the exclusion list) and its
++ * machine settings into our tree, then records that the question was answered.
++ * Copies, never moves: VS Code keeps working exactly as before.
++ * @param {{ runner: any, distro: string, home: string, extensions?: boolean, settings?: boolean }} options
++ * @returns {Promise<{ copied: string[], settings: boolean }>}
++ */
++async function importLegacy(options) {
++	const { runner, distro, home } = options;
++	const paths = homePaths(home);
++	const withExtensions = options.extensions === false ? '0' : '1';
++	const withSettings = options.settings === false ? '0' : '1';
++	const skip = IMPORT_EXCLUDE.map(prefix => `      ${prefix}*) continue ;;`).join('\n');
++	const script = [
++		'set -u',
++		'mkdir -p "$2/extensions" "$2/data/Machine" || exit 1',
++		'if [ "$3" = 1 ] && [ -d "$1/extensions" ]; then',
++		'  for d in "$1"/extensions/*; do',
++		'    [ -d "$d" ] || continue',
++		'    b=${d##*/}',
++		'    case "$b" in',
++		skip,
++		'    esac',
++		'    [ -e "$2/extensions/$b" ] && continue',
++		'    cp -a "$d" "$2/extensions/$b" || continue',
++		'    printf "copied %s\\n" "$b"',
++		'  done',
++		'fi',
++		'if [ "$4" = 1 ] && [ -f "$1/data/Machine/settings.json" ]; then',
++		'  cp -a "$1/data/Machine/settings.json" "$2/data/Machine/settings.json" 2>/dev/null && printf "settings\\n"',
++		'fi',
++		': > "$2/.imported"'
++	].join('\n');
++	const result = await runner.exec([
++		'-d', distro, '-e', 'sh', '-c', script, 'sh', paths.legacyRoot, paths.root, withExtensions, withSettings
++	]);
++	if (result.code !== 0) {
++		throw new Error(`Could not import from the VS Code tree: ${String(result.stderr).trim()}`);
++	}
++	const copied = lines(result.stdout).filter(line => line.startsWith('copied ')).map(line => line.slice('copied '.length));
++	return { copied, settings: lines(result.stdout).includes('settings') };
++}
++
++/**
++ * Records that the user answered the import question, so it is asked once per
++ * distro even when the answer was "start fresh".
++ * @param {{ runner: any, distro: string, home: string }} options
++ */
++async function markAnswered(options) {
++	const { runner, distro, home } = options;
++	const paths = homePaths(home);
++	const result = await runner.exec(['-d', distro, '-e', 'sh', '-c', 'mkdir -p "$2" && : > "$1"', 'sh', paths.marker, paths.root]);
++	if (result.code !== 0) {
++		throw new Error(`Could not record the import choice: ${String(result.stderr).trim()}`);
++	}
++}
++
++/**
++ * Migration without questions, for the paths that cannot prompt (the resolver
++ * starts a server before any UI exists).
++ * @param {{ runner: any, distro: string, home: string, log?: { info: (message: string) => void } }} options
++ * @returns {Promise<string[]>}
++ */
++async function prepareHome(options) {
++	const moved = await migratePayload(options);
++	if (moved.length > 0) {
++		options.log?.info(`Migrated payload ${moved.join(', ')} from ~/.vscode-server/bin to ~/${DATA_ROOT}/bin`);
++	}
++	return moved;
++}
++
++/** @param {any} stdout */
++function lines(stdout) {
++	return String(stdout).split('\n').map(line => line.trim()).filter(line => line.length > 0);
++}
++
++module.exports = { DATA_ROOT, IMPORT_EXCLUDE, homePaths, migratePayload, detectLegacy, importLegacy, markAnswered, prepareHome };
 diff --git a/extensions/picket-remote-wsl/src/launch.js b/extensions/picket-remote-wsl/src/launch.js
 new file mode 100644
-index 00000000..77c0e005
+index 00000000..55d39b5a
 --- /dev/null
 +++ b/extensions/picket-remote-wsl/src/launch.js
-@@ -0,0 +1,446 @@
+@@ -0,0 +1,447 @@
 +'use strict';
 +
 +const { randomBytes } = require('node:crypto');
++const { DATA_ROOT } = require('./isolate.js');
 +
 +/** @typedef {{ port: number, token: string, version: string, commit: string, pid: number, startedAt: string, tunnelMode?: string, icode?: string }} IRuntimeInfo */
 +
@@ -2787,8 +3051,8 @@ index 00000000..77c0e005
 + * @param {string} tag
 + */
 +function serverPaths(home, tag) {
-+	const root = `${home}/.vscode-server`;
-+	const stateDir = `${home}/.picket-code-server`;
++	const root = `${home}/${DATA_ROOT}`;
++	const stateDir = root;
 +	const payloadDir = `${root}/bin/picket-${tag}`;
 +	return {
 +		root,
@@ -2808,7 +3072,7 @@ index 00000000..77c0e005
 +}
 +
 +/**
-+ * `~/.vscode-server/bin/picket-<version>` is the only place a version is
++ * `~/.picket-code-server/bin/picket-<version>` is the only place a version is
 + * spelled out for an installed payload, so it is what a start reads back.
 + * @param {string} payloadDir
 + * @returns {string}
@@ -4314,10 +4578,10 @@ index 00000000..5d3d0222
 +module.exports = { AUTHORITY_PREFIX, LEGACY_AUTHORITY_PREFIX, parseAuthority, canonicalAuthority, remoteUriFor, uncPathFor, parseUncPath, toPosixPath, toWindowsPath };
 diff --git a/extensions/picket-remote-wsl/src/resolver.js b/extensions/picket-remote-wsl/src/resolver.js
 new file mode 100644
-index 00000000..c60a4414
+index 00000000..62e5a7d9
 --- /dev/null
 +++ b/extensions/picket-remote-wsl/src/resolver.js
-@@ -0,0 +1,514 @@
+@@ -0,0 +1,519 @@
 +'use strict';
 +
 +const { listDistros, defaultDistro, visibleDistros, distroHome } = require('./distro.js');
@@ -4328,6 +4592,7 @@ index 00000000..c60a4414
 +const { detectIcode } = require('./icode.js');
 +const { chooseTunnelMode, readWslConfigFile, wslConfigPath } = require('./preflight.js');
 +const { createStdioTunnel } = require('./tunnel.js');
++const { prepareHome } = require('./isolate.js');
 +
 +/** @typedef {{ port: number, token: string, version: string, commit: string, pid: number, startedAt: string, tunnelMode?: string, icode?: string }} IRuntimeInfo */
 +/** @typedef {{ host: string, port: number, connectionToken: string }} IResolverResult */
@@ -4750,6 +5015,10 @@ index 00000000..c60a4414
 +	 */
 +	async function startFresh(distro, home) {
 +		const runtimeFile = runtimeFileFor(home, distro);
++		// An earlier build installed its payload into the VS Code tree. Move it
++		// before anything looks for a payload, so the first start after the
++		// upgrade does not re-download 88 MB.
++		await prepareHome({ runner, distro, home, log });
 +		const manager = components({ distro, home, runner });
 +		// The payload decides the version: whatever still satisfies the minimum
 +		// is what runs, even when the catalog has moved on.
@@ -4925,7 +5194,7 @@ index 00000000..c8ba4972
 +module.exports = { resolveSettings, describeOfficialSettings };
 diff --git a/extensions/picket-remote-wsl/src/shim.js b/extensions/picket-remote-wsl/src/shim.js
 new file mode 100644
-index 00000000..d4923d45
+index 00000000..926b696f
 --- /dev/null
 +++ b/extensions/picket-remote-wsl/src/shim.js
 @@ -0,0 +1,156 @@
@@ -4983,7 +5252,7 @@ index 00000000..d4923d45
 +const REMOVE_OWNED_LINK_SCRIPT = 'case "$(readlink -f "$2" 2>/dev/null)" in "$1"/picket-*/*) rm -f "$2" ;; esac';
 +
 +/**
-+ * Installs `<home>/.vscode-server/bin/picket-<version>/bin/picket-code` and links it
++ * Installs `<home>/.picket-code-server/bin/picket-<version>/bin/picket-code` and links it
 + * to `<home>/.local/bin/picket-code`. An existing link that resolves inside
 + * our shim root is an upgrade; anything else is never overwritten. The last
 + * step probes that the Windows client is startable from inside the distro at
@@ -5671,10 +5940,10 @@ index 00000000..1d666a4e
 +});
 diff --git a/extensions/picket-remote-wsl/test/commands.test.js b/extensions/picket-remote-wsl/test/commands.test.js
 new file mode 100644
-index 00000000..4f8eef6c
+index 00000000..27522901
 --- /dev/null
 +++ b/extensions/picket-remote-wsl/test/commands.test.js
-@@ -0,0 +1,383 @@
+@@ -0,0 +1,443 @@
 +// RED first: this file must fail until src/commands.js exists.
 +const test = require('node:test');
 +const assert = require('node:assert');
@@ -5721,6 +5990,17 @@ index 00000000..4f8eef6c
 +		async exec(args) {
 +			const key = args.join(' ');
 +			calls.push(args);
++			if (typeof options.shellReply === 'function') {
++				const custom = options.shellReply(key, args);
++				if (custom) {
++					return custom;
++				}
++			}
++			if (key.includes('.picket-code-server/.imported') && key.includes('[ -e "$2" ] && exit 4')) {
++				// Until a test says otherwise, this distro has already answered the
++				// "import from VS Code?" question.
++				return { code: 4, stdout: '', stderr: '' };
++			}
 +			if (key === '--list --verbose') {
 +				return { code: 0, stdout: Buffer.from(TABLE, 'utf16le'), stderr: '' };
 +			}
@@ -5984,7 +6264,7 @@ index 00000000..4f8eef6c
 +
 +	const write = ctx.calls.find(args => args.join(' ').includes('chmod 755'));
 +	assert.ok(write, 'the shim script write never happened');
-+	assert.ok(write.join(' ').includes('/.vscode-server/bin/picket-1.1.0/bin/picket-code'), write.join(' '));
++	assert.ok(write.join(' ').includes('/.picket-code-server/bin/picket-1.1.0/bin/picket-code'), write.join(' '));
 +	assert.ok(!write.join(' ').includes('picket-1.4.0'), 'the shim must not name a payload that was never installed');
 +});
 +
@@ -6058,9 +6338,58 @@ index 00000000..4f8eef6c
 +	assert.strictEqual(dialog.defaultUri.fsPath, '\\\\wsl.localhost\\Ubuntu-24.04\\home\\u');
 +	assert.strictEqual(ctx.host.opened.length, 1);
 +});
++
++test('a VS Code tree in the distro is offered once, and importing copies around the excluded families', async () => {
++	// Isolation means the user's VS Code extensions are not there any more. The
++	// first connect asks, and a "yes" copies them — the VS Code tree is read,
++	// never written, so VS Code keeps working exactly as before.
++	const ctx = harness({
++		flavor: 'embedded',
++		host: { quickPick: 'Ubuntu-24.04', openDialog: [{ path: '/home/u/project' }], info: ['导入扩展与设置'] },
++		shellReply: key => {
++			if (key.includes('[ -e "$2" ] && exit 4')) {
++				return { code: 0, stdout: '12 1\n', stderr: '' };
++			}
++			if (key.includes('case "$b" in')) {
++				return { code: 0, stdout: 'copied ms-python.python-2026.1.0\ncopied esbenp.prettier-vscode-10.1.0\nsettings\n', stderr: '' };
++			}
++			return undefined;
++		}
++	});
++	await ctx.commands.openFolder();
++
++	assert.ok(ctx.host.messages.some(message => /检测到 VS Code 在此发行版里有 12 个扩展/.test(String(message))), ctx.host.messages.join(' | '));
++	assert.ok(ctx.host.messages.some(message => /已从 VS Code 导入 2 个扩展 与 Machine 设置/.test(String(message))), ctx.host.messages.join(' | '));
++	assert.strictEqual(ctx.host.opened.length, 1, 'the window still opens');
++});
++
++test('"start fresh" answers the question for this distro instead of asking on every connect', async () => {
++	const ctx = harness({
++		flavor: 'embedded',
++		host: { quickPick: 'Ubuntu-24.04', openDialog: [{ path: '/home/u/project' }], info: ['全新开始'] },
++		shellReply: key => (key.includes('[ -e "$2" ] && exit 4') ? { code: 0, stdout: '5 0\n', stderr: '' } : undefined)
++	});
++	await ctx.commands.openFolder();
++
++	assert.ok(ctx.host.messages.some(message => /检测到 VS Code/.test(String(message))));
++	const marker = ctx.calls.find(args => args.join(' ').includes('.picket-code-server/.imported') && args.join(' ').includes(': >'));
++	assert.ok(marker, 'the answer must be recorded so the question is not asked again');
++	assert.strictEqual(ctx.host.opened.length, 1);
++});
++
++test('no VS Code tree means no question at all', async () => {
++	const ctx = harness({
++		flavor: 'embedded',
++		host: { quickPick: 'Ubuntu-24.04', openDialog: [{ path: '/home/u/project' }] }
++	});
++	await ctx.commands.openFolder();
++
++	assert.ok(!ctx.host.messages.some(message => /检测到 VS Code/.test(String(message))), ctx.host.messages.join(' | '));
++	assert.strictEqual(ctx.host.opened.length, 1);
++});
 diff --git a/extensions/picket-remote-wsl/test/components.test.js b/extensions/picket-remote-wsl/test/components.test.js
 new file mode 100644
-index 00000000..606fbb15
+index 00000000..c484497c
 --- /dev/null
 +++ b/extensions/picket-remote-wsl/test/components.test.js
 @@ -0,0 +1,198 @@
@@ -6070,7 +6399,7 @@ index 00000000..606fbb15
 +const { createComponentManager } = require('../src/components.js');
 +
 +const HOME = '/home/u';
-+const ROOT = `${HOME}/.vscode-server/bin`;
++const ROOT = `${HOME}/.picket-code-server/bin`;
 +const COMMIT = 'abc';
 +const PRODUCT = { commit: COMMIT, version: '1.143.1', picketServerMinVersion: '1.0.0' };
 +
@@ -6218,7 +6547,7 @@ index 00000000..606fbb15
 +	const gone = await manager.cleanup(1);
 +	// `ls -1t` is newest-first, so keeping one extra keeps the first of the rest.
 +	assert.deepStrictEqual(gone.sort(), ['picket-0.7.0', 'picket-0.8.0']);
-+	assert.ok(!calls.includes('rm -rf /home/u/.vscode-server/bin/picket-1.4.0'), 'the live payload survives');
++	assert.ok(!calls.includes('rm -rf /home/u/.picket-code-server/bin/picket-1.4.0'), 'the live payload survives');
 +});
 +
 +test('an unreadable state cache never changes the verdict', async () => {
@@ -6264,7 +6593,7 @@ index 00000000..606fbb15
 +});
 diff --git a/extensions/picket-remote-wsl/test/diagnose.test.js b/extensions/picket-remote-wsl/test/diagnose.test.js
 new file mode 100644
-index 00000000..1f3f3966
+index 00000000..7aac6e46
 --- /dev/null
 +++ b/extensions/picket-remote-wsl/test/diagnose.test.js
 @@ -0,0 +1,186 @@
@@ -6438,10 +6767,10 @@ index 00000000..1f3f3966
 +		productsVersion: '1.143.1',
 +		runner: extensionsRunner(
 +			[
-+				{ identifier: { id: 'ms-vscode-remote.remote-containers' }, version: '0.340.0', location: { path: '/home/u/.vscode-server/extensions/containers-0.340.0' } },
-+				{ identifier: { id: 'esbenp.prettier-vscode' }, version: '10.1.0', location: { path: '/home/u/.vscode-server/extensions/prettier-10.1.0' } }
++				{ identifier: { id: 'ms-vscode-remote.remote-containers' }, version: '0.340.0', location: { path: '/home/u/.picket-code-server/extensions/containers-0.340.0' } },
++				{ identifier: { id: 'esbenp.prettier-vscode' }, version: '10.1.0', location: { path: '/home/u/.picket-code-server/extensions/prettier-10.1.0' } }
 +			],
-+			[['/home/u/.vscode-server/extensions/containers-0.340.0', '^1.150.0'], ['/home/u/.vscode-server/extensions/prettier-10.1.0', '^1.80.0']]
++			[['/home/u/.picket-code-server/extensions/containers-0.340.0', '^1.150.0'], ['/home/u/.picket-code-server/extensions/prettier-10.1.0', '^1.80.0']]
 +		)
 +	});
 +	assert.match(report, /^ {2}ms-vscode-remote\.remote-containers@0\.340\.0 {2}engines=\^1\.150\.0 {2}compatible=no$/m);
@@ -6574,7 +6903,7 @@ index 00000000..f9fd9e83
 +});
 diff --git a/extensions/picket-remote-wsl/test/download.test.js b/extensions/picket-remote-wsl/test/download.test.js
 new file mode 100644
-index 00000000..eab68457
+index 00000000..80904827
 --- /dev/null
 +++ b/extensions/picket-remote-wsl/test/download.test.js
 @@ -0,0 +1,435 @@
@@ -7005,9 +7334,9 @@ index 00000000..eab68457
 +	await withServer(proxy, async (port) => {
 +		const result = await installPayload({
 +			runner, distro: 'D', component, source: { kind: 'url', url: `http://mirror.corp/${component.file}` },
-+			payloadRoot: '/home/u/.vscode-server/bin', proxy: `127.0.0.1:${port}`
++			payloadRoot: '/home/u/.picket-code-server/bin', proxy: `127.0.0.1:${port}`
 +		});
-+		assert.strictEqual(result.payloadDir, `/home/u/.vscode-server/bin/picket-${component.version}`);
++		assert.strictEqual(result.payloadDir, `/home/u/.picket-code-server/bin/picket-${component.version}`);
 +	});
 +	assert.strictEqual(seen[0].url, `http://mirror.corp/${component.file}`);
 +	assert.strictEqual(calls.length, 2, 'the archive was verified and then unpacked');
@@ -7390,9 +7719,135 @@ index 00000000..5e31eaaa
 +	};
 +	assert.deepStrictEqual(await detectIcode({ runner, distro: 'Ubuntu', configuredPath: '' }), { path: '/home/u/.local/bin/icode', source: 'path' });
 +});
+diff --git a/extensions/picket-remote-wsl/test/isolate.test.js b/extensions/picket-remote-wsl/test/isolate.test.js
+new file mode 100644
+index 00000000..1b2b53c4
+--- /dev/null
++++ b/extensions/picket-remote-wsl/test/isolate.test.js
+@@ -0,0 +1,120 @@
++// RED first: this file must fail until src/isolate.js exists.
++const test = require('node:test');
++const assert = require('node:assert');
++const { homePaths, migratePayload, detectLegacy, importLegacy, markAnswered, DATA_ROOT, IMPORT_EXCLUDE } = require('../src/isolate.js');
++
++/**
++ * Records the script it was handed and answers with canned shell output, which
++ * is all these functions do with the distro.
++ * @param {{ code?: number, stdout?: string, stderr?: string }} [reply]
++ */
++function fakeRunner(reply = {}) {
++	/** @type {any[][]} */
++	const calls = [];
++	return {
++		calls,
++		async exec(args) {
++			calls.push(args);
++			return { code: reply.code ?? 0, stdout: reply.stdout ?? '', stderr: reply.stderr ?? '' };
++		}
++	};
++}
++
++test('every path this extension owns lives under .picket-code-server', () => {
++	const paths = homePaths('/home/u');
++	assert.strictEqual(DATA_ROOT, '.picket-code-server');
++	assert.strictEqual(paths.root, '/home/u/.picket-code-server');
++	assert.strictEqual(paths.bin, '/home/u/.picket-code-server/bin');
++	assert.strictEqual(paths.data, '/home/u/.picket-code-server/data');
++	assert.strictEqual(paths.extensions, '/home/u/.picket-code-server/extensions');
++	for (const value of Object.values(paths)) {
++		if (typeof value !== 'string' || !value.startsWith('/home/u')) {
++			continue;
++		}
++		assert.ok(!value.startsWith('/home/u/.vscode-server') || value === paths.legacyRoot,
++			`${value} must not point into the VS Code tree`);
++	}
++	assert.strictEqual(paths.legacyRoot, '/home/u/.vscode-server');
++});
++
++test('a legacy payload is copied into our bin and only then removed', async () => {
++	const runner = fakeRunner({ stdout: 'picket-1.143.1\npicket-1.144.0\n' });
++	const moved = await migratePayload({ runner, distro: 'Ubuntu', home: '/home/u' });
++	assert.deepStrictEqual(moved, ['picket-1.143.1', 'picket-1.144.0']);
++
++	const [args] = runner.calls;
++	assert.strictEqual(args[0], '-d');
++	assert.strictEqual(args[1], 'Ubuntu');
++	assert.strictEqual(args[2], '-e');
++	assert.strictEqual(args[3], 'sh');
++	assert.strictEqual(args[4], '-c');
++	// The script gets the old and the new root as positional parameters, so it
++	// never has to interpolate a home directory into shell text.
++	assert.strictEqual(args[args.length - 2], '/home/u/.vscode-server/bin');
++	assert.strictEqual(args[args.length - 1], '/home/u/.picket-code-server/bin');
++	assert.match(args[5], /cp -a/);
++	assert.match(args[5], /rm -rf/);
++});
++
++test('migration is silent when the VS Code tree holds no payload', async () => {
++	const runner = fakeRunner({ stdout: '' });
++	assert.deepStrictEqual(await migratePayload({ runner, distro: 'Ubuntu', home: '/home/u' }), []);
++});
++
++test('nothing to import: no VS Code tree in this distro', async () => {
++	const runner = fakeRunner({ code: 3 });
++	assert.strictEqual(await detectLegacy({ runner, distro: 'Ubuntu', home: '/home/u' }), undefined);
++});
++
++test('nothing to import once this distro has answered the question', async () => {
++	const runner = fakeRunner({ code: 4 });
++	assert.strictEqual(await detectLegacy({ runner, distro: 'Ubuntu', home: '/home/u' }), undefined);
++});
++
++test('a legacy tree is reported with its extension count and settings flag', async () => {
++	const runner = fakeRunner({ stdout: '34 1\n' });
++	assert.deepStrictEqual(await detectLegacy({ runner, distro: 'Ubuntu', home: '/home/u' }), { extensions: 34, settings: true });
++	const runner2 = fakeRunner({ stdout: '0 0\n' });
++	assert.deepStrictEqual(await detectLegacy({ runner: runner2, distro: 'Ubuntu', home: '/home/u' }), { extensions: 0, settings: false });
++});
++
++test('import copies extensions around the exclusion list and records that it ran', async () => {
++	const runner = fakeRunner({ stdout: 'copied ms-python.python-2026.1.0\nsettings\n' });
++	const result = await importLegacy({ runner, distro: 'Ubuntu', home: '/home/u', extensions: true, settings: true });
++	assert.deepStrictEqual(result.copied, ['ms-python.python-2026.1.0']);
++	assert.strictEqual(result.settings, true);
++
++	const [args] = runner.calls;
++	const script = args[5];
++	for (const prefix of IMPORT_EXCLUDE) {
++		assert.ok(script.includes(prefix), `${prefix} must be skipped by the import`);
++	}
++	assert.match(script, /\.imported/);
++	assert.strictEqual(args[args.length - 4], '/home/u/.vscode-server');
++	assert.strictEqual(args[args.length - 3], '/home/u/.picket-code-server');
++	assert.strictEqual(args[args.length - 2], '1');
++	assert.strictEqual(args[args.length - 1], '1');
++});
++
++test('import can skip extensions or settings, and a failure is reported', async () => {
++	const runner = fakeRunner({ stdout: 'settings\n' });
++	await importLegacy({ runner, distro: 'Ubuntu', home: '/home/u', extensions: false, settings: true });
++	assert.strictEqual(runner.calls[0].at(-2), '0');
++
++	const failing = { async exec() { return { code: 1, stdout: '', stderr: 'cp: cannot create' }; } };
++	await assert.rejects(
++		() => importLegacy({ runner: failing, distro: 'Ubuntu', home: '/home/u', extensions: true }),
++		/cannot create/
++	);
++});
++
++test('answering the question once is recorded in our own tree', async () => {
++	const runner = fakeRunner();
++	await markAnswered({ runner, distro: 'Ubuntu', home: '/home/u' });
++	const [args] = runner.calls;
++	assert.strictEqual(args[args.length - 2], '/home/u/.picket-code-server/.imported');
++	assert.match(args[5], /mkdir -p/);
++
++	const failing = { async exec() { return { code: 1, stdout: '', stderr: 'read-only' }; } };
++	await assert.rejects(() => markAnswered({ runner: failing, distro: 'Ubuntu', home: '/home/u' }), /read-only/);
++});
 diff --git a/extensions/picket-remote-wsl/test/launch.test.js b/extensions/picket-remote-wsl/test/launch.test.js
 new file mode 100644
-index 00000000..e1ba3e93
+index 00000000..49bf0a42
 --- /dev/null
 +++ b/extensions/picket-remote-wsl/test/launch.test.js
 @@ -0,0 +1,291 @@
@@ -7403,21 +7858,21 @@ index 00000000..e1ba3e93
 +
 +test('serverPaths composes the documented layout', () => {
 +	const p = serverPaths('/home/u', 'v1.143.1-picket.1-rc.4');
-+	assert.strictEqual(p.binary, '/home/u/.vscode-server/bin/picket-v1.143.1-picket.1-rc.4/bin/picket-code-server');
-+	assert.strictEqual(p.dataDir, '/home/u/.vscode-server/data');
-+	assert.strictEqual(p.extensionsDir, '/home/u/.vscode-server/extensions');
++	assert.strictEqual(p.binary, '/home/u/.picket-code-server/bin/picket-v1.143.1-picket.1-rc.4/bin/picket-code-server');
++	assert.strictEqual(p.dataDir, '/home/u/.picket-code-server/data');
++	assert.strictEqual(p.extensionsDir, '/home/u/.picket-code-server/extensions');
 +	assert.strictEqual(p.runtimeDir, '/home/u/.picket-code-server/runtime');
 +	assert.strictEqual(runtimeFileFor('/home/u', 'Ubuntu 22.04 LTS'), '/home/u/.picket-code-server/runtime/Ubuntu 22.04 LTS.json');
 +});
 +
-+test('server paths live under the shared .vscode-server root', () => {
++test('server paths live under our own .picket-code-server root', () => {
 +	const paths = serverPaths('/home/u', '1.2.0');
-+	assert.equal(paths.root, '/home/u/.vscode-server');
-+	assert.equal(paths.payloadDir, '/home/u/.vscode-server/bin/picket-1.2.0');
-+	assert.equal(paths.binary, '/home/u/.vscode-server/bin/picket-1.2.0/bin/picket-code-server');
-+	assert.equal(paths.dataDir, '/home/u/.vscode-server/data');
-+	assert.equal(paths.extensionsDir, '/home/u/.vscode-server/extensions');
-+	assert.equal(paths.envSetupFile, '/home/u/.vscode-server/server-env-setup');
++	assert.equal(paths.root, '/home/u/.picket-code-server');
++	assert.equal(paths.payloadDir, '/home/u/.picket-code-server/bin/picket-1.2.0');
++	assert.equal(paths.binary, '/home/u/.picket-code-server/bin/picket-1.2.0/bin/picket-code-server');
++	assert.equal(paths.dataDir, '/home/u/.picket-code-server/data');
++	assert.equal(paths.extensionsDir, '/home/u/.picket-code-server/extensions');
++	assert.equal(paths.envSetupFile, '/home/u/.picket-code-server/server-env-setup');
 +	assert.equal(paths.stateDir, '/home/u/.picket-code-server');
 +	assert.equal(paths.runtimeDir, '/home/u/.picket-code-server/runtime');
 +});
@@ -7761,10 +8216,10 @@ index 00000000..118dde5d
 +});
 diff --git a/extensions/picket-remote-wsl/test/manifest.test.js b/extensions/picket-remote-wsl/test/manifest.test.js
 new file mode 100644
-index 00000000..c63a470b
+index 00000000..1c0a4d11
 --- /dev/null
 +++ b/extensions/picket-remote-wsl/test/manifest.test.js
-@@ -0,0 +1,130 @@
+@@ -0,0 +1,131 @@
 +// RED first: the manifest and the code must agree about which commands exist.
 +const test = require('node:test');
 +const assert = require('node:assert');
@@ -7794,12 +8249,13 @@ index 00000000..c63a470b
 +	assert.deepStrictEqual(stray, [], `registered but not in the manifest: ${stray.join(', ')}`);
 +});
 +
-+test('the command layer owns the sixteen commands of this milestone', () => {
++test('the command layer owns the seventeen commands of this milestone', () => {
 +	assert.deepStrictEqual(Object.keys(COMMANDS).sort(), [
 +		'picket.wsl.addDistro',
 +		'picket.wsl.components',
 +		'picket.wsl.deleteDistro',
 +		'picket.wsl.diagnose',
++		'picket.wsl.importFromVSCode',
 +		'picket.wsl.installCli',
 +		'picket.wsl.installVsix',
 +		'picket.wsl.openFolder',
@@ -8280,7 +8736,7 @@ index 00000000..81d2272e
 +});
 diff --git a/extensions/picket-remote-wsl/test/payload.test.js b/extensions/picket-remote-wsl/test/payload.test.js
 new file mode 100644
-index 00000000..7e23e834
+index 00000000..698458c4
 --- /dev/null
 +++ b/extensions/picket-remote-wsl/test/payload.test.js
 @@ -0,0 +1,196 @@
@@ -8322,7 +8778,7 @@ index 00000000..7e23e834
 +	const calls = [];
 +	const runner = { exec: async (args) => { calls.push(args.join(' ')); return { code: 0, stdout: '', stderr: '' }; } };
 +	await assert.rejects(() => installPayload({ runner, distro: 'D', component: { ...COMPONENT, sha256: 'c'.repeat(64) },
-+		source: { kind: 'file', path: file }, payloadRoot: '/home/u/.vscode-server/bin', onProgress: () => { } }), /checksum mismatch/i);
++		source: { kind: 'file', path: file }, payloadRoot: '/home/u/.picket-code-server/bin', onProgress: () => { } }), /checksum mismatch/i);
 +	assert.deepStrictEqual(calls, []);
 +});
 +
@@ -8334,7 +8790,7 @@ index 00000000..7e23e834
 +	const calls = [];
 +	const runner = { exec: async (args) => { calls.push(args.join(' ')); return { code: 0, stdout: '', stderr: '' }; } };
 +	await assert.rejects(() => installPayload({ runner, distro: 'D', component: { ...COMPONENT, sha256: sha },
-+		source: { kind: 'file', path: file }, payloadRoot: '/home/u/.vscode-server/bin' }),
++		source: { kind: 'file', path: file }, payloadRoot: '/home/u/.picket-code-server/bin' }),
 +	/Size mismatch for .*: expected 3 bytes, got 4/);
 +	assert.deepStrictEqual(calls, []);
 +});
@@ -8349,7 +8805,7 @@ index 00000000..7e23e834
 +	const sha = createHash('sha256').update('abcd').digest('hex');
 +	const runner = { exec: async () => ({ code: 0, stdout: '', stderr: '' }) };
 +	await assert.rejects(() => installPayload({ runner, distro: 'D', component: { ...COMPONENT, sha256: sha },
-+		source: { kind: 'file', path: file }, payloadRoot: '/home/u/.vscode-server/bin' }),
++		source: { kind: 'file', path: file }, payloadRoot: '/home/u/.picket-code-server/bin' }),
 +	(error) => {
 +		assert.match(error.message, /Size mismatch for .*: expected 3 bytes, got 4/);
 +		assert.ok(error.message.includes(file), 'the message names the file that was read');
@@ -8361,7 +8817,7 @@ index 00000000..7e23e834
 +	// digest branch is what reports it.
 +	writeFileSync(file, 'abc');
 +	await assert.rejects(() => installPayload({ runner, distro: 'D', component: { ...COMPONENT, sha256: 'c'.repeat(64) },
-+		source: { kind: 'file', path: file }, payloadRoot: '/home/u/.vscode-server/bin' }),
++		source: { kind: 'file', path: file }, payloadRoot: '/home/u/.picket-code-server/bin' }),
 +	(error) => {
 +		assert.match(error.message, /Checksum mismatch for .*/);
 +		assert.ok(error.message.includes(file), 'the checksum error names the file too');
@@ -8377,8 +8833,8 @@ index 00000000..7e23e834
 +	const calls = [];
 +	const runner = { exec: async (args, opts) => { calls.push({ args, hasInput: !!(opts && opts.input) }); return { code: 0, stdout: '', stderr: '' }; } };
 +	const result = await installPayload({ runner, distro: 'D', component: { ...COMPONENT, sha256: sha },
-+		source: { kind: 'file', path: file }, payloadRoot: '/home/u/.vscode-server/bin', onProgress: () => { } });
-+	assert.strictEqual(result.payloadDir, '/home/u/.vscode-server/bin/picket-v1.143.1-picket.1-rc.4');
++		source: { kind: 'file', path: file }, payloadRoot: '/home/u/.picket-code-server/bin', onProgress: () => { } });
++	assert.strictEqual(result.payloadDir, '/home/u/.picket-code-server/bin/picket-v1.143.1-picket.1-rc.4');
 +	assert.strictEqual(calls.length, 2);
 +	assert.match(calls[0].args.join(' '), /mkdir -p/);
 +	// Another window may be installing into the same root right now: only scratch
@@ -8663,7 +9119,7 @@ index 00000000..2c7627db
 +});
 diff --git a/extensions/picket-remote-wsl/test/resolver.test.js b/extensions/picket-remote-wsl/test/resolver.test.js
 new file mode 100644
-index 00000000..9964c0c9
+index 00000000..7999d56e
 --- /dev/null
 +++ b/extensions/picket-remote-wsl/test/resolver.test.js
 @@ -0,0 +1,786 @@
@@ -8798,7 +9254,7 @@ index 00000000..9964c0c9
 +
 +/** @param {{ payloadDir?: string }} [options] */
 +function components(options = {}) {
-+	return () => ({ ensure: async () => ({ payloadDir: options.payloadDir ?? `/home/u/.vscode-server/bin/picket-${VERSION}` }) });
++	return () => ({ ensure: async () => ({ payloadDir: options.payloadDir ?? `/home/u/.picket-code-server/bin/picket-${VERSION}` }) });
 +}
 +
 +function startsRecording() {
@@ -8903,7 +9359,7 @@ index 00000000..9964c0c9
 +	assert.strictEqual(stopped[0].info.commit, 'f'.repeat(40));
 +	const args = starts[0].args;
 +	assert.ok(args.some(a => /^--connection-token=.{32,}$/.test(a)), 'a fresh token is minted for the new server');
-+	assert.ok(args.includes(`--user-data-dir=/home/u/.vscode-server/data`));
++	assert.ok(args.includes(`--user-data-dir=/home/u/.picket-code-server/data`));
 +	assert.strictEqual(args[1], 'Ubuntu');
 +	assert.strictEqual(starts[0].runtimeFile, `/home/u/.picket-code-server/runtime/Ubuntu.json`);
 +	assert.strictEqual(starts[0].extra.commit, COMMIT);
@@ -9021,7 +9477,7 @@ index 00000000..9964c0c9
 +	assert.strictEqual(stopped[0].distro, 'Ubuntu');
 +	assert.strictEqual(stopped[0].info.port, 41234);
 +	assert.strictEqual(stopped[0].runtimeFile, '/home/u/.picket-code-server/runtime/Ubuntu.json');
-+	assert.strictEqual(stopped[0].dataDir, '/home/u/.vscode-server/data');
++	assert.strictEqual(stopped[0].dataDir, '/home/u/.picket-code-server/data');
 +});
 +
 +test('the detected iCode path and the tunnel mode reach the started server', async () => {
@@ -9250,7 +9706,7 @@ index 00000000..9964c0c9
 +	assert.deepStrictEqual(probed, [6001], 'the VM port is not dialable from the host, so the probe must use the tunnel');
 +	assert.strictEqual(created.length, 1);
 +	assert.strictEqual(created[0].serverPort, 41234);
-+	assert.strictEqual(created[0].nodePath, `/home/u/.vscode-server/bin/picket-${VERSION}/node`);
++	assert.strictEqual(created[0].nodePath, `/home/u/.picket-code-server/bin/picket-${VERSION}/node`);
 +	assert.strictEqual(starts.length, 0);
 +
 +	await resolver.resolve('picket-wsl+Ubuntu');
@@ -9515,7 +9971,7 @@ index 00000000..b38aabc8
 +});
 diff --git a/extensions/picket-remote-wsl/test/shim.test.js b/extensions/picket-remote-wsl/test/shim.test.js
 new file mode 100644
-index 00000000..6e4b01da
+index 00000000..4586d5b8
 --- /dev/null
 +++ b/extensions/picket-remote-wsl/test/shim.test.js
 @@ -0,0 +1,173 @@
@@ -9557,18 +10013,18 @@ index 00000000..6e4b01da
 +	const script = shimScript({
 +		clientPath: '/mnt/c/Users/u/AppData/Local/Programs/Picket Code/Picket Code.exe',
 +		authority: 'picket-wsl+Ubuntu 22.04 LTS',
-+		remoteCliPath: '/home/u/.vscode-server/bin/picket-T/bin/remote-cli/picket-code'
++		remoteCliPath: '/home/u/.picket-code-server/bin/picket-T/bin/remote-cli/picket-code'
 +	});
 +	assert.match(script, /VSCODE_CLIENT_COMMAND='\/mnt\/c\/Users\/u\/AppData\/Local\/Programs\/Picket Code\/Picket Code\.exe'/);
 +	assert.match(script, /VSCODE_CLI_AUTHORITY='picket-wsl\+Ubuntu 22\.04 LTS'/);
-+	assert.match(script, /exec '\/home\/u\/\.vscode-server\/bin\/picket-T\/bin\/remote-cli\/picket-code' "\$@"$/);
++	assert.match(script, /exec '\/home\/u\/\.picket-code-server\/bin\/picket-T\/bin\/remote-cli\/picket-code' "\$@"$/);
 +});
 +
 +test('installShim writes the script, links it and verifies interop', async () => {
 +	const r = recordingRunner([{ code: 0, stdout: 'none\n' }, { code: 0 }, { code: 0 }, { code: 0, stdout: 'ok\n' }, { code: 0, stdout: 'none\n' }, { code: 0 }, { code: 0 }]);
 +	const result = await installShim({ runner: r, ...BASE });
 +	assert.strictEqual(result.status, 'installed');
-+	assert.strictEqual(result.scriptPath, `${HOME}/.vscode-server/bin/picket-${VERSION}/bin/picket-code`);
++	assert.strictEqual(result.scriptPath, `${HOME}/.picket-code-server/bin/picket-${VERSION}/bin/picket-code`);
 +	assert.strictEqual(result.linkPath, `${HOME}/.local/bin/picket-code`);
 +	assert.strictEqual(result.codeAlias, 'created');
 +	assert.strictEqual(r.calls.length, 7);
@@ -9578,14 +10034,14 @@ index 00000000..6e4b01da
 +		assert.deepStrictEqual(call.args.slice(0, 4), ['-d', 'Ubuntu', '-e', 'sh']);
 +	}
 +	// inspect: one round trip that creates the directories and reads the link
-+	assert.ok(inspect.args.includes(`${HOME}/.vscode-server/bin/picket-${VERSION}/bin`), 'inspect must create the script directory');
++	assert.ok(inspect.args.includes(`${HOME}/.picket-code-server/bin/picket-${VERSION}/bin`), 'inspect must create the script directory');
 +	assert.ok(inspect.args.includes(`${HOME}/.local/bin`), 'inspect must create the link directory too');
 +	assert.ok(inspect.args.includes(result.linkPath), 'inspect reads the current link target');
 +	// write: the shim content travels on stdin, never through a shell word
 +	assert.ok(write.args.includes(result.scriptPath));
 +	assert.match(String(write.input), /VSCODE_CLIENT_COMMAND='\/mnt\/c\/Programs\/Picket Code\.exe'/);
 +	assert.match(String(write.input), /VSCODE_CLI_AUTHORITY='picket-wsl\+Ubuntu'/);
-+	assert.match(String(write.input), new RegExp(`exec '${HOME.replace(/\./g, '\\.')}/\\.vscode-server/bin/picket-${VERSION}/bin/remote-cli/picket-code' "\\$@"`));
++	assert.match(String(write.input), new RegExp(`exec '${HOME.replace(/\./g, '\\.')}/\\.picket-code-server/bin/picket-${VERSION}/bin/remote-cli/picket-code' "\\$@"`));
 +	// link: both paths as positional args
 +	assert.ok(link.args.includes(result.scriptPath) && link.args.includes(result.linkPath));
 +	// verify: the link must resolve to the script and the script must be executable
@@ -9607,7 +10063,7 @@ index 00000000..6e4b01da
 +	assert.strictEqual(taken.calls.length, 6, 'no link may be written over an existing code');
 +	assert.ok(!taken.calls[5].args.includes(`${HOME}/.local/bin/code`));
 +
-+	const own = recordingRunner([{ code: 0, stdout: 'none\n' }, { code: 0 }, { code: 0 }, { code: 0, stdout: 'ok\n' }, { code: 0, stdout: `${HOME}/.vscode-server/bin/picket-0.9.0/bin/picket-code\n` }, { code: 0 }, { code: 0 }]);
++	const own = recordingRunner([{ code: 0, stdout: 'none\n' }, { code: 0 }, { code: 0 }, { code: 0, stdout: 'ok\n' }, { code: 0, stdout: `${HOME}/.picket-code-server/bin/picket-0.9.0/bin/picket-code\n` }, { code: 0 }, { code: 0 }]);
 +	const upgraded = await installShim({ runner: own, ...BASE });
 +	assert.strictEqual(upgraded.codeAlias, 'created', 'our own alias from an older payload is repointed');
 +});
@@ -9628,7 +10084,7 @@ index 00000000..6e4b01da
 +});
 +
 +test('a link into our own shim root is upgraded in place', async () => {
-+	const r = recordingRunner([{ code: 0, stdout: `${HOME}/.vscode-server/bin/picket-0.9.0/bin/picket-code\n` }, { code: 0 }, { code: 0 }, { code: 0, stdout: 'ok\n' }, { code: 0, stdout: 'none\n' }, { code: 0 }, { code: 0 }]);
++	const r = recordingRunner([{ code: 0, stdout: `${HOME}/.picket-code-server/bin/picket-0.9.0/bin/picket-code\n` }, { code: 0 }, { code: 0 }, { code: 0, stdout: 'ok\n' }, { code: 0, stdout: 'none\n' }, { code: 0 }, { code: 0 }]);
 +	const result = await installShim({ runner: r, ...BASE });
 +	assert.strictEqual(result.status, 'installed');
 +	assert.strictEqual(r.calls.length, 7);
@@ -9676,17 +10132,17 @@ index 00000000..6e4b01da
 +	const r = recordingRunner([]);
 +	await removeShim({ runner: r, distro: 'Ubuntu', home: HOME });
 +	assert.strictEqual(r.calls.length, 2);
-+	// `~/.vscode-server/bin/picket-<version>/` holds the server a window may still
++	// `~/.picket-code-server/bin/picket-<version>/` holds the server a window may still
 +	// be running, so removal may only unlink the script we generated inside it —
 +	// never the directory, and never anything outside `picket-*`.
 +	const script = r.calls[0].args[5];
-+	assert.ok(r.calls[0].args.includes(`${HOME}/.vscode-server/bin`));
++	assert.ok(r.calls[0].args.includes(`${HOME}/.picket-code-server/bin`));
 +	assert.ok(r.calls[0].args.includes(`${HOME}/.local/bin/picket-code`));
 +	assert.match(script, /rm -f "\$1"\/picket-\*\/bin\/picket-code/);
 +	assert.doesNotMatch(script, /rm -rf/, 'a payload directory must survive a CLI removal');
 +	assert.doesNotMatch(script, /rm -rf "\$1"/, 'the shared bin directory must survive');
 +	// The alias has to be checked, not listed: a `code` that is not ours stays.
-+	assert.ok(r.calls[1].args.includes(`${HOME}/.vscode-server/bin`));
++	assert.ok(r.calls[1].args.includes(`${HOME}/.picket-code-server/bin`));
 +	assert.ok(r.calls[1].args.includes(`${HOME}/.local/bin/code`));
 +	assert.match(r.calls[1].args[5], /readlink/);
 +	// …and "ours" means inside a picket-* payload, not anywhere under bin/.
@@ -10128,429 +10584,6 @@ index 00000000..093514e6
 +	assert.strictEqual(engineMinimum('*'), undefined);
 +	assert.strictEqual(engineMinimum(undefined), undefined);
 +});
-diff --git a/test/automation/src/agentsWindow.ts b/test/automation/src/agentsWindow.ts
-index a415183f..8443d859 100644
---- a/test/automation/src/agentsWindow.ts
-+++ b/test/automation/src/agentsWindow.ts
-@@ -59,6 +59,21 @@ const TOOL_CONFIRMATION_WIDGET = '.chat-confirmation-widget2';
- // onto `aria-expanded` (see `ChatCollapsibleInputOutputContentPart`).
- const ACTIVE_SESSION_TOOL_PART_HEADER = `${ACTIVE_SESSION} .interactive-item-container.interactive-response .chat-confirmation-widget-collapsible .chat-confirmation-widget-title`;
- 
-+// Per-turn changes summary (`ChatTurnPillsContentPart`): a `<details>` whose
-+// summary reports `N files changed +ins -del` and whose body lists the changed
-+// files (`renderChangesSummaryFileList` → a `WorkbenchList`).
-+const ACTIVE_SESSION_TURN_CHANGES = `${ACTIVE_SESSION} .chat-turn-pills-part`;
-+const ACTIVE_SESSION_TURN_CHANGES_HEADER = `${ACTIVE_SESSION_TURN_CHANGES} .checkpoint-file-changes-summary-header`;
-+// The `N files changed` label toggles the `<details>`; the sibling
-+// `.chat-file-changes-counts` button opens the changes editor instead.
-+const ACTIVE_SESSION_TURN_CHANGES_LABEL = `${ACTIVE_SESSION_TURN_CHANGES_HEADER} .chat-file-changes-label`;
-+const ACTIVE_SESSION_TURN_CHANGES_DETAILS = `${ACTIVE_SESSION_TURN_CHANGES} details.checkpoint-file-changes-disclosure`;
-+const ACTIVE_SESSION_TURN_CHANGES_ROW = `${ACTIVE_SESSION_TURN_CHANGES} .monaco-list-row`;
-+// Modified side of an open diff editor. `data-uri` is stamped on the inner
-+// editor's root by `CodeEditorWidget`, so this matches both a plain diff editor
-+// and the per-file editors of a multi-diff editor.
-+const DIFF_EDITOR_MODIFIED = '.monaco-editor.modified-in-monaco-diff-editor';
-+
- export class AgentsWindow {
- 
- 	constructor(private code: Code, private quickaccess: QuickAccess) { }
-@@ -1013,6 +1028,90 @@ export class AgentsWindow {
- 		await page.locator(expandedHeader, { hasText: label }).first().waitFor({ state: 'visible', timeout: timeoutMs });
- 	}
- 
-+	/**
-+	 * Wait for the active turn's changes summary and return the file labels it
-+	 * lists (each row also carries the `+added / -removed` counts).
-+	 */
-+	async getTurnChangedFiles(timeoutMs: number = 60_000): Promise<string[]> {
-+		await this.expandTurnChanges(timeoutMs);
-+		const rows = await this.code.driver.currentPage.locator(ACTIVE_SESSION_TURN_CHANGES_ROW).allTextContents();
-+		return rows.map(text => text.replace(/\s+/g, ' ').trim()).filter(text => text.length > 0);
-+	}
-+
-+	/**
-+	 * Open the diff editor of one file listed in the active turn's changes
-+	 * summary. Rows open the checkpoint diff, because
-+	 * `chat.editing.openChangedFileInDiffEditor` defaults to true.
-+	 *
-+	 * The modified side is a `git-blob:` resource whose URI appends a JSON query
-+	 * (`?{"sessionUri":…,"sha":"refs/agents/…/checkpoints/turn/1",…}`), so the
-+	 * `data-uri` attribute does not end with the file name — match on a substring.
-+	 */
-+	async openTurnChangeDiff(file: string, timeoutMs: number = 60_000): Promise<void> {
-+		await this.expandTurnChanges(timeoutMs);
-+		const page = this.code.driver.currentPage;
-+		const row = page.locator(ACTIVE_SESSION_TURN_CHANGES_ROW, { hasText: file }).first();
-+		await row.waitFor({ state: 'visible', timeout: timeoutMs });
-+		await row.click();
-+		await page.locator(this.diffEditorSelector(file)).first().waitFor({ state: 'visible', timeout: timeoutMs });
-+	}
-+
-+	/**
-+	 * Wait for the modified side of the open diff editor for `file` to satisfy
-+	 * `accept`.
-+	 *
-+	 * Inline diffs render the *removed* lines in a view zone that carries its own
-+	 * `.view-lines` (`div.view-zones > div.view-lines.line-delete`, see
-+	 * `diffEditorViewZones.ts`). That element precedes the editor's real
-+	 * `.view-lines` in the DOM, so a bare `… .view-lines` selector resolves to the
-+	 * deleted-lines zone — which is empty when the file was created — and never
-+	 * sees the document. Only the primary `.lines-content > .view-lines` holds the
-+	 * modified document.
-+	 */
-+	async waitForDiffEditorText(file: string, accept: (text: string) => boolean, timeoutMs: number = 60_000): Promise<string> {
-+		const selector = `${this.diffEditorSelector(file)} .lines-content > .view-lines`;
-+		try {
-+			return await this.code.waitForTextContent(selector, undefined, text => accept(text.replace(/\u00a0/g, ' ')), Math.ceil(timeoutMs / 100));
-+		} catch (error) {
-+			const message = error instanceof Error ? error.message : String(error);
-+			throw new Error(`${message.replace(/\.$/, '')}. ${await this.describeOpenDiffEditors(file)}`);
-+		}
-+	}
-+
-+	/** Reports what the diff editors of `file` currently render, for failure messages. */
-+	private async describeOpenDiffEditors(file: string): Promise<string> {
-+		try {
-+			const editors = await this.code.driver.currentPage.evaluate((needle: string) => {
-+				return Array.from(document.querySelectorAll('.monaco-editor'))
-+					.filter(editor => (editor.getAttribute('data-uri') ?? '').includes(needle))
-+					.map(editor => ({
-+						uri: editor.getAttribute('data-uri'),
-+						viewLines: Array.from(editor.querySelectorAll('.view-lines')).map(element => (element.textContent ?? '').slice(0, 500)),
-+						text: (editor.textContent ?? '').slice(0, 500),
-+					}));
-+			}, file);
-+			return `Observed editors for "${file}": ${JSON.stringify(editors)}`;
-+		} catch (error) {
-+			return `The diff editor DOM for "${file}" could not be inspected: ${error instanceof Error ? error.message : String(error)}`;
-+		}
-+	}
-+
-+	private diffEditorSelector(file: string): string {
-+		const escaped = file.replace(/[\\"]/g, '\\$&');
-+		return `${DIFF_EDITOR_MODIFIED}[data-uri*="${escaped}"]`;
-+	}
-+
-+	private async expandTurnChanges(timeoutMs: number): Promise<void> {
-+		const page = this.code.driver.currentPage;
-+		await page.locator(ACTIVE_SESSION_TURN_CHANGES_HEADER).first().waitFor({ state: 'visible', timeout: timeoutMs });
-+		const isOpen = await page.evaluate(selector => (document.querySelector(selector) as HTMLDetailsElement | null)?.open === true, ACTIVE_SESSION_TURN_CHANGES_DETAILS);
-+		if (isOpen) {
-+			return;
-+		}
-+		await page.locator(ACTIVE_SESSION_TURN_CHANGES_LABEL).first().click();
-+		await page.waitForFunction(selector => (document.querySelector(selector) as HTMLDetailsElement | null)?.open === true, ACTIVE_SESSION_TURN_CHANGES_DETAILS, { timeout: timeoutMs });
-+	}
-+
- 	/**
- 	 * Open the model picker in the active session input and select the model
- 	 * whose displayed name contains `modelName`. Clicks the model-picker name
-diff --git a/test/automation/src/code.ts b/test/automation/src/code.ts
-index 4c0d9bda..8ff230a3 100644
---- a/test/automation/src/code.ts
-+++ b/test/automation/src/code.ts
-@@ -31,6 +31,11 @@ export interface LaunchOptions {
- 	useInMemorySecretStorage?: boolean;
- 	readonly extraArgs?: string[];
- 	readonly remote?: boolean;
-+	/**
-+	 * Authority used when `remote` is set. Defaults to `test+test` (the test
-+	 * resolver); the WSL area targets `picket-wsl+<distro>`.
-+	 */
-+	readonly remoteAuthority?: string;
- 	readonly web?: boolean;
- 	readonly tracing?: boolean;
- 	snapshots?: boolean;
-diff --git a/test/automation/src/electron.ts b/test/automation/src/electron.ts
-index dda7cb2f..81de7cac 100644
---- a/test/automation/src/electron.ts
-+++ b/test/automation/src/electron.ts
-@@ -60,8 +60,10 @@ export async function resolveElectronConfiguration(options: LaunchOptions): Prom
- 		if (!workspacePath) {
- 			throw new Error('Workspace path is required when running remote');
- 		}
--		// Replace workspace path with URI
--		args[0] = `--${workspacePath.endsWith('.code-workspace') ? 'file' : 'folder'}-uri=vscode-remote://test+test/${URI.file(workspacePath).path}`;
-+		// Replace workspace path with URI. The authority defaults to the
-+		// test resolver's; the WSL smoke area targets `picket-wsl+<distro>`.
-+		const remoteAuthority = options.remoteAuthority ?? 'test+test';
-+		args[0] = `--${workspacePath.endsWith('.code-workspace') ? 'file' : 'folder'}-uri=vscode-remote://${remoteAuthority}/${URI.file(workspacePath).path}`;
- 
- 		if (codePath) {
- 			if (!extensionsPath) {
-diff --git a/test/smoke/src/areas/agentsWindow/icode.test.ts b/test/smoke/src/areas/agentsWindow/icode.test.ts
-index c986803d..3acc84a0 100644
---- a/test/smoke/src/areas/agentsWindow/icode.test.ts
-+++ b/test/smoke/src/areas/agentsWindow/icode.test.ts
-@@ -57,8 +57,10 @@ const FAKE_ASK_FOLLOW_UP = 'after-answer';
- // `session/request_permission`, so the confirmation banner is the visible
- // evidence that the call is waiting for approval.
- const FAKE_PERMISSION_TOOL_CALL_ID = 'tc-p';
--// `diff` names this file in its `edit` tool call title.
-+// `diff` names this file in its `edit` tool call title, then appends a
-+// `change-<n>` line to it inside the session folder.
- const FAKE_DIFF_FILE = 'probe-diff.txt';
-+const FAKE_DIFF_LINE_PATTERN = /change-\d+/;
- 
- // Selector for the send button in the Agents Window new-session homepage.
- // Kept in sync with `SEND_BUTTON_ENABLED` in `test/automation/src/agentsWindow.ts`
-@@ -72,9 +74,9 @@ const SESSION_TYPE = 'iCode';
-  * directory. The agent host passes the folder the Agents Window hands over to
-  * `session/new` as the chat's cwd, and its per-turn checkpoints only work
-  * inside a repository (`IcodeAgent._sendMessage`), so the diff scenario needs a
-- * real repo — which is itself part of the behaviour under test. (The ACP
-- * subprocess itself is spawned with the agent host's cwd, so the fake CLI's
-- * relative writes land there; see the diff scenario's MANUAL STEP note.)
-+ * real repo — which is itself part of the behaviour under test. The ACP
-+ * subprocess is spawned with that same cwd, so the fake CLI's relative writes
-+ * land in the session folder and the checkpoints capture them.
-  */
- function createTempGitRepo(): string {
- 	const repoPath = fs.mkdtempSync(path.join(os.tmpdir(), 'vscode-icode-smoke-'));
-@@ -297,9 +299,10 @@ export function setup(logger: Logger): void {
- 
- 		const context = setupIcodeSuite(logger, { label: 'Agents Window [icode] diff scenario', scenario: 'diff' });
- 
--		it('reports the changed file of the turn', async function () {
-+		it('reports the changed file of the turn and shows its diff', async function () {
- 			this.timeout(5 * 60 * 1000);
- 			const app = this.app as Application;
-+			const agentsWindow = app.workbench.agentsWindow;
- 
- 			try {
- 				const repoPath = context.repoPath;
-@@ -307,21 +310,20 @@ export function setup(logger: Logger): void {
- 
- 				await submitIcodePrompt(app, PROMPT);
- 
--				// The turn must surface the file the `edit` tool call touched: the
--				// tool call title (`edit probe-diff.txt`) names the file in the
--				// response. There is no changeset/diff page object in
--				// `test/automation/src`, so this is the deepest diff assertion the
--				// driver can make today.
--				//
--				// MANUAL STEP for the visual half: the fake CLI appends to
--				// `join(process.cwd(), 'probe-diff.txt')` and the ACP subprocess is
--				// spawned with the agent host's cwd (the transport does not forward
--				// the session cwd), so no file inside the temp repo actually changes
--				// and the red/green diff view is empty on purpose. To verify the deep
--				// diff, run the fixture from the session folder and open the turn's
--				// changeset, which must list `probe-diff.txt` with `+change-N`.
--				const response = await app.workbench.agentsWindow.waitForAssistantText(FAKE_DIFF_FILE, 120_000);
--				assert.ok(response.includes(FAKE_DIFF_FILE), `Expected the response to name the changed file "${FAKE_DIFF_FILE}" (got "${response}")`);
-+				// The turn's changes summary must list the file the `edit` tool call
-+				// wrote. The ACP subprocess runs in the session folder, so the fake
-+				// CLI's `appendFileSync(join(process.cwd(), 'probe-diff.txt'))` really
-+				// touches the repo the checkpoints are taken against.
-+				const files = await agentsWindow.getTurnChangedFiles(120_000);
-+				assert.strictEqual(files.length, 1, `Expected the turn changes summary to list one file (got ${JSON.stringify(files)})`);
-+				assert.ok(files[0].includes(FAKE_DIFF_FILE), `Expected the turn changes summary to list "${FAKE_DIFF_FILE}" (got ${JSON.stringify(files)})`);
-+
-+				// Selecting the row opens the checkpoint diff; its modified side must
-+				// show the appended line, which only holds if the checkpoint captured
-+				// the real file contents rather than an empty change.
-+				await agentsWindow.openTurnChangeDiff(FAKE_DIFF_FILE, 120_000);
-+				const diffText = await agentsWindow.waitForDiffEditorText(FAKE_DIFF_FILE, text => FAKE_DIFF_LINE_PATTERN.test(text), 120_000);
-+				assert.ok(FAKE_DIFF_LINE_PATTERN.test(diffText), `Expected the diff of "${FAKE_DIFF_FILE}" to show the appended line (got "${diffText}")`);
- 			} catch (error) {
- 				await reportFailure(app, logger, 'Agents Window [icode] diff scenario', error);
- 			}
-diff --git a/test/smoke/src/areas/wsl/remote.test.ts b/test/smoke/src/areas/wsl/remote.test.ts
-new file mode 100644
-index 00000000..2be699f1
---- /dev/null
-+++ b/test/smoke/src/areas/wsl/remote.test.ts
-@@ -0,0 +1,168 @@
-+/*---------------------------------------------------------------------------------------------
-+ *  Copyright (c) Microsoft Corporation. All rights reserved.
-+ *  Licensed under the MIT License. See License.txt in the project root for license information.
-+ *--------------------------------------------------------------------------------------------*/
-+
-+import * as fs from 'fs';
-+import * as os from 'os';
-+import * as path from 'path';
-+import { Application, ApplicationOptions, Logger } from '../../../../automation';
-+import { createApp, installAppAfterHandler, installDiagnosticsHandler, suiteCrashPath, suiteLogsPath } from '../../utils';
-+
-+/**
-+ * Layer 4 (UI smoke) coverage for the WSL remote window, driven through the
-+ * stand-in `wsl.exe` (`test/wsl-harness/fake-wsl.mjs`) and the real server
-+ * payload (see `docs/wsl-verification.md` and `build/wsl/acceptance.sh`).
-+ *
-+ * The suite is opt-in via environment so the shared smoke matrix is unaffected:
-+ * acceptance.sh exports PICKET_WSL_DISTRO / PICKET_WSL_FAKE_HOME /
-+ * PICKET_WSL_RUNNER; without them the suite skips before launching Electron.
-+ * Behaviour inside the remote extension host (folder identity, login shell,
-+ * watcher, 10 MB round trip) lives in the harness extension
-+ * (`test/wsl-harness/remote/`); this area asserts what only the UI can see:
-+ * the `WSL 目标` view, the distro node from a real listing, and a title bar
-+ * branded `WSL` instead of the raw authority.
-+ *
-+ * Suite title carries a lowercase `wsl` token on purpose: the smoke runner maps
-+ * `-f` onto mocha's `grep` (case-sensitive, full nested title), so
-+ * `node test/index.js -f wsl` selects exactly this suite.
-+ */
-+
-+// `out/areas/wsl/remote.test.js` → the picket-code repository root.
-+const REPO_ROOT = path.resolve(__dirname, '..', '..', '..', '..', '..', '..');
-+const DOWNLOAD_DIR = path.join(REPO_ROOT, 'build', 'wsl', 'download');
-+
-+const DISTRO = process.env.PICKET_WSL_DISTRO ?? '';
-+const FAKE_HOME = process.env.PICKET_WSL_FAKE_HOME ?? '';
-+const FAKE_WSL = process.env.PICKET_WSL_RUNNER ?? '';
-+const ACCEPT_HOME = process.env.PICKET_WSL_ACCEPT_HOME ?? path.join(os.tmpdir(), 'picket-wsl-smoke');
-+const FOLDER = path.join(FAKE_HOME, '我的 项目');
-+
-+function findPayloadTarball(): string | undefined {
-+	try {
-+		return fs.readdirSync(DOWNLOAD_DIR)
-+			.filter(name => /^picket-code-server-.+-linux-x64\.tar\.gz$/.test(name))
-+			.map(name => path.join(DOWNLOAD_DIR, name))[0];
-+	} catch {
-+		return undefined;
-+	}
-+}
-+
-+/**
-+ * The dev workbench scans `extensions/` and loads the in-tree extension with
-+ * the placeholder (empty) catalog. Loading a staged copy with the real catalog
-+ * through `--extensionDevelopmentPath` shadows it, which is also how the
-+ * release acceptance run works.
-+ */
-+function stageExtensionWithRealCatalog(): string | undefined {
-+	const tarball = findPayloadTarball();
-+	const catalog = path.join(DOWNLOAD_DIR, 'catalog.json');
-+	if (!tarball || !fs.existsSync(catalog)) {
-+		return undefined;
-+	}
-+	const staging = path.join(ACCEPT_HOME, 'ext');
-+	fs.rmSync(staging, { recursive: true, force: true });
-+	fs.cpSync(path.join(REPO_ROOT, 'vscode', 'extensions', 'picket-remote-wsl'), staging, { recursive: true });
-+	fs.copyFileSync(catalog, path.join(staging, 'payloads', 'catalog.json'));
-+	// The 目标 view is declared `when: isWindows`; this suite drives the
-+	// stand-in wsl.exe on Linux, where an empty Remote Explorer container would
-+	// hide itself and leave nothing to assert. Drop the gate on the copy only.
-+	const manifestFile = path.join(staging, 'package.json');
-+	const manifest = JSON.parse(fs.readFileSync(manifestFile, 'utf8'));
-+	delete manifest.contributes.views.remote[0].when;
-+	fs.writeFileSync(manifestFile, JSON.stringify(manifest, null, '\t') + '\n');
-+	return staging;
-+}
-+
-+export function setup(logger: Logger): void {
-+
-+	let staging: string | undefined;
-+
-+	describe('WSL remote window (wsl)', () => {
-+
-+		before(function () {
-+			if (process.platform !== 'linux') {
-+				logger.log('Skipping WSL area: the stand-in wsl.exe path is exercised on Linux; Windows acceptance runs the manual checklist (docs/wsl-verification.md).');
-+				this.skip();
-+			}
-+			if (!DISTRO || !FAKE_HOME || !FAKE_WSL) {
-+				logger.log('Skipping WSL area: PICKET_WSL_DISTRO / PICKET_WSL_FAKE_HOME / PICKET_WSL_RUNNER are not set (run build/wsl/acceptance.sh).');
-+				this.skip();
-+			}
-+			staging = stageExtensionWithRealCatalog();
-+			if (!staging) {
-+				logger.log(`Skipping WSL area: payload tarball or catalog.json not found under ${DOWNLOAD_DIR} (run build/wsl/fetch-payload.sh).`);
-+				this.skip();
-+			}
-+			fs.mkdirSync(FOLDER, { recursive: true });
-+		});
-+
-+		installDiagnosticsHandler(logger);
-+
-+		before(async function () {
-+			this.timeout(5 * 60 * 1000); // resolver: payload install + server start + connect
-+			const suiteName = this.test?.parent?.title ?? 'unknown';
-+			const defaultOptions: ApplicationOptions = {
-+				...this.defaultOptions,
-+				logsPath: suiteLogsPath(this.defaultOptions, suiteName),
-+				crashesPath: suiteCrashPath(this.defaultOptions, suiteName),
-+			};
-+
-+			this.app = createApp(defaultOptions, opts => ({
-+				...opts,
-+				remote: true,
-+				remoteAuthority: `picket-wsl+${DISTRO}`,
-+				// The folder the authority points at must exist in the distro
-+				// before the window opens (the folder dialog flow is manual).
-+				workspacePath: FOLDER,
-+				extensionDevelopmentPath: staging,
-+				// Isolated user data dir: the settings seeded below must not leak
-+				// into the shared smoke profile other suites run against.
-+				userDataDir: fs.mkdtempSync(path.join(os.tmpdir(), 'vscode-wsl-smoke-')),
-+				// The activity-bar label A5 clicks comes from the workbench NLS, so
-+				// pin the language instead of depending on the machine's locale.
-+				extraArgs: ['--locale=en'],
-+				extraEnv: {
-+					...(opts.extraEnv ?? {}),
-+					PICKET_WSL_RUNNER: FAKE_WSL,
-+					PICKET_WSL_FAKE_HOME: FAKE_HOME,
-+				},
-+			}));
-+
-+			// The payload source must come from the verified tarball trio; the
-+			// dev catalog copy in the staged extension only carries the tag.
-+			const userDataDir = (this.app as Application).userDataPath;
-+			const tarball = findPayloadTarball();
-+			if (userDataDir && tarball) {
-+				fs.mkdirSync(path.join(userDataDir, 'User'), { recursive: true });
-+				fs.writeFileSync(path.join(userDataDir, 'User', 'settings.json'), JSON.stringify({
-+					'picket.wsl.serverPayloadPath': tarball,
-+					'picket.wsl.icodePath': '',
-+				}, null, 2));
-+			}
-+
-+			await (this.app as Application).start();
-+		});
-+
-+		installAppAfterHandler();
-+
-+		it('renders the WSL targets view with the distro from a real listing (A5, B1)', async function () {
-+			const app = this.app as Application;
-+
-+			// `workbench.view.remote` is a view container id, not a command, so
-+			// open the container the way a user does: click its activity bar icon.
-+			await app.code.waitAndClick('.activitybar .action-label[aria-label^="Remote Explorer"]');
-+			await app.code.waitForElements('.monaco-pane-view .pane-header .title', true,
-+				elements => elements.some(element => (element.textContent ?? '').includes('WSL 目标')));
-+			await app.code.waitForElements('.monaco-list-row .monaco-tl-contents', true,
-+				elements => elements.some(element => (element.textContent ?? '').includes(DISTRO)));
-+		});
-+
-+		it('brands the window title as WSL, not the raw authority (A6)', async function () {
-+			const app = this.app as Application;
-+
-+			await app.code.waitForTitle(title =>
-+				/WSL/.test(title) && !title.includes('picket-wsl+'));
-+		});
-+	});
-+}
-diff --git a/test/smoke/src/main.ts b/test/smoke/src/main.ts
-index 02bee7c0..fb0c381a 100644
---- a/test/smoke/src/main.ts
-+++ b/test/smoke/src/main.ts
-@@ -36,6 +36,7 @@ import { setup as setupChatModelConfigTests } from './areas/chat/chatModelConfig
- import { setup as setupAccessibilityTests } from './areas/accessibility/accessibility.test';
- import { setup as setupAgentsWindowTests } from './areas/agentsWindow/agentsWindow.test';
- import { setup as setupIcodeTests } from './areas/agentsWindow/icode.test';
-+import { setup as setupWslTests } from './areas/wsl/remote.test';
- import { setup as setupBrowserViewTests } from './areas/browserView/browserView.test';
- import { setup as setupPolicyTests } from './areas/policy/policy.test';
- 
-@@ -473,6 +474,9 @@ const smokeTestSuite = describe(`VSCode Smoke Tests (${opts.web ? 'Web' : 'Elect
- 	// account or mock LLM server — only desktop Electron (the fake CLI is
- 	// spawned directly, which Windows cannot do; the suite skips itself there).
- 	if (!opts.web && !opts.remote) { setupIcodeTests(logger); }
-+	// The WSL area self-skips unless acceptance.sh exports its environment; it
-+	// opens its own remote window (remote: true) regardless of opts.remote.
-+	setupWslTests(logger);
- 	if (!opts.web && !opts.remote) { setupBrowserViewTests(logger); }
- 	// Native policy fixtures modify OS state outside the test profile; opt in only on disposable runners so you don't break your own machine.
- 	if (!opts.web && !opts.remote && process.env.VSCODE_SMOKE_TEST_POLICY === '1') { setupPolicyTests(logger); }
 diff --git a/test/wsl-harness/conflict/extension.js b/test/wsl-harness/conflict/extension.js
 new file mode 100644
 index 00000000..794a14a6
