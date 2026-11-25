@@ -922,14 +922,14 @@ index 00000000..45983e00
 +module.exports = { loadCatalog };
 diff --git a/extensions/picket-remote-wsl/src/commands.js b/extensions/picket-remote-wsl/src/commands.js
 new file mode 100644
-index 00000000..ed45cc81
+index 00000000..e5d659d6
 --- /dev/null
 +++ b/extensions/picket-remote-wsl/src/commands.js
 @@ -0,0 +1,553 @@
 +'use strict';
 +
 +const { listDistros, distroHome, visibleDistros } = require('./distro.js');
-+const { AUTHORITY_PREFIX, parseAuthority, parseUncPath, toPosixPath, toWindowsPath } = require('./remoteUri.js');
++const { AUTHORITY_PREFIX, parseAuthority, parseUncPath, uncPathFor, toPosixPath, toWindowsPath } = require('./remoteUri.js');
 +const { manageDistro } = require('./manage.js');
 +const { buildDiagnostics } = require('./diagnose.js');
 +const { selectGallery, installVsix } = require('./marketplace.js');
@@ -1168,7 +1168,7 @@ index 00000000..ed45cc81
 +			canSelectFolders: true,
 +			canSelectMany: false,
 +			title: `在 ${distro} 中选择文件夹`,
-+			defaultUri: host.uriFor({ scheme: 'vscode-remote', authority: `${AUTHORITY_PREFIX}+${distro}`, path: home })
++			defaultUri: host.fileUri(uncPathFor(distro, home))
 +		});
 +		const chosen = Array.isArray(picked) ? picked[0] : picked;
 +		if (!chosen) {
@@ -4185,10 +4185,10 @@ index 00000000..1c98de4a
 +module.exports = { readProduct };
 diff --git a/extensions/picket-remote-wsl/src/remoteUri.js b/extensions/picket-remote-wsl/src/remoteUri.js
 new file mode 100644
-index 00000000..286ab287
+index 00000000..5d3d0222
 --- /dev/null
 +++ b/extensions/picket-remote-wsl/src/remoteUri.js
-@@ -0,0 +1,108 @@
+@@ -0,0 +1,123 @@
 +'use strict';
 +
 +const { decodeWslOutput } = require('./distro.js');
@@ -4260,6 +4260,21 @@ index 00000000..286ab287
 +}
 +
 +/**
++ * The same folder spelled for a *local* file dialog. A `vscode-remote` URI has
++ * no file system provider until the server is connected — and the dialog is one
++ * of the ways a user gets connected — so the picker must start from a plain
++ * `file` URI. `\\wsl.localhost` is that URI: Explorer hands it to the dialog
++ * like any share, and `parseUncPath` turns the answer straight back into a
++ * distro path.
++ * @param {string} distro
++ * @param {string} posixPath
++ */
++function uncPathFor(distro, posixPath) {
++	const tail = String(posixPath ?? '/').replace(/^\/+/, '').replace(/\/+$/, '').replace(/\//g, '\\');
++	return `\\\\wsl.localhost\\${distro}${tail.length > 0 ? `\\${tail}` : ''}`;
++}
++
++/**
 + * The only place a Windows path becomes a Linux one: `wslpath` owns the mapping
 + * (`C:\` -> `/mnt/c`, drvfs mounts, `$HOME`-relative shortcuts), and guessing it
 + * would be wrong on exactly the machines that need it most.
@@ -4296,7 +4311,7 @@ index 00000000..286ab287
 +	return wslpath('-w', runner, distro, posixPath);
 +}
 +
-+module.exports = { AUTHORITY_PREFIX, LEGACY_AUTHORITY_PREFIX, parseAuthority, canonicalAuthority, remoteUriFor, parseUncPath, toPosixPath, toWindowsPath };
++module.exports = { AUTHORITY_PREFIX, LEGACY_AUTHORITY_PREFIX, parseAuthority, canonicalAuthority, remoteUriFor, uncPathFor, parseUncPath, toPosixPath, toWindowsPath };
 diff --git a/extensions/picket-remote-wsl/src/resolver.js b/extensions/picket-remote-wsl/src/resolver.js
 new file mode 100644
 index 00000000..c60a4414
@@ -5656,10 +5671,10 @@ index 00000000..1d666a4e
 +});
 diff --git a/extensions/picket-remote-wsl/test/commands.test.js b/extensions/picket-remote-wsl/test/commands.test.js
 new file mode 100644
-index 00000000..e1b30781
+index 00000000..4f8eef6c
 --- /dev/null
 +++ b/extensions/picket-remote-wsl/test/commands.test.js
-@@ -0,0 +1,355 @@
+@@ -0,0 +1,383 @@
 +// RED first: this file must fail until src/commands.js exists.
 +const test = require('node:test');
 +const assert = require('node:assert');
@@ -6014,6 +6029,34 @@ index 00000000..e1b30781
 +	await ctx.commands.openFolder();
 +
 +	assert.deepStrictEqual(ctx.ensured[0].config.download, { proxy: '', strictSSL: true, caFile: '' });
++});
++
++test('the folder dialog opens on the WSL home as a UNC file path, not a remote URI', async () => {
++	// A `vscode-remote` defaultUri makes VS Code pick the simple dialog for that
++	// scheme; in a window with no server connection yet there is no provider for
++	// it, so the dialog only reports "File system provider ... is not available"
++	// and the command dies. The native dialog can reach the same folder through
++	// \\wsl.localhost, which is a plain `file` URI.
++	/** @type {any} */
++	let dialog;
++	const ctx = harness({
++		flavor: 'embedded',
++		host: {
++			quickPick: 'Ubuntu-24.04',
++			openDialog: (opts) => {
++				if (!opts.canSelectFolders) {
++					return '/tmp/payload.tar.gz';
++				}
++				dialog = opts;
++				return [{ path: '/home/u/project' }];
++			}
++		}
++	});
++	await ctx.commands.openFolder();
++
++	assert.strictEqual(dialog.defaultUri.scheme, 'file');
++	assert.strictEqual(dialog.defaultUri.fsPath, '\\\\wsl.localhost\\Ubuntu-24.04\\home\\u');
++	assert.strictEqual(ctx.host.opened.length, 1);
 +});
 diff --git a/extensions/picket-remote-wsl/test/components.test.js b/extensions/picket-remote-wsl/test/components.test.js
 new file mode 100644
@@ -8537,14 +8580,14 @@ index 00000000..56079fa9
 +});
 diff --git a/extensions/picket-remote-wsl/test/remoteUri.test.js b/extensions/picket-remote-wsl/test/remoteUri.test.js
 new file mode 100644
-index 00000000..1d83cdef
+index 00000000..2c7627db
 --- /dev/null
 +++ b/extensions/picket-remote-wsl/test/remoteUri.test.js
-@@ -0,0 +1,71 @@
+@@ -0,0 +1,77 @@
 +// RED first: this file must fail until src/remoteUri.js exists.
 +const test = require('node:test');
 +const assert = require('node:assert');
-+const { parseAuthority, canonicalAuthority, remoteUriFor, parseUncPath, toPosixPath, toWindowsPath } = require('../src/remoteUri.js');
++const { parseAuthority, canonicalAuthority, remoteUriFor, uncPathFor, parseUncPath, toPosixPath, toWindowsPath } = require('../src/remoteUri.js');
 +
 +test('parseAuthority names the prefix and the distro, and treats default as empty', () => {
 +	assert.deepStrictEqual(parseAuthority('picket-wsl+Ubuntu 22.04 LTS'), { prefix: 'picket-wsl', distro: 'Ubuntu 22.04 LTS' });
@@ -8583,6 +8626,12 @@ index 00000000..1d83cdef
 +	assert.deepStrictEqual(parseUncPath('\\\\wsl$\\Debian\\srv\\app'), { distro: 'Debian', posixPath: '/srv/app' });
 +	assert.deepStrictEqual(parseUncPath('//wsl.localhost/Ubuntu/home/u'), { distro: 'Ubuntu', posixPath: '/home/u' });
 +	assert.deepStrictEqual(parseUncPath('\\\\wsl.localhost\\Ubuntu'), { distro: 'Ubuntu', posixPath: '/' });
++});
++
++test('uncPathFor spells a distro path the way a local file dialog reads it', () => {
++	assert.strictEqual(uncPathFor('Ubuntu 22.04 LTS', '/home/u'), '\\\\wsl.localhost\\Ubuntu 22.04 LTS\\home\\u');
++	assert.strictEqual(uncPathFor('Debian', '/'), '\\\\wsl.localhost\\Debian');
++	assert.deepStrictEqual(parseUncPath(uncPathFor('Debian', '/srv/app')), { distro: 'Debian', posixPath: '/srv/app' });
 +	assert.deepStrictEqual(parseUncPath('\\\\wsl.localhost\\Ubuntu\\home\\u\\'), { distro: 'Ubuntu', posixPath: '/home/u' });
 +});
 +
