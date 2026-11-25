@@ -101,9 +101,24 @@ cd website && npm ci && npm run docs:build
 wrangler pages deploy docs/.vitepress/dist --project-name=picket-code
 ```
 
-## 六、GitHub Actions 一键部署（备用）
+## 六、当前部署方式：手动 `Deploy site` 工作流
 
-`deploy/.github/workflows/deploy-pages.yml.example` 提供了 GitHub Actions 直传 Pages 的完整示例，需在仓库 Secrets 中配置：
+Pages 项目**没有**接入本仓库的 GitHub webhook（`gh api repos/noware-cn/picket-code/hooks`
+只有 Gitee 镜像一条），所以 push 到 `main` 不会触发重建；站点一度因此停留在旧构建。
+现在改用仓库自带的工作流 `.github/workflows/deploy-site.yml`：
+
+- 触发：仅 `workflow_dispatch`（Actions → **Deploy site** → Run workflow）；
+- 口令：仓库 Secret `CF_PAGES_TOKEN`（**Account → Cloudflare Pages → Edit**，不要附加 R2 或
+  Zone 权限）＋ 仓库变量 `CF_ACCOUNT_ID`；`CF_API_TOKEN` 只有 R2 权限，仅作为缺省回退；
+- 行为：`npm ci && npm run docs:build` 后 `wrangler pages deploy docs/.vitepress/dist
+  --project-name=picket-code --branch=main`，即把该次构建作为 production 部署。
+
+若在 Cloudflare 控制台把 Pages 项目重新连到 `noware-cn/picket-code` 的 `main`，可恢复
+push 即发布，届时该工作流可以保留为手动兜底。
+
+## 七、GitHub Actions 一键部署（备用形态）
+
+`deploy/.github/workflows/deploy-pages.yml.example` 提供了 GitHub Actions 直传 Pages 的另一种示例，需在仓库 Secrets 中配置：
 
 | Secret | 说明 |
 |---|---|
