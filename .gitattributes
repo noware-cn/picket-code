@@ -5,3 +5,8 @@
 *.yml text eol=lf
 *.json text eol=lf
 *.md text eol=lf
+# 补丁必须按 LF 检出：Git for Windows 默认 core.autocrlf=true，CRLF 化的文本
+# hunk 还能应用，但 `GIT binary patch` 段会解析失败（rc.8 的 win32 编译即卡在
+# 67-picket-remote-wsl.patch 的 icon.png 二进制段）。
+*.patch text eol=lf
+*.diff text eol=lf
