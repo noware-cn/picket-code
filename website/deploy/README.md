@@ -2,7 +2,15 @@
 
 Picket Code 官网是纯静态站点（VitePress 构建产物），托管在 **Cloudflare Pages**，域名 **`picket-code.noware.cn`**，构建由 **GitHub** 触发。发行包等大文件放 **Cloudflare R2**，通过 R2 桶的自定义域名 **`download.noware.cn`** 直出。
 
-> **实际部署状态（2026-10-30）**：Pages 项目 `picket-code` 已接入 GitHub（仓库原为 `dantesun/picket-code`，现已迁移到 `noware-cn/picket-code`，production branch `main`；迁移后请在 Pages 设置里确认仍指向新地址），每次 push 到 `website/**` 自动构建上线；自定义域名 `picket-code.noware.cn` 已绑定并生效（active），SSL 由 Google Trust Services 签发（有效期至 2027-01-26）。构建配置：Root directory `website`，Build command `npm ci && npm run docs:build`，Output directory `docs/.vitepress/dist`。下载域名 `download.noware.cn` 为 R2 桶 `picket-releases` 的自定义域名。
+> **实际部署状态（2026-11-25）**：Pages 项目 `picket-code` 的 Git 连接已重新指向 `noware-cn/picket-code`
+> （`source.config.owner = noware-cn`、`repo_id 1429677360`、production branch `main`、`deployments_enabled = true`），
+> 由一次真实的 `github:push main → deploy/success` 验证；自定义域名 `picket-code.noware.cn` 仍绑定在同一个项目上
+> （SSL 由 Google Trust Services 签发，有效期至 2027-01-26）。构建配置：Root directory `website`，
+> Build command `npm ci && npm run docs:build`，Output directory `docs/.vitepress/dist`。
+> Node 版本**不显式指定**，用 v3 构建镜像的默认 22.23.4（v3 起不再读取 `package.json` 的 `engines.node`）。
+> Build watch paths 应设为 `website/*`，避免应用代码提交也触发站点重建。
+> 项目状态用只读工作流 **Actions → Pages info** 复核（打印仓库接线、构建配置、环境变量名、最近部署）。
+> 下载域名 `download.noware.cn` 为 R2 桶 `picket-releases` 的自定义域名。
 
 ## 总体架构
 
@@ -101,20 +109,29 @@ cd website && npm ci && npm run docs:build
 wrangler pages deploy docs/.vitepress/dist --project-name=picket-code
 ```
 
-## 六、当前部署方式：手动 `Deploy site` 工作流
+## 六、部署方式：Git 构建为主，`Deploy site` 工作流为兜底
 
-Pages 项目**没有**接入本仓库的 GitHub webhook（`gh api repos/noware-cn/picket-code/hooks`
-只有 Gitee 镜像一条），所以 push 到 `main` 不会触发重建；站点一度因此停留在旧构建。
-现在改用仓库自带的工作流 `.github/workflows/deploy-site.yml`：
+2026-10-30 到 2026-11-25 之间站点在"默默不更新"：仓库从 `dantesun/picket-code` 转移到
+`noware-cn/picket-code` 后，Pages 项目仍指向旧地址（`gh api repos/noware-cn/picket-code/hooks`
+里只有 Gitee 镜像一条，没有 Cloudflare 的 push 回调）。2026-11-25 重新连接后恢复自动构建。
+
+**主路径（自动）**：push 到 `main` → Pages 按项目构建配置构建 → 发布到 `picket-code.noware.cn`。
+前提是 Cloudflare Pages 的 GitHub App 已在 `noware-cn` 组织上获得该仓库的访问权
+（https://github.com/apps/cloudflare-pages/installations/new → 选组织 → 只勾 `picket-code`）。
+换仓库/换组织时，只点 "Manage" 重新授权不管用，必须在 Settings → Builds → Git Repository
+里**先 Disconnect 再重连**，否则项目会继续指向旧 org。
+
+**兜底（手动）**：`.github/workflows/deploy-site.yml`。
 
 - 触发：仅 `workflow_dispatch`（Actions → **Deploy site** → Run workflow）；
 - 口令：仓库 Secret `CF_PAGES_TOKEN`（**Account → Cloudflare Pages → Edit**，不要附加 R2 或
   Zone 权限）＋ 仓库变量 `CF_ACCOUNT_ID`；`CF_API_TOKEN` 只有 R2 权限，仅作为缺省回退；
 - 行为：`npm ci && npm run docs:build` 后 `wrangler pages deploy docs/.vitepress/dist
   --project-name=picket-code --branch=main`，即把该次构建作为 production 部署。
+  与 Git 构建写同一个项目，谁最后跑谁生效。
 
-若在 Cloudflare 控制台把 Pages 项目重新连到 `noware-cn/picket-code` 的 `main`，可恢复
-push 即发布，届时该工作流可以保留为手动兜底。
+**排障**：Actions → **Pages info**（只读，`.github/workflows/pages-info.yml`）打印仓库接线、
+构建配置、环境变量名（不打印值）与最近 5 次部署状态。
 
 ## 七、GitHub Actions 一键部署（备用形态）
 
