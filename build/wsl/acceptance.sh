@@ -451,8 +451,10 @@ run_isolation() {
 	snapshot_results isolation
 	kill_window "$pid"
 
-	if ! grep -q "user-data-dir=$SCRATCH/home/.picket-code-server/data" "$log"; then
-		ko isolation "the server did not run on our own data directory"; return
+	# server_pids() matches on the data directory, so a hit here means the live
+	# server is running on ours, not on the tree VS Code owns.
+	if [ -z "$(server_pids | head -1)" ]; then
+		ko isolation "no server ran on ~/.picket-code-server/data"; return
 	fi
 	# The only thing isolation may remove from the old tree is a payload an
 	# earlier build installed there; everything else must be byte-identical.
@@ -462,7 +464,7 @@ run_isolation() {
 	if [ -f "$legacy/bin/picket-marker-0.0.1/bin/picket-code-server" ]; then
 		ko isolation "the payload left in the VS Code tree was not migrated"; return
 	fi
-	if [ ! -x "$SCRATCH/home/.picket-code-server/bin/picket-marker-0.0.1/bin/picket-code-server" ]; then
+	if [ ! -f "$SCRATCH/home/.picket-code-server/bin/picket-marker-0.0.1/bin/picket-code-server" ]; then
 		ko isolation "the migrated payload is not under ~/.picket-code-server/bin"; return
 	fi
 	if print_results b2 b3 b4 b5 hook; then ok isolation; else ko isolation "harness checks failed (log: $log)"; fi

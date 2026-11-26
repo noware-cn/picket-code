@@ -10758,6 +10758,28 @@ index 00000000..2be699f1
 +		});
 +	});
 +}
+diff --git a/test/smoke/src/main.ts b/test/smoke/src/main.ts
+index 02bee7c0..fb0c381a 100644
+--- a/test/smoke/src/main.ts
++++ b/test/smoke/src/main.ts
+@@ -36,6 +36,7 @@ import { setup as setupChatModelConfigTests } from './areas/chat/chatModelConfig
+ import { setup as setupAccessibilityTests } from './areas/accessibility/accessibility.test';
+ import { setup as setupAgentsWindowTests } from './areas/agentsWindow/agentsWindow.test';
+ import { setup as setupIcodeTests } from './areas/agentsWindow/icode.test';
++import { setup as setupWslTests } from './areas/wsl/remote.test';
+ import { setup as setupBrowserViewTests } from './areas/browserView/browserView.test';
+ import { setup as setupPolicyTests } from './areas/policy/policy.test';
+ 
+@@ -473,6 +474,9 @@ const smokeTestSuite = describe(`VSCode Smoke Tests (${opts.web ? 'Web' : 'Elect
+ 	// account or mock LLM server — only desktop Electron (the fake CLI is
+ 	// spawned directly, which Windows cannot do; the suite skips itself there).
+ 	if (!opts.web && !opts.remote) { setupIcodeTests(logger); }
++	// The WSL area self-skips unless acceptance.sh exports its environment; it
++	// opens its own remote window (remote: true) regardless of opts.remote.
++	setupWslTests(logger);
+ 	if (!opts.web && !opts.remote) { setupBrowserViewTests(logger); }
+ 	// Native policy fixtures modify OS state outside the test profile; opt in only on disposable runners so you don't break your own machine.
+ 	if (!opts.web && !opts.remote && process.env.VSCODE_SMOKE_TEST_POLICY === '1') { setupPolicyTests(logger); }
 diff --git a/test/wsl-harness/conflict/extension.js b/test/wsl-harness/conflict/extension.js
 new file mode 100644
 index 00000000..794a14a6
