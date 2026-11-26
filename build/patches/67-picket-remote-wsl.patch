@@ -931,10 +931,10 @@ index 00000000..45983e00
 +module.exports = { loadCatalog };
 diff --git a/extensions/picket-remote-wsl/src/commands.js b/extensions/picket-remote-wsl/src/commands.js
 new file mode 100644
-index 00000000..8148fe9e
+index 00000000..a114ffce
 --- /dev/null
 +++ b/extensions/picket-remote-wsl/src/commands.js
-@@ -0,0 +1,609 @@
+@@ -0,0 +1,613 @@
 +'use strict';
 +
 +const { listDistros, distroHome, visibleDistros } = require('./distro.js');
@@ -1204,7 +1204,11 @@ index 00000000..8148fe9e
 +		if (!await ensureComponentInteractive({ distro, home })) {
 +			return;
 +		}
-+		await offerImport({ distro, home });
++		// Asked, not awaited: the answer only affects what this window sees after
++		// its next reload, and blocking here kept the folder from opening at all
++		// (a non-modal message resolves on dismissal, so the window never came up).
++		void offerImport({ distro, home }).catch(error =>
++			options.log?.error(`import offer failed: ${error?.message ?? error}`));
 +		await host.openFolder(
 +			host.uriFor({ scheme: 'vscode-remote', authority: `${AUTHORITY_PREFIX}+${distro}`, path: posixPath }),
 +			{ forceNewWindow: true, remoteAuthority: `${AUTHORITY_PREFIX}+${distro}` }
@@ -5940,10 +5944,10 @@ index 00000000..1d666a4e
 +});
 diff --git a/extensions/picket-remote-wsl/test/commands.test.js b/extensions/picket-remote-wsl/test/commands.test.js
 new file mode 100644
-index 00000000..27522901
+index 00000000..0f2757c2
 --- /dev/null
 +++ b/extensions/picket-remote-wsl/test/commands.test.js
-@@ -0,0 +1,443 @@
+@@ -0,0 +1,456 @@
 +// RED first: this file must fail until src/commands.js exists.
 +const test = require('node:test');
 +const assert = require('node:assert');
@@ -6339,6 +6343,17 @@ index 00000000..27522901
 +	assert.strictEqual(ctx.host.opened.length, 1);
 +});
 +
++
++/** The import offer runs beside the connect, so its messages land a tick later. */
++async function settled(messages, pattern) {
++	for (let i = 0; i < 100; i++) {
++		if (messages.some(message => pattern.test(String(message)))) {
++			return;
++		}
++		await new Promise(resolve => setTimeout(resolve, 10));
++	}
++}
++
 +test('a VS Code tree in the distro is offered once, and importing copies around the excluded families', async () => {
 +	// Isolation means the user's VS Code extensions are not there any more. The
 +	// first connect asks, and a "yes" copies them — the VS Code tree is read,
@@ -6357,7 +6372,9 @@ index 00000000..27522901
 +		}
 +	});
 +	await ctx.commands.openFolder();
++	assert.strictEqual(ctx.host.opened.length, 1, 'the window opens without waiting for the answer');
 +
++	await settled(ctx.host.messages, /已从 VS Code 导入/);
 +	assert.ok(ctx.host.messages.some(message => /检测到 VS Code 在此发行版里有 12 个扩展/.test(String(message))), ctx.host.messages.join(' | '));
 +	assert.ok(ctx.host.messages.some(message => /已从 VS Code 导入 2 个扩展 与 Machine 设置/.test(String(message))), ctx.host.messages.join(' | '));
 +	assert.strictEqual(ctx.host.opened.length, 1, 'the window still opens');
@@ -10584,12 +10601,39 @@ index 00000000..093514e6
 +	assert.strictEqual(engineMinimum('*'), undefined);
 +	assert.strictEqual(engineMinimum(undefined), undefined);
 +});
+diff --git a/test/automation/src/code.ts b/test/automation/src/code.ts
+index 4c0d9bda..8564139a 100644
+--- a/test/automation/src/code.ts
++++ b/test/automation/src/code.ts
+@@ -31,6 +31,11 @@ export interface LaunchOptions {
+ 	useInMemorySecretStorage?: boolean;
+ 	readonly extraArgs?: string[];
+ 	readonly remote?: boolean;
++	/**
++	 * Authority used when `remote` is set. Defaults to `test+test` (the test
++	 * resolver); the WSL area targets `picket-wsl+<distro>`.
++	 */
++	readonly remoteAuthority?: string;
+ 	readonly web?: boolean;
+ 	readonly tracing?: boolean;
+ 	snapshots?: boolean;
+@@ -312,6 +317,10 @@ export class Code {
+ 		await this.poll(() => this.driver.isActiveElement(selector), r => r, `is active element '${selector}'`, retryCount);
+ 	}
+ 
++	async getTitle(): Promise<string> {
++		return this.driver.getTitle();
++	}
++
+ 	async waitForTitle(accept: (title: string) => boolean): Promise<void> {
+ 		await this.poll(() => this.driver.getTitle(), accept, `get title`);
+ 	}
 diff --git a/test/smoke/src/areas/wsl/remote.test.ts b/test/smoke/src/areas/wsl/remote.test.ts
 new file mode 100644
-index 00000000..2be699f1
+index 00000000..bff174ae
 --- /dev/null
 +++ b/test/smoke/src/areas/wsl/remote.test.ts
-@@ -0,0 +1,168 @@
+@@ -0,0 +1,187 @@
 +/*---------------------------------------------------------------------------------------------
 + *  Copyright (c) Microsoft Corporation. All rights reserved.
 + *  Licensed under the MIT License. See License.txt in the project root for license information.
@@ -10733,6 +10777,7 @@ index 00000000..2be699f1
 +				}, null, 2));
 +			}
 +
++			logger.log(`WSL smoke: distro=${DISTRO} fakeHome=${FAKE_HOME} folder=${FOLDER} authority=picket-wsl+${DISTRO}`);
 +			await (this.app as Application).start();
 +		});
 +
@@ -10753,8 +10798,26 @@ index 00000000..2be699f1
 +		it('brands the window title as WSL, not the raw authority (A6)', async function () {
 +			const app = this.app as Application;
 +
-+			await app.code.waitForTitle(title =>
-+				/WSL/.test(title) && !title.includes('picket-wsl+'));
++			// waitForTitle gives up without saying what it saw, which made the
++			// first failure unreadable (was the title wrong, or just late?). Poll
++			// here so the error carries the titles that were actually observed.
++			this.timeout(90 * 1000);
++			const seen: string[] = [];
++			const deadline = Date.now() + 60 * 1000;
++			for (;;) {
++				const title = await app.code.getTitle();
++				if (!seen.includes(title)) {
++					seen.push(title);
++					logger.log(`WSL smoke: window title "${title}"`);
++				}
++				if (/WSL/.test(title) && !title.includes('picket-wsl+')) {
++					return;
++				}
++				if (Date.now() > deadline) {
++					throw new Error(`the title never became a WSL label; observed: ${JSON.stringify(seen)}`);
++				}
++				await new Promise(resolve => setTimeout(resolve, 500));
++			}
 +		});
 +	});
 +}
