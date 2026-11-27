@@ -9,10 +9,10 @@ index 00000000..96fab092
 +tsconfig.json
 diff --git a/extensions/picket-remote-wsl/extension.js b/extensions/picket-remote-wsl/extension.js
 new file mode 100644
-index 00000000..7c32d5b2
+index 00000000..2e5b70f3
 --- /dev/null
 +++ b/extensions/picket-remote-wsl/extension.js
-@@ -0,0 +1,315 @@
+@@ -0,0 +1,316 @@
 +'use strict';
 +
 +const { join } = require('node:path');
@@ -195,6 +195,7 @@ index 00000000..7c32d5b2
 +			task
 +		),
 +		openFolder: (uri, options) => vscode.commands.executeCommand('vscode.openFolder', uri, options),
++		reloadWindow: () => vscode.commands.executeCommand('workbench.action.reloadWindow'),
 +		runInTerminal: (command) => {
 +			const terminal = vscode.window.createTerminal('Picket WSL');
 +			terminal.show();
@@ -931,10 +932,10 @@ index 00000000..45983e00
 +module.exports = { loadCatalog };
 diff --git a/extensions/picket-remote-wsl/src/commands.js b/extensions/picket-remote-wsl/src/commands.js
 new file mode 100644
-index 00000000..a114ffce
+index 00000000..b54e41c9
 --- /dev/null
 +++ b/extensions/picket-remote-wsl/src/commands.js
-@@ -0,0 +1,613 @@
+@@ -0,0 +1,631 @@
 +'use strict';
 +
 +const { listDistros, distroHome, visibleDistros } = require('./distro.js');
@@ -1166,8 +1167,17 @@ index 00000000..a114ffce
 +			`检测到 VS Code 在此发行版里有 ${legacy.extensions} 个扩展。Picket Code 使用独立的 ~/.picket-code-server，不会改动 VS Code 的目录。要导入吗？`,
 +			'导入扩展与设置', '只导入扩展', '只导入设置', '全新开始'
 +		);
-+		if (!choice || choice === '全新开始') {
++		// A dismissed notification, not an answer: leaving the marker unset is what
++		// makes the question come back on the next connect. Writing it here turned
++		// an unnoticed toast (the window opens and takes focus while it is showing)
++		// into "this user chose to start fresh, forever".
++		if (!choice) {
++			options.log?.info(`Import offer dismissed for ${target.distro}; it will be offered again`);
++			return;
++		}
++		if (choice === '全新开始') {
 +			await markAnswered({ runner, distro: target.distro, home: target.home });
++			options.log?.info(`Import declined for ${target.distro}; recorded so the question is not repeated`);
 +			return;
 +		}
 +		const withExtensions = choice !== '只导入设置';
@@ -1181,9 +1191,18 @@ index 00000000..a114ffce
 +			if (result.settings) {
 +				bits.push('Machine 设置');
 +			}
-+			await host.showInformationMessage(bits.length > 0
-+				? `已从 VS Code 导入 ${bits.join(' 与 ')}。云端助理类扩展（Remote 系列、Copilot 系列）刻意跳过。`
-+				: '没有可导入的内容。');
++			// The reload is not decoration: the list this window shows was built at
++			// start-up, so imported extensions only appear after the remote window
++			// reloads. The message says so and offers the one click that does it.
++			const summary = bits.length > 0
++				? `已从 VS Code 导入 ${bits.join(' 与 ')}。Remote 与 Copilot 系列刻意跳过；重载窗口后才会出现在扩展列表里。`
++				: '没有可导入的内容。';
++			const answer = bits.length > 0
++				? await host.showInformationMessage(summary, '重新加载窗口')
++				: await host.showInformationMessage(summary);
++			if (answer === '重新加载窗口') {
++				await host.reloadWindow();
++			}
 +			options.log?.info(`Imported from ~/.vscode-server: ${result.copied.length} extensions, settings=${result.settings}`);
 +		} catch (error) {
 +			await host.showErrorMessage(`导入 VS Code 数据失败：${error.message}`);
@@ -5944,10 +5963,10 @@ index 00000000..1d666a4e
 +});
 diff --git a/extensions/picket-remote-wsl/test/commands.test.js b/extensions/picket-remote-wsl/test/commands.test.js
 new file mode 100644
-index 00000000..0f2757c2
+index 00000000..032347b1
 --- /dev/null
 +++ b/extensions/picket-remote-wsl/test/commands.test.js
-@@ -0,0 +1,456 @@
+@@ -0,0 +1,492 @@
 +// RED first: this file must fail until src/commands.js exists.
 +const test = require('node:test');
 +const assert = require('node:assert');
@@ -6392,6 +6411,42 @@ index 00000000..0f2757c2
 +	const marker = ctx.calls.find(args => args.join(' ').includes('.picket-code-server/.imported') && args.join(' ').includes(': >'));
 +	assert.ok(marker, 'the answer must be recorded so the question is not asked again');
 +	assert.strictEqual(ctx.host.opened.length, 1);
++});
++
++test('a dismissed question is not an answer: the offer comes back next time', async () => {
++	// The window opens while the toast is showing and takes focus, so dismissing it
++	// by accident is the common case. Recording that as "start fresh" silenced the
++	// question forever and left the user with an empty extension list.
++	const ctx = harness({
++		flavor: 'embedded',
++		host: { quickPick: 'Ubuntu-24.04', openDialog: [{ path: '/home/u/project' }], info: [undefined] },
++		shellReply: key => (key.includes('[ -e "$2" ] && exit 4') ? { code: 0, stdout: '7 1\n', stderr: '' } : undefined)
++	});
++	await ctx.commands.openFolder();
++	await settled(ctx.host.messages, /检测到 VS Code/);
++
++	const marker = ctx.calls.find(args => args.join(' ').includes('.picket-code-server/.imported') && args.join(' ').includes(': >'));
++	assert.strictEqual(marker, undefined, 'a dismissal must not record an answer');
++});
++
++test('importing offers the reload that makes the extensions appear', async () => {
++	let reloaded = 0;
++	const ctx = harness({
++		flavor: 'embedded',
++		host: { quickPick: 'Ubuntu-24.04', openDialog: [{ path: '/home/u/project' }], info: ['只导入扩展', '重新加载窗口'], reloadWindow: () => { reloaded++; } },
++		shellReply: key => {
++			if (key.includes('[ -e "$2" ] && exit 4')) {
++				return { code: 0, stdout: '3 0\n', stderr: '' };
++			}
++			if (key.includes('case "$b" in')) {
++				return { code: 0, stdout: 'copied ms-python.python-2026.1.0\n', stderr: '' };
++			}
++			return undefined;
++		}
++	});
++	await ctx.commands.openFolder();
++	await settled(ctx.host.messages, /重载窗口后才会出现/);
++	assert.strictEqual(reloaded, 1, 'the reload action must run the command it advertises');
 +});
 +
 +test('no VS Code tree means no question at all', async () => {
@@ -7361,10 +7416,10 @@ index 00000000..80904827
 +});
 diff --git a/extensions/picket-remote-wsl/test/fixtures/fake-host.js b/extensions/picket-remote-wsl/test/fixtures/fake-host.js
 new file mode 100644
-index 00000000..47b9fe9c
+index 00000000..d01be40a
 --- /dev/null
 +++ b/extensions/picket-remote-wsl/test/fixtures/fake-host.js
-@@ -0,0 +1,191 @@
+@@ -0,0 +1,197 @@
 +'use strict';
 +
 +/**
@@ -7423,6 +7478,12 @@ index 00000000..47b9fe9c
 +				return options.confirm ? actions.filter(action => typeof action === 'string')[0] : undefined;
 +			}
 +			return warningQueue.length > 0 ? warningQueue.shift() : undefined;
++		},
++		async reloadWindow() {
++			state.reloaded = (state.reloaded ?? 0) + 1;
++			if (options.reloadWindow) {
++				options.reloadWindow();
++			}
 +		},
 +		/** @param {string} message */
 +		async showErrorMessage(message) {
