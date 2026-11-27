@@ -12,3 +12,4 @@
 66-gallery-no-account.patch
 67-picket-remote-wsl.patch
 68-picket-brand-icons.patch
+69-no-github-signin.patch
