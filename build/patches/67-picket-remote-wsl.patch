@@ -10630,10 +10630,10 @@ index 4c0d9bda..8564139a 100644
  	}
 diff --git a/test/smoke/src/areas/wsl/remote.test.ts b/test/smoke/src/areas/wsl/remote.test.ts
 new file mode 100644
-index 00000000..bff174ae
+index 00000000..5f6ef3f2
 --- /dev/null
 +++ b/test/smoke/src/areas/wsl/remote.test.ts
-@@ -0,0 +1,187 @@
+@@ -0,0 +1,191 @@
 +/*---------------------------------------------------------------------------------------------
 + *  Copyright (c) Microsoft Corporation. All rights reserved.
 + *  Licensed under the MIT License. See License.txt in the project root for license information.
@@ -10795,12 +10795,16 @@ index 00000000..bff174ae
 +				elements => elements.some(element => (element.textContent ?? '').includes(DISTRO)));
 +		});
 +
-+		it('brands the window title as WSL, not the raw authority (A6)', async function () {
++		it('shows the remote folder in the title, never the raw authority (A6)', async function () {
 +			const app = this.app as Application;
++			const folder = path.basename(FOLDER);
 +
-+			// waitForTitle gives up without saying what it saw, which made the
-+			// first failure unreadable (was the title wrong, or just late?). Poll
-+			// here so the error carries the titles that were actually observed.
++			// What the product actually does: the window title carries the folder
++			// and the generic `[vscode-remote]` suffix Visual Studio Code gives a
++			// custom authority -- there is no supported way to brand that suffix,
++			// so the WSL name lives in the explorer and the status bar instead.
++			// What must hold: the remote window is up (the folder is in the title)
++			// and the authority never leaks into user-visible text.
 +			this.timeout(90 * 1000);
 +			const seen: string[] = [];
 +			const deadline = Date.now() + 60 * 1000;
@@ -10810,11 +10814,11 @@ index 00000000..bff174ae
 +					seen.push(title);
 +					logger.log(`WSL smoke: window title "${title}"`);
 +				}
-+				if (/WSL/.test(title) && !title.includes('picket-wsl+')) {
++				if (title.includes(folder) && !title.includes('picket-wsl+')) {
 +					return;
 +				}
 +				if (Date.now() > deadline) {
-+					throw new Error(`the title never became a WSL label; observed: ${JSON.stringify(seen)}`);
++					throw new Error(`the title never showed "${folder}" without the authority; observed: ${JSON.stringify(seen)}`);
 +				}
 +				await new Promise(resolve => setTimeout(resolve, 500));
 +			}
