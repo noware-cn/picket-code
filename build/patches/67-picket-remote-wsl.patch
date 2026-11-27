@@ -1904,10 +1904,10 @@ index 00000000..05b0de23
 +module.exports = { createComponentManager, markerPath };
 diff --git a/extensions/picket-remote-wsl/src/diagnose.js b/extensions/picket-remote-wsl/src/diagnose.js
 new file mode 100644
-index 00000000..5a520269
+index 00000000..51abbc1a
 --- /dev/null
 +++ b/extensions/picket-remote-wsl/src/diagnose.js
-@@ -0,0 +1,280 @@
+@@ -0,0 +1,314 @@
 +'use strict';
 +
 +const { readFile } = require('node:fs/promises');
@@ -2001,6 +2001,39 @@ index 00000000..5a520269
 +}
 +
 +/**
++ * Terminals are the one feature that fails with no useful message when the
++ * shipped native module does not load: ptyHost exits, the server logs "No
++ * ptyHost response to createProcess", and the window just says the terminal is
++ * gone. Loading `node-pty` with the payload's own node reproduces that in a
++ * second and names the real cause — a `pty.node` built against a newer glibc
++ * than the distribution has.
++ * @param {{ runner: any, distro?: string }} options
++ * @returns {Promise<string>}
++ */
++async function terminalCapability(options) {
++	const { runner } = options;
++	const distro = options.distro ?? defaultDistro(await listDistros(runner));
++	if (!distro) {
++		return 'no distribution';
++	}
++	const home = await distroHome(runner, distro);
++	const root = `${home}/${DATA_ROOT}/bin`;
++	// Two steps on purpose: node-pty's own loader hides the reason (it reports the
++	// last dlopen attempt), while the direct require prints e.g. "version
++	// `GLIBC_2.42' not found", which is the thing a support report needs.
++	const script = 'p=$(ls -d "$1"/picket-*/ 2>/dev/null | head -1); [ -n "$p" ] || { echo "no payload installed"; exit 0; }; '
++		+ 'out=$("$p/node" -e "require(process.argv[1])" "$p/node_modules/node-pty/build/Release/pty.node" 2>&1) || '
++		+ '{ echo "$out" | grep -m1 -E "GLIBC_[0-9.]+|Cannot find|not found" || echo "$out" | tail -1; exit 3; }; '
++		+ '"$p/node" -e "require(process.argv[1])" "$p/node_modules/node-pty" 2>&1 | grep -m1 -E "Error" && exit 3; echo ok';
++	const result = await runner.exec(['-d', distro, '-e', 'sh', '-c', script, 'sh', root]);
++	const output = String(result.stdout || '').trim();
++	if (result.code === 0 && (output === 'ok' || output === '')) {
++		return 'ok (node-pty loads)';
++	}
++	return `broken: ${output.split(/\r?\n/).pop() || `exit ${result.code}`}`;
++}
++
++/**
 + * A support report is only useful if it is complete, so every probe is fenced:
 + * a broken distro or a missing binary degrades to `unavailable: <reason>` on
 + * that one line instead of truncating everything after it.
@@ -2052,6 +2085,7 @@ index 00000000..5a520269
 +
 +	await section('Server version', async () => (await readProduct(appRoot)).version || 'none');
 +	await section('Server minimum', async () => (await readProduct(appRoot)).picketServerMinVersion || 'none');
++	await section('Terminal capability', () => terminalCapability({ runner }));
 +
 +	// A user arriving from the official extension carries `remote.WSL.*` in their
 +	// settings; this is the one place that says which of those keys still do
@@ -6723,10 +6757,10 @@ index 00000000..c484497c
 +});
 diff --git a/extensions/picket-remote-wsl/test/diagnose.test.js b/extensions/picket-remote-wsl/test/diagnose.test.js
 new file mode 100644
-index 00000000..7aac6e46
+index 00000000..4b569cf0
 --- /dev/null
 +++ b/extensions/picket-remote-wsl/test/diagnose.test.js
-@@ -0,0 +1,186 @@
+@@ -0,0 +1,201 @@
 +// RED first: this file must fail until src/diagnose.js exists.
 +const test = require('node:test');
 +const assert = require('node:assert');
@@ -6912,6 +6946,21 @@ index 00000000..7aac6e46
 +	const report = await diagnostics();
 +	assert.match(report, /^Extensions:$/m);
 +	assert.match(report, /^ {2}\(none\)$/m);
++});
++
++test('the report says whether terminals can work at all', async () => {
++	// A payload whose pty.node was built against a newer glibc loads nothing, and
++	// the only user-visible symptom is a terminal that never opens. The report has
++	// to name that, not leave it to be discovered in the server log.
++	const broken = happyRunner([
++		['node-pty', { code: 1, stdout: "Error: /lib/x86_64-linux-gnu/libc.so.6: version `GLIBC_2.42' not found\n" }],
++	]);
++	const report = await buildDiagnostics({ runner: broken, components: () => ({ list: async () => [] }), appRoot: '/nonexistent' });
++	assert.match(report, /Terminal capability: broken: .*GLIBC_2\.42/);
++
++	const healthy = happyRunner();
++	const ok = await buildDiagnostics({ runner: healthy, components: () => ({ list: async () => [] }), appRoot: '/nonexistent' });
++	assert.match(ok, /Terminal capability: ok \(node-pty loads\)/);
 +});
 diff --git a/extensions/picket-remote-wsl/test/distro.test.js b/extensions/picket-remote-wsl/test/distro.test.js
 new file mode 100644
@@ -10764,6 +10813,123 @@ index 00000000..093514e6
 +	assert.strictEqual(engineMinimum('*'), undefined);
 +	assert.strictEqual(engineMinimum(undefined), undefined);
 +});
+diff --git a/test/automation/src/agentsWindow.ts b/test/automation/src/agentsWindow.ts
+index a415183f..8443d859 100644
+--- a/test/automation/src/agentsWindow.ts
++++ b/test/automation/src/agentsWindow.ts
+@@ -59,6 +59,21 @@ const TOOL_CONFIRMATION_WIDGET = '.chat-confirmation-widget2';
+ // onto `aria-expanded` (see `ChatCollapsibleInputOutputContentPart`).
+ const ACTIVE_SESSION_TOOL_PART_HEADER = `${ACTIVE_SESSION} .interactive-item-container.interactive-response .chat-confirmation-widget-collapsible .chat-confirmation-widget-title`;
+ 
++// Per-turn changes summary (`ChatTurnPillsContentPart`): a `<details>` whose
++// summary reports `N files changed +ins -del` and whose body lists the changed
++// files (`renderChangesSummaryFileList` → a `WorkbenchList`).
++const ACTIVE_SESSION_TURN_CHANGES = `${ACTIVE_SESSION} .chat-turn-pills-part`;
++const ACTIVE_SESSION_TURN_CHANGES_HEADER = `${ACTIVE_SESSION_TURN_CHANGES} .checkpoint-file-changes-summary-header`;
++// The `N files changed` label toggles the `<details>`; the sibling
++// `.chat-file-changes-counts` button opens the changes editor instead.
++const ACTIVE_SESSION_TURN_CHANGES_LABEL = `${ACTIVE_SESSION_TURN_CHANGES_HEADER} .chat-file-changes-label`;
++const ACTIVE_SESSION_TURN_CHANGES_DETAILS = `${ACTIVE_SESSION_TURN_CHANGES} details.checkpoint-file-changes-disclosure`;
++const ACTIVE_SESSION_TURN_CHANGES_ROW = `${ACTIVE_SESSION_TURN_CHANGES} .monaco-list-row`;
++// Modified side of an open diff editor. `data-uri` is stamped on the inner
++// editor's root by `CodeEditorWidget`, so this matches both a plain diff editor
++// and the per-file editors of a multi-diff editor.
++const DIFF_EDITOR_MODIFIED = '.monaco-editor.modified-in-monaco-diff-editor';
++
+ export class AgentsWindow {
+ 
+ 	constructor(private code: Code, private quickaccess: QuickAccess) { }
+@@ -1013,6 +1028,90 @@ export class AgentsWindow {
+ 		await page.locator(expandedHeader, { hasText: label }).first().waitFor({ state: 'visible', timeout: timeoutMs });
+ 	}
+ 
++	/**
++	 * Wait for the active turn's changes summary and return the file labels it
++	 * lists (each row also carries the `+added / -removed` counts).
++	 */
++	async getTurnChangedFiles(timeoutMs: number = 60_000): Promise<string[]> {
++		await this.expandTurnChanges(timeoutMs);
++		const rows = await this.code.driver.currentPage.locator(ACTIVE_SESSION_TURN_CHANGES_ROW).allTextContents();
++		return rows.map(text => text.replace(/\s+/g, ' ').trim()).filter(text => text.length > 0);
++	}
++
++	/**
++	 * Open the diff editor of one file listed in the active turn's changes
++	 * summary. Rows open the checkpoint diff, because
++	 * `chat.editing.openChangedFileInDiffEditor` defaults to true.
++	 *
++	 * The modified side is a `git-blob:` resource whose URI appends a JSON query
++	 * (`?{"sessionUri":…,"sha":"refs/agents/…/checkpoints/turn/1",…}`), so the
++	 * `data-uri` attribute does not end with the file name — match on a substring.
++	 */
++	async openTurnChangeDiff(file: string, timeoutMs: number = 60_000): Promise<void> {
++		await this.expandTurnChanges(timeoutMs);
++		const page = this.code.driver.currentPage;
++		const row = page.locator(ACTIVE_SESSION_TURN_CHANGES_ROW, { hasText: file }).first();
++		await row.waitFor({ state: 'visible', timeout: timeoutMs });
++		await row.click();
++		await page.locator(this.diffEditorSelector(file)).first().waitFor({ state: 'visible', timeout: timeoutMs });
++	}
++
++	/**
++	 * Wait for the modified side of the open diff editor for `file` to satisfy
++	 * `accept`.
++	 *
++	 * Inline diffs render the *removed* lines in a view zone that carries its own
++	 * `.view-lines` (`div.view-zones > div.view-lines.line-delete`, see
++	 * `diffEditorViewZones.ts`). That element precedes the editor's real
++	 * `.view-lines` in the DOM, so a bare `… .view-lines` selector resolves to the
++	 * deleted-lines zone — which is empty when the file was created — and never
++	 * sees the document. Only the primary `.lines-content > .view-lines` holds the
++	 * modified document.
++	 */
++	async waitForDiffEditorText(file: string, accept: (text: string) => boolean, timeoutMs: number = 60_000): Promise<string> {
++		const selector = `${this.diffEditorSelector(file)} .lines-content > .view-lines`;
++		try {
++			return await this.code.waitForTextContent(selector, undefined, text => accept(text.replace(/\u00a0/g, ' ')), Math.ceil(timeoutMs / 100));
++		} catch (error) {
++			const message = error instanceof Error ? error.message : String(error);
++			throw new Error(`${message.replace(/\.$/, '')}. ${await this.describeOpenDiffEditors(file)}`);
++		}
++	}
++
++	/** Reports what the diff editors of `file` currently render, for failure messages. */
++	private async describeOpenDiffEditors(file: string): Promise<string> {
++		try {
++			const editors = await this.code.driver.currentPage.evaluate((needle: string) => {
++				return Array.from(document.querySelectorAll('.monaco-editor'))
++					.filter(editor => (editor.getAttribute('data-uri') ?? '').includes(needle))
++					.map(editor => ({
++						uri: editor.getAttribute('data-uri'),
++						viewLines: Array.from(editor.querySelectorAll('.view-lines')).map(element => (element.textContent ?? '').slice(0, 500)),
++						text: (editor.textContent ?? '').slice(0, 500),
++					}));
++			}, file);
++			return `Observed editors for "${file}": ${JSON.stringify(editors)}`;
++		} catch (error) {
++			return `The diff editor DOM for "${file}" could not be inspected: ${error instanceof Error ? error.message : String(error)}`;
++		}
++	}
++
++	private diffEditorSelector(file: string): string {
++		const escaped = file.replace(/[\\"]/g, '\\$&');
++		return `${DIFF_EDITOR_MODIFIED}[data-uri*="${escaped}"]`;
++	}
++
++	private async expandTurnChanges(timeoutMs: number): Promise<void> {
++		const page = this.code.driver.currentPage;
++		await page.locator(ACTIVE_SESSION_TURN_CHANGES_HEADER).first().waitFor({ state: 'visible', timeout: timeoutMs });
++		const isOpen = await page.evaluate(selector => (document.querySelector(selector) as HTMLDetailsElement | null)?.open === true, ACTIVE_SESSION_TURN_CHANGES_DETAILS);
++		if (isOpen) {
++			return;
++		}
++		await page.locator(ACTIVE_SESSION_TURN_CHANGES_LABEL).first().click();
++		await page.waitForFunction(selector => (document.querySelector(selector) as HTMLDetailsElement | null)?.open === true, ACTIVE_SESSION_TURN_CHANGES_DETAILS, { timeout: timeoutMs });
++	}
++
+ 	/**
+ 	 * Open the model picker in the active session input and select the model
+ 	 * whose displayed name contains `modelName`. Clicks the model-picker name
 diff --git a/test/automation/src/code.ts b/test/automation/src/code.ts
 index 4c0d9bda..8564139a 100644
 --- a/test/automation/src/code.ts
@@ -10791,6 +10957,23 @@ index 4c0d9bda..8564139a 100644
  	async waitForTitle(accept: (title: string) => boolean): Promise<void> {
  		await this.poll(() => this.driver.getTitle(), accept, `get title`);
  	}
+diff --git a/test/automation/src/electron.ts b/test/automation/src/electron.ts
+index dda7cb2f..81de7cac 100644
+--- a/test/automation/src/electron.ts
++++ b/test/automation/src/electron.ts
+@@ -60,8 +60,10 @@ export async function resolveElectronConfiguration(options: LaunchOptions): Prom
+ 		if (!workspacePath) {
+ 			throw new Error('Workspace path is required when running remote');
+ 		}
+-		// Replace workspace path with URI
+-		args[0] = `--${workspacePath.endsWith('.code-workspace') ? 'file' : 'folder'}-uri=vscode-remote://test+test/${URI.file(workspacePath).path}`;
++		// Replace workspace path with URI. The authority defaults to the
++		// test resolver's; the WSL smoke area targets `picket-wsl+<distro>`.
++		const remoteAuthority = options.remoteAuthority ?? 'test+test';
++		args[0] = `--${workspacePath.endsWith('.code-workspace') ? 'file' : 'folder'}-uri=vscode-remote://${remoteAuthority}/${URI.file(workspacePath).path}`;
+ 
+ 		if (codePath) {
+ 			if (!extensionsPath) {
 diff --git a/test/smoke/src/areas/wsl/remote.test.ts b/test/smoke/src/areas/wsl/remote.test.ts
 new file mode 100644
 index 00000000..5f6ef3f2
