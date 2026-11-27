@@ -174,6 +174,25 @@ for (const name of ['light', 'dark', 'hcLight', 'hcDark']) {
 	check(svg.includes(EMBLEM), `${relative}: editor watermark is not the Picket emblem`);
 }
 
+// The title bar draws its own SVG, not icon.ico: a rebrand that replaces only the
+// binaries leaves the VS Code glyph in the corner (that is exactly what happened
+// in rc.8/rc.9). Tie it to the site's favicon, which is the emblem of record.
+const titlebarIcon = read('vscode/src/vs/workbench/browser/media/code-icon.svg')?.toString('utf8');
+const favicon = read('website/public/favicon.svg')?.toString('utf8');
+if (titlebarIcon !== undefined && favicon !== undefined) {
+	const modules = favicon.match(/d="(M0 0h58[^"]+)"/);
+	check(!!modules, 'favicon.svg: emblem path not found');
+	check(modules !== null && titlebarIcon.includes(modules[1]), 'code-icon.svg: title bar still draws the upstream glyph');
+	check(titlebarIcon.includes('#19C6D8'), 'code-icon.svg: Signal Cyan core missing');
+}
+
+// "Open in Editor" used Codicon.vscodeInsiders, which renders Visual Studio Code's
+// own mark inside our window.
+const vscodeAction = read('vscode/src/vs/sessions/electron-browser/actions/vscodeActions.ts')?.toString('utf8');
+if (vscodeAction !== undefined) {
+	check(!vscodeAction.includes('Codicon.vscodeInsiders'), 'vscodeActions.ts: "Open in Editor" still uses the VS Code logo glyph');
+}
+
 const loopback = read('vscode/src/vs/workbench/api/node/loopbackServer.ts')?.toString('utf8');
 if (loopback !== undefined) {
 	check(!loopback.includes('data:image/png;base64,iVBOR'), 'loopbackServer.ts: still embeds the upstream VS Code logo PNG');
