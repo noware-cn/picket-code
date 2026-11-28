@@ -60,7 +60,28 @@ jobs:
       vscode: ${{ steps.versions.outputs.vscode }}
       node: ${{ steps.versions.outputs.node }}
       picket-code: ${{ steps.versions.outputs.picket-code }}
+      # The matrix legs themselves, so a single-platform release is a property of
+      # the matrix instead of a job-level `if` (a job `if` cannot read `env`).
+      platforms: ${{ steps.platforms.outputs.platforms }}
     steps:
+      - name: Resolve platforms
+        id: platforms
+        shell: bash
+        env:
+          PUBLISH_PLATFORMS: ${{ vars.PUBLISH_PLATFORMS || 'linux-x64 win32-x64' }}
+        run: |
+          legs=""
+          for p in $PUBLISH_PLATFORMS; do
+            case "$p" in
+              linux-x64) leg='{"platform":"linux","arch":"x64","runner":"ubuntu-latest"}' ;;
+              win32-x64) leg='{"platform":"win32","arch":"x64","runner":"windows-2022"}' ;;
+              *) echo "PUBLISH_PLATFORMS names an unknown platform: $p" >&2; exit 1 ;;
+            esac
+            legs="${legs:+$legs,}$leg"
+          done
+          echo "platforms=[$legs]" >> "$GITHUB_OUTPUT"
+          echo "platforms=[$legs]"
+
       - name: Resolve versions (vscode tag, node from upstream .nvmrc)
         id: versions
         shell: bash
@@ -129,13 +150,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - platform: linux
-            arch: x64
-            runner: ubuntu-latest
-          - platform: win32
-            arch: x64
-            runner: windows-2022
+        include: ${{ fromJSON(needs.versions.outputs.platforms) }}
     steps:
       - uses: actions/checkout@v7
 
@@ -186,13 +201,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - platform: linux
-            arch: x64
-            runner: ubuntu-latest
-          - platform: win32
-            arch: x64
-            runner: windows-2022
+        include: ${{ fromJSON(needs.versions.outputs.platforms) }}
     steps:
       - uses: actions/checkout@v7
 
