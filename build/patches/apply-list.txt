@@ -13,3 +13,4 @@
 67-picket-remote-wsl.patch
 68-picket-brand-icons.patch
 69-no-github-signin.patch
+70-picket-no-extension-signature-verification.patch

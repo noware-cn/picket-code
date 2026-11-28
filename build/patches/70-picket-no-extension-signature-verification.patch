@@ -1,0 +1,27 @@
+# 70-picket-no-extension-signature-verification.patch
+#
+# Picket Code installs extensions from open-vsx. open-vsx advertises a signature
+# asset in its gallery response but the archive it serves has no `.signature.p7s`
+# member, so Microsoft's validator fails every package
+# (`Signature file size: 0`, `CryptographicException: Der_Invalid_Encoding`).
+# With verification on, every install also fails at the end of the download and the
+# extensions view stays at "Installing" until the error reaches the log, so the
+diff --git a/src/vs/workbench/contrib/extensions/browser/extensions.contribution.ts b/src/vs/workbench/contrib/extensions/browser/extensions.contribution.ts
+index 67488e3f..81c24226 100644
+--- a/src/vs/workbench/contrib/extensions/browser/extensions.contribution.ts
++++ b/src/vs/workbench/contrib/extensions/browser/extensions.contribution.ts
+@@ -331,7 +331,13 @@ Registry.as<IConfigurationRegistry>(ConfigurationExtensions.Configuration)
+ 			[VerifyExtensionSignatureConfigKey]: {
+ 				type: 'boolean',
+ 				description: localize('extensions.verifySignature', "When enabled, extensions are verified to be signed before getting installed."),
+-				default: true,
++				// Picket Code installs from open-vsx, which advertises a signature asset
++				// but serves an archive without the `.signature.p7s` member. Microsoft's
++				// validator rejects it (`Signature file size: 0`,
++				// `CryptographicException: Der_Invalid_Encoding`), so verification can
++				// never succeed and would block every install. Off by default; anyone
++				// pointing the gallery at Microsoft's signed marketplace can turn it on.
++				default: false,
+ 				scope: ConfigurationScope.APPLICATION,
+ 				included: isNative
+ 			},
