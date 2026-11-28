@@ -33,7 +33,6 @@
   资产（`curl`，带重试与停顿检测），不再依赖 `gh`。将来若把载荷挪到私有镜像，设
   `PICKET_SERVER_REPO` 与该仓库的只读 PAT（`PICKET_SERVER_TOKEN`）即可，脚本自动切回 `gh`。
 - `verify-release.yml` 跑完再确认一次：`gh release view <tag> --json assets` 里应有
-  `…-offline-wsl.zip`（离线组件包），大小约 87 MB。
 - 服务端仓库的发行流程见 `noware-cn/picket-code-server` 的 README（tag 形如
   `server-v1.2.0`，资产 `<server 版本>-SHA256SUMS` 与载荷 tar.gz）。
 
