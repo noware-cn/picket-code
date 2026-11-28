@@ -145,7 +145,7 @@ jobs:
     needs: [versions, tests, tests-ui]
     # The gate: nothing is built unless the test layers passed. `tests-ui` only runs on
     # tag pushes, so a manual (non-tag) dispatch is gated by `tests` alone.
-    if: ${{ !cancelled() && needs.tests.result == 'success' && (needs.tests-ui.result == 'success' || needs.tests-ui.result == 'skipped') && contains(format(' {0} ', vars.PUBLISH_PLATFORMS || 'linux-x64 win32-x64'), format(' {0}-{1} ', matrix.platform, matrix.arch)) }}
+    if: ${{ !cancelled() && needs.tests.result == 'success' && (needs.tests-ui.result == 'success' || needs.tests-ui.result == 'skipped') }}
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -196,7 +196,7 @@ jobs:
     needs: [versions, compile, tests, tests-ui]
     # Same gate as compile; listed here too so the dependency is explicit in the graph
     # instead of only transitive.
-    if: ${{ !cancelled() && needs.tests.result == 'success' && (needs.tests-ui.result == 'success' || needs.tests-ui.result == 'skipped') && contains(format(' {0} ', vars.PUBLISH_PLATFORMS || 'linux-x64 win32-x64'), format(' {0}-{1} ', matrix.platform, matrix.arch)) }}
+    if: ${{ !cancelled() && needs.tests.result == 'success' && (needs.tests-ui.result == 'success' || needs.tests-ui.result == 'skipped') }}
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
