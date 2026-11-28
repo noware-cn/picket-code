@@ -18,11 +18,9 @@ on:
 permissions:
   contents: write
 
-env:
-  # Space-separated `<platform>-<arch>` list. Unset means every platform, which is
-  # what a tag push normally wants; a variable narrows a single release without a
-  # code change, since a tag push carries no inputs.
-  PUBLISH_PLATFORMS: ${{ vars.PUBLISH_PLATFORMS || 'linux-x64 win32-x64' }}
+# A tag push carries no inputs, so the platform list lives in a repository
+# variable: space-separated `<platform>-<arch>`, unset meaning both. A job-level
+# `if:` cannot read `env`, hence `vars` inline at each use.
 
 # WSL server component (docs/superpowers/plans/2026-11-04-picket-wsl.md Task 12).
 # Public builds ship the ondemand flavor: the app carries only the component
@@ -126,7 +124,7 @@ jobs:
     needs: [versions, tests, tests-ui]
     # The gate: nothing is built unless the test layers passed. `tests-ui` only runs on
     # tag pushes, so a manual (non-tag) dispatch is gated by `tests` alone.
-    if: ${{ !cancelled() && needs.tests.result == 'success' && (needs.tests-ui.result == 'success' || needs.tests-ui.result == 'skipped') && contains(format(' {0} ', env.PUBLISH_PLATFORMS), format(' {0}-{1} ', matrix.platform, matrix.arch)) }}
+    if: ${{ !cancelled() && needs.tests.result == 'success' && (needs.tests-ui.result == 'success' || needs.tests-ui.result == 'skipped') && contains(format(' {0} ', vars.PUBLISH_PLATFORMS || 'linux-x64 win32-x64'), format(' {0}-{1} ', matrix.platform, matrix.arch)) }}
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -183,7 +181,7 @@ jobs:
     needs: [versions, compile, tests, tests-ui]
     # Same gate as compile; listed here too so the dependency is explicit in the graph
     # instead of only transitive.
-    if: ${{ !cancelled() && needs.tests.result == 'success' && (needs.tests-ui.result == 'success' || needs.tests-ui.result == 'skipped') && contains(format(' {0} ', env.PUBLISH_PLATFORMS), format(' {0}-{1} ', matrix.platform, matrix.arch)) }}
+    if: ${{ !cancelled() && needs.tests.result == 'success' && (needs.tests-ui.result == 'success' || needs.tests-ui.result == 'skipped') && contains(format(' {0} ', vars.PUBLISH_PLATFORMS || 'linux-x64 win32-x64'), format(' {0}-{1} ', matrix.platform, matrix.arch)) }}
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
