@@ -43,7 +43,7 @@
 预发行版用于验证尚未进入稳定版的能力（如 WSL 远程、iCode 适配层的最新修复）。它们发布在 [GitHub Releases](https://github.com/noware-cn/picket-code/releases) 并标注为 **Pre-release**，因此不会被“最新版本”解析选中：
 
 - 标签：`v<上游版本>-picket.<N>-rc.<M>`，例如 `v1.143.1-picket.1-rc.8`；
-- 资产：`picket-code-<标签>-<os>-<arch>.<ext>`、`picket-code-<标签>-SHA256SUMS`，另有 `…-offline-wsl.zip` 离线组件包与测试报告；
+- 资产：`picket-code-<标签>-<os>-<arch>.<ext>`、`picket-code-<标签>-SHA256SUMS`，另有测试报告；
 - 下载地址把资产名接到镜像域名后面即可（`https://download.noware.cn/picket-code-v<…>-rc.<M>-win32-x64.zip`）。RC 同样会镜像，但自动清理只识别 `vX.Y.Z` / `-pN` 形态，因此 RC 对象不会被自动删除；
 - 一键下载脚本传 `-Tag v1.143.1-picket.1-rc.8` 可以取得指定 RC。
 

@@ -1,0 +1,232 @@
+diff --git a/src/vs/platform/extensionManagement/common/extensionGalleryManifest.ts b/src/vs/platform/extensionManagement/common/extensionGalleryManifest.ts
+index 02fc94c3..8b817d27 100644
+--- a/src/vs/platform/extensionManagement/common/extensionGalleryManifest.ts
++++ b/src/vs/platform/extensionManagement/common/extensionGalleryManifest.ts
+@@ -100,3 +100,16 @@ export function getExtensionGalleryManifestResourceUri(manifest: IExtensionGalle
+ export const ExtensionGalleryServiceUrlConfigKey = 'extensions.gallery.serviceUrl';
+ 
+ export const ExtensionGalleryAuthProviderConfigKey = 'extensions.gallery.authProvider';
++
++/**
++ * `extensions.gallery.serviceUrl` value that switches the gallery off rather than pointing it
++ * somewhere: an air-gapped deployment has no search endpoint, and a state is better than a view
++ * that sits on a timeout.
++ */
++export const ExtensionGalleryDisabledServiceUrl = 'none';
++
++/**
++ * `extensions.gallery.authProvider` value for a gallery that authenticates nobody (Open VSX and
++ * the private mirrors built from it). The account providers serve Microsoft's marketplace only.
++ */
++export const ExtensionGalleryNoAuthProvider = 'none';
+diff --git a/src/vs/platform/extensionManagement/common/extensionGalleryManifestService.ts b/src/vs/platform/extensionManagement/common/extensionGalleryManifestService.ts
+index 53be55bd..d0c949d3 100644
+--- a/src/vs/platform/extensionManagement/common/extensionGalleryManifestService.ts
++++ b/src/vs/platform/extensionManagement/common/extensionGalleryManifestService.ts
+@@ -9,14 +9,14 @@ import { IProductService } from '../../product/common/productService.js';
+ import { ExtensionGalleryResourceType, Flag, IExtensionGalleryManifest, IExtensionGalleryManifestService, ExtensionGalleryManifestStatus } from './extensionGalleryManifest.js';
+ import { FilterType, SortBy } from './extensionManagement.js';
+ 
+-type ExtensionGalleryConfig = {
++export type ExtensionGalleryConfig = {
+ 	readonly serviceUrl: string;
+-	readonly itemUrl: string;
+-	readonly publisherUrl: string;
+-	readonly resourceUrlTemplate: string;
+-	readonly extensionUrlTemplate: string;
+-	readonly controlUrl: string;
+-	readonly nlsBaseUrl: string;
++	readonly itemUrl?: string;
++	readonly publisherUrl?: string;
++	readonly resourceUrlTemplate?: string;
++	readonly extensionUrlTemplate?: string;
++	readonly controlUrl?: string;
++	readonly nlsBaseUrl?: string;
+ };
+ 
+ export class ExtensionGalleryManifestService extends Disposable implements IExtensionGalleryManifestService {
+@@ -36,7 +36,14 @@ export class ExtensionGalleryManifestService extends Disposable implements IExte
+ 	}
+ 
+ 	async getExtensionGalleryManifest(): Promise<IExtensionGalleryManifest | null> {
+-		const extensionsGallery = this.productService.extensionsGallery as ExtensionGalleryConfig | undefined;
++		return this.buildExtensionGalleryManifest(this.productService.extensionsGallery as ExtensionGalleryConfig | undefined);
++	}
++
++	/**
++	 * The manifest for a gallery described inline: the build's own gallery, or a mirror that a
++	 * deployment configured without an account provider behind it.
++	 */
++	protected buildExtensionGalleryManifest(extensionsGallery: ExtensionGalleryConfig | undefined): IExtensionGalleryManifest | null {
+ 		if (!extensionsGallery?.serviceUrl) {
+ 			return null;
+ 		}
+diff --git a/src/vs/workbench/contrib/extensions/browser/extensions.contribution.ts b/src/vs/workbench/contrib/extensions/browser/extensions.contribution.ts
+index 695859ca..67488e3f 100644
+--- a/src/vs/workbench/contrib/extensions/browser/extensions.contribution.ts
++++ b/src/vs/workbench/contrib/extensions/browser/extensions.contribution.ts
+@@ -362,10 +362,11 @@ Registry.as<IConfigurationRegistry>(ConfigurationExtensions.Configuration)
+ 			},
+ 			[ExtensionGalleryAuthProviderConfigKey]: {
+ 				type: 'string',
+-				enum: ['github', 'microsoft'],
++				enum: ['github', 'microsoft', 'none'],
+ 				enumDescriptions: [
+ 					localize('extensions.gallery.authProvider.github', "Authenticate to the Extensions Marketplace using GitHub."),
+ 					localize('extensions.gallery.authProvider.microsoft', "Authenticate to the Extensions Marketplace using a Microsoft (Entra ID) account."),
++					localize('extensions.gallery.authProvider.none', "The configured Marketplace requires no account, such as Open VSX or a mirror built from it."),
+ 				],
+ 				description: localize('extensions.gallery.authProvider', "Configure the authentication provider for the Extensions Marketplace"),
+ 				default: 'github',
+@@ -389,6 +390,10 @@ Registry.as<IConfigurationRegistry>(ConfigurationExtensions.Configuration)
+ 								key: 'extensions.gallery.authProvider.microsoft',
+ 								value: localize('extensions.gallery.authProvider.microsoft', "Authenticate to the Extensions Marketplace using a Microsoft (Entra ID) account."),
+ 							},
++							{
++								key: 'extensions.gallery.authProvider.none',
++								value: localize('extensions.gallery.authProvider.none', "The configured Marketplace requires no account, such as Open VSX or a mirror built from it."),
++							},
+ 						]
+ 					}
+ 				},
+diff --git a/src/vs/workbench/services/extensionManagement/electron-browser/extensionGalleryManifestService.ts b/src/vs/workbench/services/extensionManagement/electron-browser/extensionGalleryManifestService.ts
+index ae8e7593..3d5b5351 100644
+--- a/src/vs/workbench/services/extensionManagement/electron-browser/extensionGalleryManifestService.ts
++++ b/src/vs/workbench/services/extensionManagement/electron-browser/extensionGalleryManifestService.ts
+@@ -10,8 +10,8 @@ import { IHeaders } from '../../../../base/parts/request/common/request.js';
+ import { localize } from '../../../../nls.js';
+ import { IConfigurationService } from '../../../../platform/configuration/common/configuration.js';
+ import { IEnvironmentService } from '../../../../platform/environment/common/environment.js';
+-import { IExtensionGalleryManifestService, IExtensionGalleryManifest, ExtensionGalleryServiceUrlConfigKey, ExtensionGalleryAuthProviderConfigKey, ExtensionGalleryManifestStatus } from '../../../../platform/extensionManagement/common/extensionGalleryManifest.js';
+-import { ExtensionGalleryManifestService } from '../../../../platform/extensionManagement/common/extensionGalleryManifestService.js';
++import { IExtensionGalleryManifestService, IExtensionGalleryManifest, ExtensionGalleryServiceUrlConfigKey, ExtensionGalleryAuthProviderConfigKey, ExtensionGalleryManifestStatus, ExtensionGalleryDisabledServiceUrl, ExtensionGalleryNoAuthProvider } from '../../../../platform/extensionManagement/common/extensionGalleryManifest.js';
++import { ExtensionGalleryConfig, ExtensionGalleryManifestService } from '../../../../platform/extensionManagement/common/extensionGalleryManifestService.js';
+ import { resolveMarketplaceHeaders } from '../../../../platform/externalServices/common/marketplace.js';
+ import { IFileService } from '../../../../platform/files/common/files.js';
+ import { InstantiationType, registerSingleton } from '../../../../platform/instantiation/common/extensions.js';
+@@ -56,6 +56,15 @@ function isExtensionGalleryManifestResponse(candidate: unknown): candidate is Ex
+ 		&& isExtensionQueryCapabilityValues(extensionQuery.flags);
+ }
+ 
++/**
++ * Open VSX serves item pages from the same host under `/vscode/item`, and the private mirrors
++ * keep that layout. A gallery shaped differently gets no item links rather than links to a 404.
++ */
++function galleryItemUrl(serviceUrl: string): string | undefined {
++	const match = /^(.*)\/vscode\/gallery\/?$/.exec(serviceUrl);
++	return match ? `${match[1]}/vscode/item` : undefined;
++}
++
+ export class WorkbenchExtensionGalleryManifestService extends ExtensionGalleryManifestService implements IExtensionGalleryManifestService {
+ 
+ 	private readonly commonHeadersPromise: Promise<IHeaders>;
+@@ -125,13 +134,26 @@ export class WorkbenchExtensionGalleryManifestService extends ExtensionGalleryMa
+ 	}
+ 
+ 	private async doGetExtensionGalleryManifest(): Promise<void> {
+-		const defaultServiceUrl = this.productService.extensionsGallery?.serviceUrl;
+-		if (!defaultServiceUrl) {
++		const extensionsGallery = this.productService.extensionsGallery as ExtensionGalleryConfig | undefined;
++		if (!extensionsGallery?.serviceUrl) {
+ 			return;
+ 		}
+ 
+ 		const configuredServiceUrl = this.configurationService.getValue<string>(ExtensionGalleryServiceUrlConfigKey);
+-		if (configuredServiceUrl) {
++		const authProvider = this.configurationService.getValue<string>(ExtensionGalleryAuthProviderConfigKey);
++		if (configuredServiceUrl === ExtensionGalleryDisabledServiceUrl) {
++			this.logService.trace('[Marketplace] The extension gallery is disabled by configuration');
++			this.update(null, ExtensionGalleryManifestStatus.Unavailable);
++		} else if (configuredServiceUrl && authProvider === ExtensionGalleryNoAuthProvider) {
++			// Open VSX and the mirrors built from it hold no account, and this build ships no
++			// account provider they could satisfy: building the manifest locally is the whole job.
++			this.logService.trace('[Marketplace] Using a gallery that requires no account', configuredServiceUrl);
++			this.update(this.buildExtensionGalleryManifest({
++				...extensionsGallery,
++				serviceUrl: configuredServiceUrl,
++				itemUrl: galleryItemUrl(configuredServiceUrl),
++			}));
++		} else if (configuredServiceUrl) {
+ 			this.logService.trace('[Marketplace] Private marketplace configured, checking access and fetching manifest', configuredServiceUrl);
+ 			this._register(this.galleryAccountService.onDidChangeAccount(() => this.handleMarketplaceAccountAccess(configuredServiceUrl)));
+ 			await this.handleMarketplaceAccountAccess(configuredServiceUrl);
+diff --git a/src/vs/workbench/services/extensionManagement/test/electron-browser/extensionGalleryManifestService.test.ts b/src/vs/workbench/services/extensionManagement/test/electron-browser/extensionGalleryManifestService.test.ts
+index 3b4e433c..1489bb46 100644
+--- a/src/vs/workbench/services/extensionManagement/test/electron-browser/extensionGalleryManifestService.test.ts
++++ b/src/vs/workbench/services/extensionManagement/test/electron-browser/extensionGalleryManifestService.test.ts
+@@ -15,7 +15,7 @@ import { IConfigurationChangeEvent, IConfigurationService } from '../../../../..
+ import { IContextKeyService } from '../../../../../platform/contextkey/common/contextkey.js';
+ import { IDefaultAccountService } from '../../../../../platform/defaultAccount/common/defaultAccount.js';
+ import { IEnvironmentService } from '../../../../../platform/environment/common/environment.js';
+-import { ExtensionGalleryManifestStatus, ExtensionGalleryAuthProviderConfigKey, ExtensionGalleryServiceUrlConfigKey } from '../../../../../platform/extensionManagement/common/extensionGalleryManifest.js';
++import { ExtensionGalleryManifestStatus, ExtensionGalleryAuthProviderConfigKey, ExtensionGalleryServiceUrlConfigKey, IExtensionGalleryManifest } from '../../../../../platform/extensionManagement/common/extensionGalleryManifest.js';
+ import { IFileService } from '../../../../../platform/files/common/files.js';
+ import { TestInstantiationService } from '../../../../../platform/instantiation/test/common/instantiationServiceMock.js';
+ import { ISharedProcessService } from '../../../../../platform/ipc/electron-browser/services.js';
+@@ -916,4 +916,66 @@ suite('WorkbenchExtensionGalleryManifestService', () => {
+ 		assert.strictEqual(customMarketplaceCount(), 0);
+ 		assert.deepStrictEqual(authCheckedEvents(), []);
+ 	});
++
++	// --- Galleries that need no account, and a disabled gallery ---
++
++	function resourceIds(manifest: IExtensionGalleryManifest | null): string[] {
++		return manifest?.resources.map(resource => resource.id) ?? [];
++	}
++
++	test('authProvider none — the configured gallery is used without an account or a request', async () => {
++		// Open VSX and the private mirrors built from it authenticate nobody: pointing the client at
++		// one must not engage the account path, which has no provider to satisfy in this build.
++		configurationService.setUserConfiguration(ExtensionGalleryServiceUrlConfigKey, 'https://openvsx.corp.local/vscode/gallery');
++		configurationService.setUserConfiguration(ExtensionGalleryAuthProviderConfigKey, 'none');
++		requestHandler = () => { throw new Error('a gallery that needs no account must not be probed'); };
++
++		const service = createService();
++		const manifest = await service.getExtensionGalleryManifest();
++
++		assert.strictEqual(service.extensionGalleryManifestStatus, ExtensionGalleryManifestStatus.Available);
++		assert.deepStrictEqual(resourceIds(manifest), [
++			'https://openvsx.corp.local/vscode/gallery/extensionquery',
++			'https://openvsx.corp.local/vscode/gallery/vscode/{publisher}/{name}/latest',
++			'https://openvsx.corp.local/vscode/gallery/publishers/{publisher}/extensions/{name}/{version}/stats?statType={statTypeName}',
++			'https://openvsx.corp.local/vscode/item?itemName={publisher}.{name}',
++			'https://openvsx.corp.local/vscode/item?itemName={publisher}.{name}&ssr=false#review-details',
++		]);
++	});
++
++	test('authProvider none — a gallery that is not Open VSX-shaped gets no item links', async () => {
++		// The item URL is a convention of the Open VSX layout, not something the service URL
++		// carries. Guessing it for an arbitrary gallery would link users to a 404.
++		configurationService.setUserConfiguration(ExtensionGalleryServiceUrlConfigKey, 'https://market.corp.local/api');
++		configurationService.setUserConfiguration(ExtensionGalleryAuthProviderConfigKey, 'none');
++
++		const manifest = await createService().getExtensionGalleryManifest();
++
++		assert.strictEqual(resourceIds(manifest).some(id => id.includes('itemName')), false);
++		assert.ok(resourceIds(manifest).includes('https://market.corp.local/api/extensionquery'));
++	});
++
++	test('serviceUrl none — the gallery is off, with no request and no account check', async () => {
++		// Air-gapped deployments have nowhere to send a search, and every marketplace view would
++		// sit on a timeout. An explicit "off" is a state, not a failure.
++		configurationService.setUserConfiguration(ExtensionGalleryServiceUrlConfigKey, 'none');
++		requestHandler = () => { throw new Error('a disabled gallery must not be probed'); };
++
++		const service = createService();
++		const manifest = await service.getExtensionGalleryManifest();
++
++		assert.strictEqual(manifest, null);
++		assert.strictEqual(service.extensionGalleryManifestStatus, ExtensionGalleryManifestStatus.Unavailable);
++	});
++
++	test('authProvider none without a configuredServiceUrl falls back to the build gallery', async () => {
++		configurationService.setUserConfiguration(ExtensionGalleryServiceUrlConfigKey, '');
++		configurationService.setUserConfiguration(ExtensionGalleryAuthProviderConfigKey, 'none');
++
++		const service = createService();
++		const manifest = await service.getExtensionGalleryManifest();
++
++		assert.strictEqual(service.extensionGalleryManifestStatus, ExtensionGalleryManifestStatus.Available);
++		assert.ok(resourceIds(manifest).includes('https://default-marketplace.example.com/extensionquery'));
++	});
+ });

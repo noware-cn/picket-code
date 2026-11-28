@@ -74,6 +74,12 @@ if [ "$MOVED" -ne 1 ]; then
   exit 1
 fi
 
+echo "==> [picket-code] Renaming the launcher to code.exe"
+node "$SCRIPT_DIR/rename-exe.mjs" --app "$ROOT_DIR/$OUT_DIR"
+
+echo "==> [picket-code] Verifying the packaged WSL component (flavor: ${PICKET_WSL_PAYLOAD:-ondemand})"
+node "$SCRIPT_DIR/../wsl/check.mjs" --app "$ROOT_DIR/$OUT_DIR/resources/app" --flavor "${PICKET_WSL_PAYLOAD:-ondemand}"
+
 echo "==> [picket-code] Creating picket-code-win32-$ARCH.zip"
 if command -v 7z >/dev/null 2>&1; then
   7z a -r -tzip "$ROOT_DIR/picket-code-win32-$ARCH.zip" "$OUT_DIR"

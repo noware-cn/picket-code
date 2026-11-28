@@ -2,7 +2,7 @@
 
 Picket Code 自带 WSL 支持：一个内置扩展（`noware.picket-remote-wsl`）加一份**我们自己的 Linux 服务端载荷**。不需要侧载微软 Remote-WSL，也不需要手工预置 VS Code Server——首次连接时客户端自己把载荷装进目标发行版，之后每次开窗口都复用它。
 
-> 官方 `ms-vscode-remote.remote-wsl` **必须卸载**。两个扩展抢同一个 `wsl+` authority、同一个 `~/.vscode-server` 树和同一个服务器端口，先解析到的那个独占文件夹。只要官方扩展还装着（启用、禁用、未激活都算），本扩展的所有 WSL 功能一律关闭。卸载**不会**删你的服务器数据，见[卸载官方扩展](#卸载官方扩展)。
+> 官方 `ms-vscode-remote.remote-wsl` **必须卸载**。两个扩展抢同一个 `wsl+` authority 和同一个服务器端口，先解析到的那个独占文件夹。只要官方扩展还装着（启用、禁用、未激活都算），本扩展的所有 WSL 功能一律关闭。Picket Code 使用**独立数据根** `~/.picket-code-server`（不与 VS Code 共用），所以卸载官方扩展既不会删你的 VS Code 数据，也不影响本客户端自己的数据。
 
 ## 前提
 
@@ -27,8 +27,8 @@ WSL1、ARM64 发行版、Alpine 暂不支持。
 
 | 选项 | 用在哪 |
 |---|---|
-| **自动下载** | 能出网时最省事；需要先配置 `picket.wsl.serverPayloadBaseUrl`（公开版默认不带下载地址） |
-| **从文件安装…** | 内网、气隙、镜像被拦时：选官方的 `picket-code-<tag>-offline-wsl.zip` 或里面的 `picket-code-server-<version>-linux-x64.tar.gz` |
+| **自动下载** | 能出网时最省事：默认从镜像 `download.noware.cn` 取，取不到再回退到服务端仓的发行资产，两者都按 catalog 校验 |
+| **从文件安装…** | 内网、气隙、镜像被拦时：先手工下载 `picket-code-server-<version>-linux-x64.tar.gz`（镜像根目录或 `noware-cn/picket-code-server` 的 `server-v<version>` 发行页），再选中它 |
 | **取消** | 什么都不做，窗口不会开 |
 
 装好之后窗口自动打开，之后再连同一发行版不再询问。
@@ -39,24 +39,18 @@ WSL1、ARM64 发行版、Alpine 暂不支持。
 
 1. `picket.wsl.serverPayloadPath` 指向的本地文件；
 2. 构建内嵌的载荷（内网正式版才有，首次零交互）；
-3. `picket.wsl.serverPayloadBaseUrl` 下的同名文件。
+3. `picket.wsl.serverPayloadBaseUrl` 下的同名文件（配了就只用它）；
+4. 都没配时：镜像 `https://download.noware.cn`，其次 `noware-cn/picket-code-server` 的 `server-v<version>` 发行资产。多个候选会依次尝试，某个源给了错的版本会跳到下一个，报错里列出每一个尝试过的地址。
 
 无论哪种来源，都按**客户端自带 catalog** 的 `size` + `sha256` 双重校验：校验不过就拒绝安装，不会把半份东西塞进你的目录。因此**跨版本混用一定失败**——用与客户端同一个 tag 的离线包。
 
-### 离线组件包
+### 纯离线（气隙）
 
-发行页的 `picket-code-<tag>-offline-wsl.zip` 里是三样东西：
+发行版不再附带 `offline-wsl.zip`：默认源已经能自动下载，随包多带 87 MB 只对"完全不出网"的机器有意义，而那种机器本来也要手工传文件。做法：
 
-```
-picket-code-server-1.143.1-linux-x64.tar.gz   载荷本体
-SHA256SUMS                                    载荷摘要
-catalog.json                                  载荷的版本/大小/摘要清单
-```
-
-用法二选一：
-
-- **首次连接时**在弹窗里选「从文件安装…」，直接选这个 **zip**（不必解压）；
-- **已经装过想换**：把 zip 里的 `tar.gz` 解出来，设 `picket.wsl.serverPayloadPath` 指向它，再执行 `Picket: 组件…` → 选 `wsl-server` → **重新安装**。
+1. 在能出网的机器上下载 `picket-code-server-<version>-linux-x64.tar.gz`（镜像根目录或 `noware-cn/picket-code-server` 的 `server-v<version>` 发行页），连 `SHA256SUMS` 一起拷进去；
+2. **首次连接时**在弹窗里选「从文件安装…」，选这个 `tar.gz`；
+3. 已经装过想换：设 `picket.wsl.serverPayloadPath` 指向它，再执行 `Picket: 组件…` → 选 `wsl-server` → **重新安装**。
 
 内网镜像只要保证 `<base>/picket-code-server-<version>-linux-x64.tar.gz` 可取即可；自签 HTTPS 用 `picket.wsl.caFile`，需要沿用 VS Code 代理时保持 `picket.wsl.useProxy`（默认开）。
 
@@ -64,9 +58,9 @@ catalog.json                                  载荷的版本/大小/摘要清�
 
 | 内容 | 位置（在**目标发行版**里） |
 |---|---|
-| 载荷 | `~/.vscode-server/bin/picket-<server 版本>/`，同目录有 `.picket-payload.json` 记录来源与摘要，安装锁是 `.picket-install` |
+| 载荷 | `~/.picket-code-server/bin/picket-<server 版本>/`，同目录有 `.picket-payload.json` 记录来源与摘要，安装锁是 `.picket-install` |
 | 运行时状态 | `~/.picket-code-server/runtime/<发行版>.json`（跨窗口复用同一个服务器，不做退出即杀） |
-| 服务器数据 | `~/.vscode-server`（与官方 Remote-WSL 同一数据根，所以卸载官方扩展后扩展、设置、历史都还在） |
+| 服务器数据 | `~/.picket-code-server`（**独立数据根**：VS Code 的 `~/.vscode-server` 不被读写；旧版本装在那里的载荷会在首次连接时自动迁移过来） |
 | 命令行 | `~/.local/bin/picket-code`，链接到载荷里的 `bin/picket-code` |
 
 多发行版各装各的，互不共享。
@@ -105,10 +99,29 @@ catalog.json                                  载荷的版本/大小/摘要清�
 
 扩展一装上，本扩展就会在 WSL 目标视图里提示拦截。处理方式：
 
-- `Picket: 卸载官方 Remote-WSL 扩展（保留数据）` —— 直接卸载扩展，**不碰** `~/.vscode-server` 里的服务器数据、扩展、设置与历史；
+- `Picket: 卸载官方 Remote-WSL 扩展（保留数据）` —— 直接卸载扩展，**不碰**任何数据目录（本客户端本来就不写 VS Code 的 `~/.vscode-server`）；
 - `Picket: 如何卸载官方 Remote-WSL 扩展` —— 打印手工卸载步骤（扩展面板 → 齿轮 → 卸载，或 `picket-code.exe --uninstall-extension ms-vscode-remote.remote-wsl`）。
 
 两个扩展不能共存是硬约束，不是偏好。
+
+## 扩展一直停在 “Installing”
+
+Picket Code 的扩展来自 open-vsx。open-vsx 的清单会声明一个签名资产，但它提供的签名包缺少 `.signature.p7s` 成员，微软的校验器直接判为无效：
+
+```
+Package file size:  3313175
+Signature archive file size:  58082
+Signature file size:  0
+System.Security.Cryptography.CryptographicException: Der_Invalid_Encoding
+```
+
+所以 rc.12 起默认关闭扩展签名校验（`extensions.verifySignature` = `false`）。若在旧版本上遇到，把这一行加进**用户设置**（application 作用域，写在远端/工作区设置里不生效）：
+
+```json
+"extensions.verifySignature": false
+```
+
+成功装过一次后，日志里会写 `Extension signature verification ... ` 之外不再出现，扩展视图也不再卡在 Installing。
 
 ## 常见问题
 
@@ -119,7 +132,7 @@ catalog.json                                  载荷的版本/大小/摘要清�
 | `Checksum mismatch for …` | 文件被截断或改过；重新下载并验证 `SHA256SUMS` |
 | `这个构建没有 WSL 服务器组件` | `payloads/catalog.json` 缺失或被裁剪，重装客户端 |
 | 弹窗一直要求下载 | 装到了另一个发行版（载荷按 `$HOME` 隔离），或 `serverDataFolderName` 被改 |
-| `Failed to connect to the remote extension host server` | 服务器起来了但握手失败：看 `Picket: Show WSL Log` 与发行版内 `~/.vscode-server/data/logs/<时间戳>/`；先 `Picket: Stop WSL Server` 再重连 |
+| `Failed to connect to the remote extension host server` | 服务器起来了但握手失败：看 `Picket: Show WSL Log` 与发行版内 `~/.picket-code-server/data/logs/<时间戳>/`；先 `Picket: Stop WSL Server` 再重连 |
 | WSL 目标为空 | `wsl -l -v` 无输出 → 先装 WSL；有输出但视图空 → 执行 `Picket: 刷新 WSL 目标`、看 `Picket: 诊断 WSL 支持` |
 | 所有 WSL 命令都提示被禁用 | 官方 Remote-WSL 还装着，见[卸载官方扩展](#卸载官方扩展) |
 

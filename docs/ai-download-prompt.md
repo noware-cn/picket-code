@@ -26,5 +26,5 @@
    - Windows: powershell -ExecutionPolicy Bypass -File download-verify.ps1
    - Linux/macOS: bash download-verify.sh
 5. 校验通过后，解压下载到的 zip / tar.gz（归档内只有一个顶层目录，名字不带版本：picket-code-win32-x64/ 或 picket-code-linux-x64/），放置到合适目录（如 ~/picket-code）。
-6. 启动：Windows 运行 Picket Code.exe；Linux 运行 ./picket-code。
+6. 启动：Windows 运行 code.exe；Linux 运行 ./picket-code。
 7. 完成后报告：发行包 SHA256、校验结果、安装路径。

@@ -73,8 +73,18 @@ jobs:
               problems.push("builtInExtensionsEnabledWithAutoUpdates must be an empty array, got " + JSON.stringify(p.builtInExtensionsEnabledWithAutoUpdates));
             for (const key of ["defaultChatAgent", "trustedExtensionAuthAccess", "updateUrl", "tunnelApplicationConfig"])
               if (key in p) problems.push(key + " must be absent, got " + JSON.stringify(p[key]));
+            // The product version must be a bare X.Y.Z. `extensionValidator.ts` parses it
+            // with /^(\^|>=)?((\d+)|x)\.((\d+)|x)\.((\d+)|x)(\-.*)?$/, which has no
+            // build-metadata branch: `1.143.1+p4` makes parseVersion() null and every
+            // extension with a `main` is refused. A prerelease (`1.143.1-p4`) parses, but
+            // the gallery compares engine ranges with semver.satisfies(), where a
+            // prerelease no longer matches `^1.x`. Both break extension installs, so the
+            // picket revision belongs in the git tag and the file name, never here.
+            // See docs/manual-remote-wsl.md §1.
+            if (!/^\d+\.\d+\.\d+$/.test(String(p.version)))
+              problems.push("version must be a bare X.Y.Z (got " + JSON.stringify(p.version) + "); a suffix breaks extension compatibility");
             if (problems.length) { problems.forEach(p => console.error("RESIDUE: " + p)); process.exit(1); }
-            console.log("product.json shapes ok");
+            console.log("product.json shapes ok, version " + p.version);
           ' app-root/resources/app/product.json
 
       - name: --list-extensions must not throw
@@ -224,8 +234,18 @@ jobs:
               problems.push("builtInExtensionsEnabledWithAutoUpdates must be an empty array, got " + JSON.stringify(p.builtInExtensionsEnabledWithAutoUpdates));
             for (const key of ["defaultChatAgent", "trustedExtensionAuthAccess", "updateUrl", "tunnelApplicationConfig"])
               if (key in p) problems.push(key + " must be absent, got " + JSON.stringify(p[key]));
+            // The product version must be a bare X.Y.Z. `extensionValidator.ts` parses it
+            // with /^(\^|>=)?((\d+)|x)\.((\d+)|x)\.((\d+)|x)(\-.*)?$/, which has no
+            // build-metadata branch: `1.143.1+p4` makes parseVersion() null and every
+            // extension with a `main` is refused. A prerelease (`1.143.1-p4`) parses, but
+            // the gallery compares engine ranges with semver.satisfies(), where a
+            // prerelease no longer matches `^1.x`. Both break extension installs, so the
+            // picket revision belongs in the git tag and the file name, never here.
+            // See docs/manual-remote-wsl.md §1.
+            if (!/^\d+\.\d+\.\d+$/.test(String(p.version)))
+              problems.push("version must be a bare X.Y.Z (got " + JSON.stringify(p.version) + "); a suffix breaks extension compatibility");
             if (problems.length) { problems.forEach(p => console.error("RESIDUE: " + p)); process.exit(1); }
-            console.log("product.json shapes ok");
+            console.log("product.json shapes ok, version " + p.version);
           ' picket-code-win32-x64/resources/app/product.json
 
       - name: --list-extensions must not throw

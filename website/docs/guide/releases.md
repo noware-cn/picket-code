@@ -48,7 +48,7 @@ versions ──► compile(linux) ──┐
 
 - 标签格式 `v<上游版本>-picket.<N>-rc.<M>`（如 `v1.143.1-picket.1-rc.8`）；`versions` 阶段把 `-picket…` 之后的部分整体剥掉后定位上游 tag；
 - 推 `-rc.` 标签时 `tests-ui` 无论输入如何都会运行（L4 UI 冒烟 + WSL 验收矩阵），红色即不出产物；
-- 资产名同样带标签，同时额外产出 `…-offline-wsl.zip` 离线组件包与 `test-report-<tag>.tar.gz`；
+- 资产名同样带标签，另有 `test-report-<tag>.tar.gz` 测试报告；服务器载荷不再随发行版附带，客户端会按 catalog 自动下载（见 [WSL 支持](/guide/wsl)）；
 - RC 也镜像到 R2，但 `prune-r2.sh` 只识别 `vX.Y.Z` / `-pN` 形态，因此 RC 对象不会被自动清理。
 
 > 历史：早期用 `-pN` 区分同一上游版本的重建（`v1.143.1-p1` … `v1.143.1-p4`）。`p1`/`p2` 因 `product.json` 两个字段被写成 `null` / `{}`，扩展扫描器构造即抛错、装后不加载任何扩展；`p3`/`p4` 修好了扩展加载但仍按旧策略命名。2026-10-31 起改为单一标签：`v1.143.1` 指向当前发行（含提案 API 白名单与 WSL 服务端打包脚本），`-p1`…`-p4` 的 Release 与 tag 已全部删除。

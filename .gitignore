@@ -3,3 +3,6 @@ vscode/
 *.tar.gz
 *.zip
 .DS_Store
+.superpowers/
+test-results/
+build/wsl/download/

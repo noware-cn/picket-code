@@ -1,0 +1,25 @@
+diff --git a/src/vs/sessions/contrib/accountMenu/browser/account.contribution.ts b/src/vs/sessions/contrib/accountMenu/browser/account.contribution.ts
+index cc22ba08..1be67137 100644
+--- a/src/vs/sessions/contrib/accountMenu/browser/account.contribution.ts
++++ b/src/vs/sessions/contrib/accountMenu/browser/account.contribution.ts
+@@ -103,6 +103,10 @@ registerUpdateTitleBarMenuPlacement(Menus.TitleBarLeftLayout, {
+ 	),
+ });
+ 
++// Sign In is hidden in this build: it runs the Copilot chat-setup action, and
++// Copilot plus `github-authentication` are trimmed (patches 52-61), so the entry
++// can only ever fail. Restore the condition below if a build ships an auth
++// provider again.
+ // Sign In (shown when signed out)
+ registerAction2(class extends Action2 {
+ 	constructor() {
+@@ -112,7 +116,8 @@ registerAction2(class extends Action2 {
+ 			icon: Codicon.signIn,
+ 			menu: {
+ 				id: AccountMenu,
+-				when: ContextKeyExpr.notEquals('defaultAccountStatus', 'available'),
++				// was: ContextKeyExpr.notEquals('defaultAccountStatus', 'available')
++				when: ContextKeyExpr.false(),
+ 				group: '1_account',
+ 				order: 1,
+ 			}
