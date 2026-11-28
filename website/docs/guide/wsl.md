@@ -104,6 +104,25 @@ WSL1、ARM64 发行版、Alpine 暂不支持。
 
 两个扩展不能共存是硬约束，不是偏好。
 
+## 扩展一直停在 “Installing”
+
+Picket Code 的扩展来自 open-vsx。open-vsx 的清单会声明一个签名资产，但它提供的签名包缺少 `.signature.p7s` 成员，微软的校验器直接判为无效：
+
+```
+Package file size:  3313175
+Signature archive file size:  58082
+Signature file size:  0
+System.Security.Cryptography.CryptographicException: Der_Invalid_Encoding
+```
+
+所以 rc.12 起默认关闭扩展签名校验（`extensions.verifySignature` = `false`）。若在旧版本上遇到，把这一行加进**用户设置**（application 作用域，写在远端/工作区设置里不生效）：
+
+```json
+"extensions.verifySignature": false
+```
+
+成功装过一次后，日志里会写 `Extension signature verification ... ` 之外不再出现，扩展视图也不再卡在 Installing。
+
 ## 常见问题
 
 | 现象 | 原因与处理 |
