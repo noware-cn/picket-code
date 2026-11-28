@@ -4150,10 +4150,10 @@ index 00000000..28e328ac
 +module.exports = { unpackOfflineBundle, removeBundle, parseSha256Sums, defaultExpand, fileName };
 diff --git a/extensions/picket-remote-wsl/src/payload.js b/extensions/picket-remote-wsl/src/payload.js
 new file mode 100644
-index 00000000..06ee282f
+index 00000000..f30304f2
 --- /dev/null
 +++ b/extensions/picket-remote-wsl/src/payload.js
-@@ -0,0 +1,254 @@
+@@ -0,0 +1,306 @@
 +'use strict';
 +
 +const { createHash, randomBytes } = require('node:crypto');
@@ -4161,7 +4161,7 @@ index 00000000..06ee282f
 +const { downloadFile, parseProxySetting } = require('./download.js');
 +
 +/**
-+ * @typedef {{ kind: 'file', path: string } | { kind: 'embedded', path: string } | { kind: 'url', url: string }} ISource
++ * @typedef {{ kind: 'file', path: string } | { kind: 'embedded', path: string } | { kind: 'url', url: string, urls?: string[] }} ISource
 + * @typedef {{ id: string, kind: 'server' | 'extensions', version: string, file: string, size: number, sha256: string, embedded: boolean, embeddedPath?: string }} IComponent
 + */
 +
@@ -4184,8 +4184,37 @@ index 00000000..06ee282f
 +}
 +
 +/**
-+ * Three sources, in the order a user would expect them to win: a file they
-+ * pointed at, the copy shipped inside the build, then the configured mirror.
++ * Where an on-demand build gets its payload. Such a build ships no bytes of its
++ * own, so anything that stops an already-installed copy from being reused — a
++ * payload left by another release, a deleted data folder, a first run — has to
++ * fall back to a download. Without a default the only symptom is a window that
++ * cannot connect, with "No source for wsl-server".
++ *
++ * The mirror is fast in-region and carries both assets flat; the release on the
++ * server repository is the same bytes under `server-v<version>/`. A configured
++ * `picket.wsl.serverPayloadBaseUrl` replaces the list rather than extending it:
++ * someone who set a mirror meant it.
++ */
++const DEFAULT_BASE_URLS = [
++	'https://download.noware.cn',
++	'https://github.com/noware-cn/picket-code-server/releases/download/server-v{version}',
++];
++
++/**
++ * @param {IComponent} component
++ * @param {string} [baseUrl]
++ * @returns {string[]}
++ */
++function candidateUrls(component, baseUrl) {
++	return (baseUrl ? [baseUrl] : DEFAULT_BASE_URLS).map(base => `${String(base)
++		.replace(/\/+$/, '')
++		.replace('{version}', component.version)}/${component.file}`);
++}
++
++/**
++ * Four sources, in the order a user would expect them to win: a file they
++ * pointed at, the copy shipped inside the build, the configured mirror, then
++ * the defaults above.
 + * @param {IComponent} component
 + * @param {{ explicitPath?: string, embeddedDir?: string, baseUrl?: string, exists?: (path: string) => Promise<boolean> }} options
 + * @returns {Promise<ISource>}
@@ -4208,10 +4237,8 @@ index 00000000..06ee282f
 +			return { kind: 'embedded', path: embedded };
 +		}
 +	}
-+	if (options.baseUrl) {
-+		return { kind: 'url', url: `${options.baseUrl.replace(/\/+$/, '')}/${component.file}` };
-+	}
-+	throw new Error(`No source for ${component.id}: explicit path missing, no embedded payload, and no base URL configured`);
++	const urls = candidateUrls(component, options.baseUrl);
++	return { kind: 'url', url: urls[0], urls };
 +}
 +
 +/** @param {string} a @param {string} b */
@@ -4346,32 +4373,57 @@ index 00000000..06ee282f
 + */
 +async function installPayload(options) {
 +	const { runner, distro, component, source, payloadRoot } = options;
-+	const bytes = source.kind === 'url'
-+		? await download(source.url, {
-+			fetchImpl: options.fetchImpl,
-+			proxy: options.proxy,
-+			strictSSL: options.strictSSL,
-+			caFile: options.caFile,
-+			timeoutMs: options.timeoutMs,
-+			maxBytes: component.size,
-+			onProgress: options.onProgress
-+		})
-+		: await readFile(source.path);
 +
-+	// Name the file that was read, not just the catalog's expectation: a stale
-+	// `picket.wsl.serverPayloadPath` wins over the embedded copy and the mirror,
-+	// so the path in this message is usually the answer to "why is it wrong".
-+	const where = source.kind === 'url' ? source.url : source.path;
++	/**
++	 * @param {Buffer} bytes
++	 * @param {string} where
++	 */
++	const verify = (bytes, where) => {
++		// The size the catalog declares is cheap to check and catches a mirror that
++		// serves a different artifact before the (slower) hash does.
++		if (bytes.length !== component.size) {
++			throw new Error(`Size mismatch for ${component.file} from ${where}: expected ${component.size} bytes, got ${bytes.length}. A payload built for another release cannot be used here; install the one this build ships or the offline bundle from the same release.`);
++		}
++		const actual = sha256OfBuffer(bytes);
++		if (actual !== component.sha256.toLowerCase()) {
++			throw new Error(`Checksum mismatch for ${component.file} from ${where}: expected ${component.sha256.toLowerCase()}, got ${actual}`);
++		}
++	};
 +
-+	// The size the catalog declares is cheap to check and catches a mirror that
-+	// serves a different artifact before the (slower) hash does.
-+	if (bytes.length !== component.size) {
-+		throw new Error(`Size mismatch for ${component.file} from ${where}: expected ${component.size} bytes, got ${bytes.length}. A payload built for another release cannot be used here; install the one this build ships or the offline bundle from the same release.`);
-+	}
-+
-+	const actual = sha256OfBuffer(bytes);
-+	if (actual !== component.sha256.toLowerCase()) {
-+		throw new Error(`Checksum mismatch for ${component.file} from ${where}: expected ${component.sha256.toLowerCase()}, got ${actual}`);
++	let bytes;
++	if (source.kind === 'url') {
++		// Every candidate is tried before giving up: a mirror that is up but serving
++		// another release is exactly what the size and digest checks describe, and
++		// the next candidate usually has the right file.
++		const failures = [];
++		for (const url of source.urls ?? [source.url]) {
++			try {
++				const downloaded = await download(url, {
++					fetchImpl: options.fetchImpl,
++					proxy: options.proxy,
++					strictSSL: options.strictSSL,
++					caFile: options.caFile,
++					timeoutMs: options.timeoutMs,
++					maxBytes: component.size,
++					onProgress: options.onProgress
++				});
++				verify(downloaded, url);
++				bytes = downloaded;
++				source.url = url;
++				break;
++			} catch (error) {
++				failures.push(`${url}: ${/** @type {Error} */ (error)?.message ?? error}`);
++			}
++		}
++		if (!bytes) {
++			throw new Error(`Could not download ${component.file}. ${failures.join(' | ')}`);
++		}
++	} else {
++		// Name the file that was read, not just the catalog's expectation: a stale
++		// `picket.wsl.serverPayloadPath` wins over the embedded copy and the mirror,
++		// so the path in this message is usually the answer to "why is it wrong".
++		bytes = await readFile(source.path);
++		verify(bytes, source.path);
 +	}
 +
 +	const finalDir = `${payloadRoot}/picket-${component.version}`;
@@ -8965,10 +9017,10 @@ index 00000000..81d2272e
 +});
 diff --git a/extensions/picket-remote-wsl/test/payload.test.js b/extensions/picket-remote-wsl/test/payload.test.js
 new file mode 100644
-index 00000000..698458c4
+index 00000000..cca93900
 --- /dev/null
 +++ b/extensions/picket-remote-wsl/test/payload.test.js
-@@ -0,0 +1,196 @@
+@@ -0,0 +1,223 @@
 +// RED first: this file must fail until src/payload.js exists.
 +const test = require('node:test');
 +const assert = require('node:assert');
@@ -8988,16 +9040,43 @@ index 00000000..698458c4
 +	assert.strictEqual(sums.size, 2);
 +});
 +
-+test('source precedence is explicit, embedded, url', async () => {
++test('source precedence is explicit, embedded, then a mirror', async () => {
 +	const exists = async () => true;
 +	assert.deepStrictEqual(await chooseSource(COMPONENT, { explicitPath: 'C:\\p.tar.gz', embeddedDir: 'E', baseUrl: 'https://x/', exists }), { kind: 'file', path: 'C:\\p.tar.gz' });
 +	assert.deepStrictEqual(await chooseSource(COMPONENT, { embeddedDir: 'E', baseUrl: 'https://x/', exists }), { kind: 'embedded', path: join('E', COMPONENT.file) });
-+	assert.deepStrictEqual(await chooseSource(COMPONENT, { baseUrl: 'https://x/', exists }), { kind: 'url', url: `https://x/${COMPONENT.file}` });
++	assert.deepStrictEqual(await chooseSource(COMPONENT, { baseUrl: 'https://x/', exists }), { kind: 'url', url: `https://x/${COMPONENT.file}`, urls: [`https://x/${COMPONENT.file}`] });
 +});
 +
-+test('no source at all throws with every reason', async () => {
-+	await assert.rejects(() => chooseSource(COMPONENT, { exists: async () => false }),
-+		/explicit path missing, no embedded payload, and no base URL configured/);
++test('a build with no payload of its own still has somewhere to fetch from', async () => {
++	// rc.10 shipped on demand and the only fallback was a setting nobody had set,
++	// so a payload that could not be reused produced "No source for wsl-server"
++	// with no way forward. The defaults have to be there without any settings.
++	const chosen = await chooseSource(COMPONENT, { exists: async () => false });
++	assert.strictEqual(chosen.kind, 'url');
++	assert.match(chosen.url, /^https:\/\/download\.noware\.cn\/picket-code-server-/);
++	assert.strictEqual(chosen.urls[1], `https://github.com/noware-cn/picket-code-server/releases/download/server-v${COMPONENT.version}/${COMPONENT.file}`);
++});
++
++test('a mirror serving the wrong release falls through to the next source', async () => {
++	// Same shape as the real incident: the mirror has a file, but not this file.
++	const seen = [];
++	const good = Buffer.from('abc');
++	const component = { ...COMPONENT, size: good.length, sha256: createHash('sha256').update(good).digest('hex') };
++	const error = await installPayload({
++		runner: { exec: async () => ({ code: 0, stdout: '', stderr: '' }) },
++		distro: 'Ubuntu',
++		component,
++		payloadRoot: '/payloads',
++		source: { kind: 'url', url: 'https://mirror.invalid/x', urls: ['https://mirror.invalid/x', 'https://ok.invalid/x'] },
++		fetchImpl: async (/** @type {string} */ url) => {
++			seen.push(url);
++			return new Response(url.startsWith('https://mirror.invalid') ? Buffer.alloc(good.length + 1) : good);
++		}
++	}).catch(/** @param {Error} e */ e => e);
++	assert.deepStrictEqual(seen, ['https://mirror.invalid/x', 'https://ok.invalid/x']);
++	// The first source is reported, and the failure to unpack afterwards is about
++	// the payload, not about "no source" — the download itself was satisfied.
++	assert.doesNotMatch(String(error?.message), /No source for|Size mismatch.*ok\.invalid/);
 +});
 +
 +test('a checksum mismatch aborts and leaves no payload directory', async () => {
@@ -9348,10 +9427,10 @@ index 00000000..2c7627db
 +});
 diff --git a/extensions/picket-remote-wsl/test/resolver.test.js b/extensions/picket-remote-wsl/test/resolver.test.js
 new file mode 100644
-index 00000000..7999d56e
+index 00000000..0b5265ef
 --- /dev/null
 +++ b/extensions/picket-remote-wsl/test/resolver.test.js
-@@ -0,0 +1,786 @@
+@@ -0,0 +1,798 @@
 +// RED first: this file must fail until src/resolver.js exists.
 +const test = require('node:test');
 +const assert = require('node:assert');
@@ -9659,18 +9738,30 @@ index 00000000..7999d56e
 +});
 +
 +test('an absent payload with no reachable source rejects with the reasons', async () => {
++	// No fetchImpl is injected on purpose: the point is that the resolver names
++	// every source it tried, not that a download succeeds. The default sources are
++	// what make the list non-empty.
 +	const runner = makeRunner({ payloadDirs: [] });
 +	const { starts, startServer } = startsRecording();
 +	const resolver = createResolver({
 +		runner,
 +		product: PRODUCT,
-+		components: (/** @type {any} */ ctx) => createComponentManager({ catalog: catalog(), product: PRODUCT, runner: ctx.runner, distro: ctx.distro, home: ctx.home }),
++		components: (/** @type {any} */ ctx) => createComponentManager({
++			catalog: catalog(), product: PRODUCT, runner: ctx.runner, distro: ctx.distro, home: ctx.home,
++			// Offline: the assertions are about the list of sources and the reasons,
++			// so the fetch itself just fails fast.
++			fetchImpl: async () => { throw new Error('offline'); }
++		}),
 +		settings: {},
 +		log: silentLog(),
 +		startServer
 +	});
 +
-+	await assert.rejects(() => resolver.resolve('picket-wsl+Ubuntu'), /No source for wsl-server/);
++	const error = await resolver.resolve('picket-wsl+Ubuntu').catch(/** @param {Error} e */ e => e);
++	assert.match(String(error?.message), /Could not download picket-code-server-.*\.tar\.gz\./);
++	// Both defaults are listed: in-region mirror first, release asset second.
++	assert.match(String(error?.message), /download\.noware\.cn/);
++	assert.match(String(error?.message), /releases\/download\/server-v/);
 +	assert.strictEqual(starts.length, 0);
 +});
 +
@@ -10840,23 +10931,6 @@ index 4c0d9bda..8564139a 100644
  	async waitForTitle(accept: (title: string) => boolean): Promise<void> {
  		await this.poll(() => this.driver.getTitle(), accept, `get title`);
  	}
-diff --git a/test/automation/src/electron.ts b/test/automation/src/electron.ts
-index dda7cb2f..81de7cac 100644
---- a/test/automation/src/electron.ts
-+++ b/test/automation/src/electron.ts
-@@ -60,8 +60,10 @@ export async function resolveElectronConfiguration(options: LaunchOptions): Prom
- 		if (!workspacePath) {
- 			throw new Error('Workspace path is required when running remote');
- 		}
--		// Replace workspace path with URI
--		args[0] = `--${workspacePath.endsWith('.code-workspace') ? 'file' : 'folder'}-uri=vscode-remote://test+test/${URI.file(workspacePath).path}`;
-+		// Replace workspace path with URI. The authority defaults to the
-+		// test resolver's; the WSL smoke area targets `picket-wsl+<distro>`.
-+		const remoteAuthority = options.remoteAuthority ?? 'test+test';
-+		args[0] = `--${workspacePath.endsWith('.code-workspace') ? 'file' : 'folder'}-uri=vscode-remote://${remoteAuthority}/${URI.file(workspacePath).path}`;
- 
- 		if (codePath) {
- 			if (!extensionsPath) {
 diff --git a/test/smoke/src/areas/wsl/remote.test.ts b/test/smoke/src/areas/wsl/remote.test.ts
 new file mode 100644
 index 00000000..5f6ef3f2
